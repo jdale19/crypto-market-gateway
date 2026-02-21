@@ -1,57 +1,79 @@
+function toOkxInstId(symbol) {
+  // "ETHUSDT" -> "ETH-USDT-SWAP"
+  const s = String(symbol || "").toUpperCase();
+  if (!s.endsWith("USDT")) return null;
+  const base = s.slice(0, -4);
+  return `${base}-USDT-SWAP`;
+}
+
 export default async function handler(req, res) {
   try {
     const symbol = String(req.query.symbol || "ETHUSDT").toUpperCase();
+    const instId = toOkxInstId(symbol);
 
-    // Binance USDT-M Futures base URL
-    const base = "https://fapi.binance.com";
+    if (!instId) {
+      return res.status(400).json({
+        ok: false,
+        symbol,
+        error: "unsupported symbol format (expected like ETHUSDT)",
+      });
+    }
 
-    // 1) Price (mark price is good for perps context)
-    const markUrl = `${base}/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`;
+    const base = "https://www.okx.com";
 
-    // 2) Funding rate (same endpoint returns lastFundingRate)
-    // 3) Open interest (contracts)
-    const oiUrl = `${base}/futures/data/openInterestHist?symbol=${encodeURIComponent(symbol)}&period=5m&limit=1`;
+    const markUrl = `${base}/api/v5/public/mark-price?instType=SWAP&instId=${encodeURIComponent(instId)}`;
+    const fundingUrl = `${base}/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`;
+    const oiUrl = `${base}/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`;
 
-    const [markResp, oiResp] = await Promise.all([
+    const [markResp, fundingResp, oiResp] = await Promise.all([
       fetch(markUrl),
+      fetch(fundingUrl),
       fetch(oiUrl),
     ]);
 
-    if (!markResp.ok) {
-      const text = await markResp.text();
-      return res.status(markResp.status).json({ ok: false, symbol, error: "mark/funding fetch failed", detail: text });
-    }
-    if (!oiResp.ok) {
-      const text = await oiResp.text();
-      return res.status(oiResp.status).json({ ok: false, symbol, error: "open interest fetch failed", detail: text });
-    }
+    const bad = async (r, name) => {
+      const text = await r.text();
+      return res.status(r.status).json({
+        ok: false,
+        symbol,
+        instId,
+        error: `${name} fetch failed`,
+        detail: text,
+      });
+    };
 
-    const markData = await markResp.json();
-    const oiHist = await oiResp.json();
+    if (!markResp.ok) return bad(markResp, "mark");
+    if (!fundingResp.ok) return bad(fundingResp, "funding");
+    if (!oiResp.ok) return bad(oiResp, "open_interest");
 
-    // markData fields include: markPrice, lastFundingRate (strings)
-    const price = Number(markData.markPrice);
-    const funding_rate = Number(markData.lastFundingRate);
+    const markJson = await markResp.json();
+    const fundingJson = await fundingResp.json();
+    const oiJson = await oiResp.json();
 
-    // openInterestHist returns array like [{ openInterest: "...", timestamp: ... }]
-    const open_interest_contracts = oiHist?.[0]?.openInterest != null ? Number(oiHist[0].openInterest) : null;
+    const price = Number(markJson?.data?.[0]?.markPx);
+    const funding_rate = Number(fundingJson?.data?.[0]?.fundingRate);
+
+    const open_interest_contracts =
+      oiJson?.data?.[0]?.oi != null ? Number(oiJson.data[0].oi) : null;
 
     const open_interest_usd =
-      open_interest_contracts != null && Number.isFinite(price) ? open_interest_contracts * price : null;
+      open_interest_contracts != null && Number.isFinite(price)
+        ? open_interest_contracts * price
+        : null;
 
-    // Basic caching: allow very short cache to reduce rate limits
     res.setHeader("Content-Type", "application/json");
     res.setHeader("Cache-Control", "s-maxage=5, stale-while-revalidate=10");
 
     return res.status(200).json({
       ok: true,
       symbol,
+      instId,
       ts: Date.now(),
       price,
       funding_rate,
       open_interest_contracts,
       open_interest_usd,
-      source: "binance_usdtm_futures",
+      source: "okx_swap_public_api",
     });
   } catch (err) {
     return res.status(500).json({
