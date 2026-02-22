@@ -1,5 +1,6 @@
 // /api/multi.js
-// OKX PERP (SWAP) ONLY — rolling 5m series + flexible timeframe deltas + lean/why
+// OKX PERP (SWAP) ONLY — rolling 5m series + multi-timeframe deltas (5m/15m/30m/1h/4h)
+// Always returns ALL timeframes each call, so you don't need different URLs.
 // Requires env vars:
 // - UPSTASH_REDIS_REST_URL
 // - UPSTASH_REDIS_REST_TOKEN
@@ -19,7 +20,7 @@ const SERIES_TTL_SECONDS = 60 * 60 * 48; // 48h
 const INST_MAP_TTL_SECONDS = 60 * 60 * 24; // 24h
 const INST_LIST_TTL_SECONDS = 60 * 60 * 12; // 12h
 
-// Allowed timeframes (derived from the 5m series)
+// Derived from 5m series
 const TF_TO_STEPS = {
   "5m": 1,
   "15m": 3,
@@ -27,6 +28,10 @@ const TF_TO_STEPS = {
   "1h": 12,
   "4h": 48,
 };
+
+const TF_ORDER = ["5m", "15m", "30m", "1h", "4h"];
+const MAX_STEPS = Math.max(...Object.values(TF_TO_STEPS)); // 48
+const MAX_NEEDED_POINTS = MAX_STEPS + 1; // 49
 
 function pctChange(now, prev) {
   if (prev == null || !Number.isFinite(prev) || prev === 0) return null;
@@ -48,7 +53,6 @@ function baseFromSymbolUSDT(symbol) {
   return s.slice(0, -4);
 }
 
-// Classification for a given timeframe delta
 function classifyState(priceChgPct, oiChgPct) {
   if (priceChgPct == null || oiChgPct == null) return "unknown";
   const pUp = priceChgPct > 0;
@@ -76,13 +80,15 @@ function addLeanAndWhy(state, funding_rate) {
   }
 
   if (Number.isFinite(funding_rate)) {
-    if (funding_rate > 0) return { lean: "neutral", why: "Not enough change data yet; funding slightly positive." };
-    if (funding_rate < 0) return { lean: "neutral", why: "Not enough change data yet; funding slightly negative." };
+    if (funding_rate > 0)
+      return { lean: "neutral", why: "Not enough change data yet; funding slightly positive." };
+    if (funding_rate < 0)
+      return { lean: "neutral", why: "Not enough change data yet; funding slightly negative." };
   }
   return { lean: "neutral", why: "Not enough change data yet." };
 }
 
-function normalizeTf(rawTf) {
+function normalizeDriverTf(rawTf) {
   const tf = String(rawTf || "5m").toLowerCase();
   return TF_TO_STEPS[tf] ? tf : "5m";
 }
@@ -118,7 +124,7 @@ async function resolveOkxSwapInstId(symbol) {
 
   const list = await getOkxSwapInstrumentListCached();
   if (!Array.isArray(list)) {
-    // If OKX list fetch fails, fall back to a guess (do NOT cache it).
+    // If list fetch fails, fall back to guess (do NOT cache it).
     return `${base}-USDT-SWAP`;
   }
 
@@ -167,7 +173,37 @@ async function fetchOkxSwap(instId) {
   };
 }
 
-async function fetchOne(symbol, now, tf) {
+function computeTfDeltas(points, tf, funding_rate) {
+  const steps = TF_TO_STEPS[tf];
+  const needed = steps + 1;
+
+  const nowPoint = points.length >= 1 ? points[points.length - 1] : null;
+  const prevPoint = points.length >= needed ? points[points.length - needed] : null;
+
+  const price_change_pct = pctChange(nowPoint?.p, prevPoint?.p);
+  const oi_change_pct = pctChange(nowPoint?.oi, prevPoint?.oi);
+
+  const funding_change =
+    Number.isFinite(nowPoint?.fr) && Number.isFinite(prevPoint?.fr) ? nowPoint.fr - prevPoint.fr : null;
+
+  const state = classifyState(price_change_pct, oi_change_pct);
+  const { lean, why } = addLeanAndWhy(state, funding_rate);
+
+  const warmup = !(nowPoint && prevPoint);
+
+  return {
+    tf,
+    warmup,
+    price_change_pct,
+    oi_change_pct,
+    funding_change,
+    state,
+    lean,
+    why,
+  };
+}
+
+async function fetchOne(symbol, now, driver_tf) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
@@ -191,13 +227,10 @@ async function fetchOne(symbol, now, tf) {
   const open_interest_contracts = okx.open_interest_contracts;
 
   const open_interest_usd =
-    Number.isFinite(open_interest_contracts) && Number.isFinite(price)
-      ? open_interest_contracts * price
-      : null;
+    Number.isFinite(open_interest_contracts) && Number.isFinite(price) ? open_interest_contracts * price : null;
 
-  // ---- Rolling 5-minute history append ----
+  // ---- Rolling 5m history append (once per bucket) ----
   const bucket = Math.floor(now / BUCKET_MS);
-
   const seriesKey = `series5m:${instId}`;
   const lastBucketKey = `lastBucket:${instId}`;
 
@@ -216,50 +249,38 @@ async function fetchOne(symbol, now, tf) {
     await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
   }
 
-  // ---- Timeframe deltas from the 5m series ----
-  const steps = TF_TO_STEPS[tf] || 1;
-  const neededPoints = steps + 1;
-
-  const raw = await redis.lrange(seriesKey, -neededPoints, -1);
+  // ---- Read once (max needed) then compute ALL timeframes in-memory ----
+  const raw = await redis.lrange(seriesKey, -MAX_NEEDED_POINTS, -1);
   const points = (raw || []).map(safeJsonParse).filter(Boolean);
 
-  const nowPoint = points.length >= 1 ? points[points.length - 1] : null;
-  const prevTfPoint = points.length >= neededPoints ? points[0] : null;
+  const deltas = {};
+  for (const tf of TF_ORDER) {
+    deltas[tf] = computeTfDeltas(points, tf, funding_rate);
+  }
 
-  const price_change_tf_pct = pctChange(nowPoint?.p, prevTfPoint?.p);
-  const oi_change_tf_pct = pctChange(nowPoint?.oi, prevTfPoint?.oi);
-
-  const funding_change_tf =
-    Number.isFinite(nowPoint?.fr) && Number.isFinite(prevTfPoint?.fr)
-      ? nowPoint.fr - prevTfPoint.fr
-      : null;
-
-  const state = classifyState(price_change_tf_pct, oi_change_tf_pct);
-  const { lean, why } = addLeanAndWhy(state, funding_rate);
-
-  const warmup_tf = !(nowPoint && prevTfPoint);
+  // Driver summary (what you look at "first" in chat)
+  const driver = deltas[driver_tf] || deltas["5m"];
+  const lean = driver?.lean ?? "neutral";
+  const why = driver?.why ?? "Not enough change data yet.";
+  const state = driver?.state ?? "unknown";
 
   return {
     ok: true,
     symbol,
     instId,
-    tf,
+
+    // current values
     price,
     funding_rate,
     open_interest_contracts,
     open_interest_usd,
 
-    // timeframe changes
-    price_change_tf_pct,
-    oi_change_tf_pct,
-    funding_change_tf,
-
-    // read
+    // multi-timeframe package
+    driver_tf,
     state,
     lean,
     why,
-
-    warmup_tf,
+    deltas,
 
     source: "okx_swap_public_api+upstash_series",
   };
@@ -267,7 +288,7 @@ async function fetchOne(symbol, now, tf) {
 
 export default async function handler(req, res) {
   try {
-    const tf = normalizeTf(req.query.tf);
+    const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
     const symbolsRaw = String(req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT");
     const symbols = symbolsRaw
@@ -283,18 +304,19 @@ export default async function handler(req, res) {
     }
 
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, tf)));
+    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf)));
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       ts: now,
-      tf,
       symbols,
+      driver_tf,
+      timeframes: TF_ORDER,
       results,
       note:
-        "OKX perps-only. Rolling 5m series (24h). Timeframe deltas are derived from 5m points. warmup_tf=false once enough points exist for selected tf.",
-      tf_help: Object.keys(TF_TO_STEPS),
+        "OKX perps-only. Rolling 5m series (24h). Each response includes deltas for 5m/15m/30m/1h/4h derived from 5m points. warmup per timeframe goes false once enough points exist.",
+      tip: "Set driver_tf=4h when you want the top-level lean/why to reflect longer-term positioning.",
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: "server error", detail: String(err?.message || err) });
