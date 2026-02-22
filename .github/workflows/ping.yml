@@ -1,4 +1,3 @@
-# bump
 name: Ping market gateway
 
 on:
@@ -10,6 +9,6 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Call multi endpoint
+      - name: Call multi endpoint (uses DEFAULT_SYMBOLS on Vercel)
         run: |
-          curl -sS "https://crypto-market-gateway.vercel.app/api/multi?symbols=ETHUSDT,LDOUSDT" | head -c 4000
+          curl -sS "https://crypto-market-gateway.vercel.app/api/multi" | head -c 4000
