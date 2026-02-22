@@ -9,6 +9,6 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Call multi endpoint (uses DEFAULT_SYMBOLS on Vercel)
+      - name: Warm multi endpoint (default symbols)
         run: |
-          curl -sS "https://crypto-market-gateway.vercel.app/api/multi" | head -c 4000
+          curl -sS "https://crypto-market-gateway.vercel.app/api/multi?driver_tf=5m" > /dev/null
