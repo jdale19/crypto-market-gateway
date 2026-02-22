@@ -62,7 +62,6 @@ async function getOkxSwapInstrumentListCached() {
   const list = Array.isArray(j?.data) ? j.data : null;
   if (!Array.isArray(list)) return null;
 
-  // Store as JSON string
   await redis.set(cacheKey, JSON.stringify(list));
   await redis.expire(cacheKey, INST_LIST_TTL_SECONDS);
 
@@ -103,7 +102,7 @@ async function resolveOkxSwapInstId(symbol) {
   return null;
 }
 
-async function fetchOkx(instId) {
+async function fetchOkxSwap(instId) {
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
     fetch(
       `https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`
@@ -118,9 +117,9 @@ async function fetchOkx(instId) {
     ),
   ]);
 
-  if (!tickerRes.ok) return { ok: false, error: "ticker fetch failed" };
-  if (!fundingRes.ok) return { ok: false, error: "funding fetch failed" };
-  if (!oiRes.ok) return { ok: false, error: "oi fetch failed" };
+  if (!tickerRes.ok) return { ok: false, error: "swap ticker fetch failed" };
+  if (!fundingRes.ok) return { ok: false, error: "swap funding fetch failed" };
+  if (!oiRes.ok) return { ok: false, error: "swap oi fetch failed" };
 
   const tickerJson = await tickerRes.json();
   const fundingJson = await fundingRes.json();
@@ -130,17 +129,70 @@ async function fetchOkx(instId) {
   const funding_rate = Number(fundingJson?.data?.[0]?.fundingRate);
   const open_interest_contracts = Number(oiJson?.data?.[0]?.oi);
 
-  // If OKX returns empty data arrays, these become NaN -> treat as not found
   if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts)) {
-    return { ok: false, error: "instrument not found or missing data" };
+    return { ok: false, error: "swap instrument not found or missing data" };
   }
 
   return {
     ok: true,
+    market_type: "swap",
+    instId,
     price,
     funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
     open_interest_contracts,
   };
+}
+
+async function fetchOkxSpot(base) {
+  // OKX spot uses BASE-USDT
+  const spotInstId = `${base}-USDT`;
+
+  const r = await fetch(
+    `https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(spotInstId)}`
+  );
+  if (!r.ok) return { ok: false, error: "spot ticker fetch failed" };
+
+  const j = await r.json();
+  const price = Number(j?.data?.[0]?.last);
+
+  if (!Number.isFinite(price)) {
+    return { ok: false, error: "spot instrument not found or missing data" };
+  }
+
+  return {
+    ok: true,
+    market_type: "spot",
+    instId: spotInstId,
+    price,
+    funding_rate: null,
+    open_interest_contracts: null,
+  };
+}
+
+async function writeAndReadSeries({ seriesKey, lastBucketKey, bucket, now, point }) {
+  const lastBucketRaw = await redis.get(lastBucketKey);
+  const lastBucketNum = lastBucketRaw == null ? null : Number(lastBucketRaw);
+
+  // Append exactly once per new bucket
+  if (!Number.isFinite(lastBucketNum) || lastBucketNum !== bucket) {
+    await redis.rpush(seriesKey, JSON.stringify(point));
+    await redis.ltrim(seriesKey, -SERIES_POINTS_24H, -1);
+
+    await redis.set(lastBucketKey, String(bucket));
+
+    await redis.expire(seriesKey, SERIES_TTL_SECONDS);
+    await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
+  }
+
+  // Pull last 13 points so we can do 5m and ~1h deltas
+  const raw = await redis.lrange(seriesKey, -13, -1);
+  const points = (raw || []).map(safeJsonParse).filter(Boolean);
+
+  const nowPoint = points.length >= 1 ? points[points.length - 1] : null;
+  const prevPoint5m = points.length >= 2 ? points[points.length - 2] : null;
+  const prevPoint1h = points.length >= 13 ? points[0] : null;
+
+  return { points, nowPoint, prevPoint5m, prevPoint1h };
 }
 
 async function fetchOne(symbol, now) {
@@ -153,24 +205,45 @@ async function fetchOne(symbol, now) {
     };
   }
 
-  const instId = await resolveOkxSwapInstId(symbol);
-  if (!instId) {
-    return {
-      ok: false,
-      symbol,
-      instId: `${base}-USDT-SWAP`,
-      error: "no OKX USDT swap market found for this symbol",
-    };
+  // 1) Try SWAP (perps) first
+  const swapInstId = await resolveOkxSwapInstId(symbol);
+  let market;
+  let source;
+
+  if (swapInstId) {
+    const swap = await fetchOkxSwap(swapInstId);
+    if (swap.ok) {
+      market = swap;
+      source = "okx_swap_public_api+upstash_series";
+    } else {
+      // If SWAP lookup gave us an instId but it fails, fall back to spot.
+      const spot = await fetchOkxSpot(base);
+      if (!spot.ok) {
+        return { ok: false, symbol, instId: swapInstId, error: swap.error };
+      }
+      market = spot;
+      source = "okx_spot_public_api+upstash_series";
+    }
+  } else {
+    // 2) No SWAP market found -> spot fallback
+    const spot = await fetchOkxSpot(base);
+    if (!spot.ok) {
+      return {
+        ok: false,
+        symbol,
+        instId: `${base}-USDT-SWAP`,
+        error: "no OKX USDT swap market found; spot also unavailable",
+        detail: spot.error,
+      };
+    }
+    market = spot;
+    source = "okx_spot_public_api+upstash_series";
   }
 
-  const okx = await fetchOkx(instId);
-  if (!okx.ok) {
-    return { ok: false, symbol, instId, error: okx.error };
-  }
-
-  const price = okx.price;
-  const funding_rate = okx.funding_rate;
-  const open_interest_contracts = okx.open_interest_contracts;
+  const instId = market.instId;
+  const price = market.price;
+  const funding_rate = market.funding_rate;
+  const open_interest_contracts = market.open_interest_contracts;
 
   const open_interest_usd =
     Number.isFinite(open_interest_contracts) && Number.isFinite(price)
@@ -179,41 +252,26 @@ async function fetchOne(symbol, now) {
 
   const bucket = Math.floor(now / BUCKET_MS);
 
-  const seriesKey = `series5m:${instId}`;
-  const lastBucketKey = `lastBucket:${instId}`;
+  // Keep series keys unique across market types so spot & swap don't collide
+  const instKey = `${market.market_type}:${instId}`;
+  const seriesKey = `series5m:${instKey}`;
+  const lastBucketKey = `lastBucket:${instKey}`;
 
-  // NOTE: Upstash returns strings for GET. Normalize to number.
-  const lastBucketRaw = await redis.get(lastBucketKey);
-  const lastBucketNum = lastBucketRaw == null ? null : Number(lastBucketRaw);
+  const point = {
+    b: bucket,
+    ts: now,
+    p: price,
+    fr: funding_rate,
+    oi: open_interest_contracts,
+  };
 
-  // Append exactly once per new bucket
-  if (!Number.isFinite(lastBucketNum) || lastBucketNum !== bucket) {
-    const point = {
-      b: bucket,
-      ts: now,
-      p: price,
-      fr: funding_rate,
-      oi: open_interest_contracts,
-    };
-
-    // Store as string in list
-    await redis.rpush(seriesKey, JSON.stringify(point));
-    await redis.ltrim(seriesKey, -SERIES_POINTS_24H, -1);
-
-    // Store bucket as string (consistent)
-    await redis.set(lastBucketKey, String(bucket));
-
-    await redis.expire(seriesKey, SERIES_TTL_SECONDS);
-    await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
-  }
-
-  // Pull last 13 points so we can do 5m and 1h deltas
-  const raw = await redis.lrange(seriesKey, -13, -1);
-  const points = (raw || []).map(safeJsonParse).filter(Boolean);
-
-  const nowPoint = points.length >= 1 ? points[points.length - 1] : null;
-  const prevPoint5m = points.length >= 2 ? points[points.length - 2] : null;
-  const prevPoint1h = points.length >= 13 ? points[0] : null; // 12 intervals back = ~60m
+  const { nowPoint, prevPoint5m, prevPoint1h } = await writeAndReadSeries({
+    seriesKey,
+    lastBucketKey,
+    bucket,
+    now,
+    point,
+  });
 
   const price_change_5m_pct = pctChange(nowPoint?.p, prevPoint5m?.p);
   const oi_change_5m_pct = pctChange(nowPoint?.oi, prevPoint5m?.oi);
@@ -234,6 +292,8 @@ async function fetchOne(symbol, now) {
     ok: true,
     symbol,
     instId,
+    market_type: market.market_type,
+
     price,
     funding_rate,
     open_interest_contracts,
@@ -244,11 +304,16 @@ async function fetchOne(symbol, now) {
     funding_change_5m,
     oi_change_1h_pct,
 
+    // state only really makes sense when oi exists; spot will usually be "unknown"
     state,
     warmup_5m,
     warmup_1h,
 
-    source: "okx_swap_public_api+upstash_series",
+    source,
+    note:
+      market.market_type === "spot"
+        ? "No OKX perp swap market for this symbol; returning spot price (no funding/OI)."
+        : undefined,
   };
 }
 
@@ -270,7 +335,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // optional: keep a reasonable cap so a single request doesn't blow up serverless time
     if (symbols.length > 50) {
       return res.status(400).json({
         ok: false,
@@ -288,7 +352,7 @@ export default async function handler(req, res) {
       symbols,
       results,
       note:
-        "Rolling 5-minute series (24h). warmup_5m=false after 2 points. warmup_1h=false after 13 points (~65m window). OKX SWAP instId is discovered/cached (24h) instead of guessed.",
+        "Rolling 5-minute series (24h). warmup_5m=false after 2 points. warmup_1h=false after 13 points (~65m window). OKX SWAP instId is discovered/cached (24h) instead of guessed. Spot fallback enabled when SWAP not available.",
     });
   } catch (err) {
     return res.status(500).json({
