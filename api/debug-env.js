@@ -1,22 +1,37 @@
+// /api/debug-env.js
 export default async function handler(req, res) {
-  const t = process.env.TELEGRAM_BOT_TOKEN || "";
-  const url = t ? `https://api.telegram.org/bot${t}/getMe` : null;
+  // Optional simple protection
+  const secret = process.env.DEBUG_SECRET;
+  if (secret && req.query.key !== secret) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
 
-  let tg = null;
-  if (url) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const hasToken = !!token;
+
+  let telegramStatus = null;
+
+  if (hasToken) {
     try {
-      const r = await fetch(url);
-      tg = await r.json();
+      const r = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+      const j = await r.json();
+      telegramStatus = {
+        ok: j?.ok === true,
+        username: j?.result?.username || null,
+        id: j?.result?.id || null,
+      };
     } catch (e) {
-      tg = { ok: false, error: "fetch_failed", detail: String(e?.message || e) };
+      telegramStatus = {
+        ok: false,
+        error: "telegram_fetch_failed",
+      };
     }
   }
 
-  res.status(200).json({
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({
     ok: true,
-    has_token: t.length > 0,
-    token_len: t.length,
-    token_prefix: t.slice(0, 8), // still safe-ish; doesn't reveal full token
-    telegram_getMe: tg,
+    has_token: hasToken,
+    telegram: telegramStatus,
   });
 }
