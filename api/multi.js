@@ -203,7 +203,7 @@ function computeTfDeltas(points, tf, funding_rate) {
   };
 }
 
-async function fetchOne(symbol, now, driver_tf) {
+async function fetchOne(symbol, now, driver_tf, debug) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
@@ -237,6 +237,8 @@ async function fetchOne(symbol, now, driver_tf) {
   const lastBucketRaw = await redis.get(lastBucketKey);
   const lastBucketNum = lastBucketRaw == null ? null : Number(lastBucketRaw);
 
+  let did_append_this_call = false;
+
   if (!Number.isFinite(lastBucketNum) || lastBucketNum !== bucket) {
     const point = { b: bucket, ts: now, p: price, fr: funding_rate, oi: open_interest_contracts };
 
@@ -247,6 +249,8 @@ async function fetchOne(symbol, now, driver_tf) {
 
     await redis.expire(seriesKey, SERIES_TTL_SECONDS);
     await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
+
+    did_append_this_call = true;
   }
 
   // ---- Read once (max needed) then compute ALL timeframes in-memory ----
@@ -258,13 +262,13 @@ async function fetchOne(symbol, now, driver_tf) {
     deltas[tf] = computeTfDeltas(points, tf, funding_rate);
   }
 
-  // Driver summary (what you look at "first" in chat)
+  // Driver summary
   const driver = deltas[driver_tf] || deltas["5m"];
   const lean = driver?.lean ?? "neutral";
   const why = driver?.why ?? "Not enough change data yet.";
   const state = driver?.state ?? "unknown";
 
-  return {
+  const out = {
     ok: true,
     symbol,
     instId,
@@ -284,11 +288,37 @@ async function fetchOne(symbol, now, driver_tf) {
 
     source: "okx_swap_public_api+upstash_series",
   };
+
+  if (debug) {
+    const series_len = await redis.llen(seriesKey);
+    out.debug = {
+      bucket_now: bucket,
+      lastBucket_stored_raw: lastBucketRaw ?? null,
+      lastBucket_stored_num: Number.isFinite(lastBucketNum) ? lastBucketNum : null,
+      did_append_this_call,
+      series_len: Number.isFinite(series_len) ? series_len : series_len ?? null,
+      points_read: points.length,
+      last_point: points.length ? points[points.length - 1] : null,
+      first_point: points.length ? points[0] : null,
+      keys: { seriesKey, lastBucketKey },
+    };
+  }
+
+  return out;
+}
+
+function wantsHtml(req) {
+  return String(req.query.view || "").toLowerCase() === "html";
+}
+
+function wantsDebug(req) {
+  return String(req.query.debug || "").toLowerCase() === "1";
 }
 
 export default async function handler(req, res) {
   try {
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
+    const debug = wantsDebug(req);
 
     const symbolsRaw = String(req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT");
     const symbols = symbolsRaw
@@ -304,7 +334,60 @@ export default async function handler(req, res) {
     }
 
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf)));
+    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf, debug)));
+
+    // iPhone-friendly HTML view (auto-refresh)
+    if (wantsHtml(req)) {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+
+      const qs = new URLSearchParams(req.query);
+      // Ensure HTML view loads JSON view from same endpoint but without view=html
+      qs.delete("view");
+      const jsonUrl = `/api/multi?${qs.toString()}`;
+
+      return res.status(200).send(`<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>crypto-market-gateway</title>
+  <style>
+    body { font-family: -apple-system, system-ui, Arial; margin: 12px; }
+    pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+    button { padding: 8px 10px; font-size: 14px; }
+    input { width: 80px; padding: 6px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <button onclick="load()">Refresh</button>
+    <span>Auto:</span>
+    <input id="sec" type="number" value="10" min="3" />
+    <button onclick="toggle()">Start/Stop</button>
+    <span id="status">stopped</span>
+  </div>
+  <div><strong>JSON:</strong> ${jsonUrl}</div>
+  <pre id="out">Loading...</pre>
+<script>
+  let t = null;
+  async function load() {
+    const r = await fetch("${jsonUrl}", { cache: "no-store" });
+    const j = await r.json();
+    document.getElementById("out").textContent = JSON.stringify(j, null, 2);
+  }
+  function toggle() {
+    const s = document.getElementById("status");
+    if (t) { clearInterval(t); t = null; s.textContent = "stopped"; return; }
+    const sec = Math.max(3, Number(document.getElementById("sec").value || 10));
+    t = setInterval(load, sec * 1000);
+    s.textContent = "running";
+  }
+  load();
+</script>
+</body>
+</html>`);
+    }
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
