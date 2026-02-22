@@ -1,5 +1,5 @@
 // /api/multi.js
-// OKX PERP (SWAP) ONLY — rolling 5m series + 5m/1h deltas + simple lean/why
+// OKX PERP (SWAP) ONLY — rolling 5m series + flexible timeframe deltas + lean/why
 // Requires env vars:
 // - UPSTASH_REDIS_REST_URL
 // - UPSTASH_REDIS_REST_TOKEN
@@ -19,7 +19,14 @@ const SERIES_TTL_SECONDS = 60 * 60 * 48; // 48h
 const INST_MAP_TTL_SECONDS = 60 * 60 * 24; // 24h
 const INST_LIST_TTL_SECONDS = 60 * 60 * 12; // 12h
 
-const FETCH_TIMEOUT_MS = 8000;
+// Allowed timeframes (derived from the 5m series)
+const TF_TO_STEPS = {
+  "5m": 1,
+  "15m": 3,
+  "30m": 6,
+  "1h": 12,
+  "4h": 48,
+};
 
 function pctChange(now, prev) {
   if (prev == null || !Number.isFinite(prev) || prev === 0) return null;
@@ -41,7 +48,7 @@ function baseFromSymbolUSDT(symbol) {
   return s.slice(0, -4);
 }
 
-// Using 5m as default for the "lean" because you wanted scalp + positioning.
+// Classification for a given timeframe delta
 function classifyState(priceChgPct, oiChgPct) {
   if (priceChgPct == null || oiChgPct == null) return "unknown";
   const pUp = priceChgPct > 0;
@@ -75,34 +82,21 @@ function addLeanAndWhy(state, funding_rate) {
   return { lean: "neutral", why: "Not enough change data yet." };
 }
 
-async function fetchWithTimeout(url) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(t);
-  }
+function normalizeTf(rawTf) {
+  const tf = String(rawTf || "5m").toLowerCase();
+  return TF_TO_STEPS[tf] ? tf : "5m";
 }
 
-// ---- OKX instruments list (Redis cached) ----
-async function getOkxSwapInstrumentListCached(reqCache) {
-  // request-scope memory cache first
-  if (reqCache.swapList) return reqCache.swapList;
-
+async function getOkxSwapInstrumentListCached() {
   const cacheKey = `okx:instruments:swap:list:v1`;
   const cached = await redis.get(cacheKey);
-
   if (cached) {
     const list = safeJsonParse(cached);
-    if (Array.isArray(list)) {
-      reqCache.swapList = list;
-      return list;
-    }
+    if (Array.isArray(list)) return list;
   }
 
   const url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
-  const r = await fetchWithTimeout(url);
+  const r = await fetch(url);
   if (!r.ok) return null;
 
   const j = await r.json();
@@ -111,66 +105,42 @@ async function getOkxSwapInstrumentListCached(reqCache) {
 
   await redis.set(cacheKey, JSON.stringify(list));
   await redis.expire(cacheKey, INST_LIST_TTL_SECONDS);
-
-  reqCache.swapList = list;
   return list;
 }
 
-// Resolve real OKX SWAP instId (perps-only mode)
-async function resolveOkxSwapInstId(symbol, reqCache) {
+async function resolveOkxSwapInstId(symbol) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) return null;
 
-  // request-scope memory cache
-  if (reqCache.instMap.has(base)) return reqCache.instMap.get(base);
-
   const mapKey = `instmap:okx:swap:${base}`;
   const cached = await redis.get(mapKey);
-  if (cached) {
-    const v = cached === "__NONE__" ? null : String(cached);
-    reqCache.instMap.set(base, v);
-    return v;
-  }
+  if (cached) return cached === "__NONE__" ? null : cached;
 
-  const list = await getOkxSwapInstrumentListCached(reqCache);
-
-  // If list fetch fails, fall back to guess (do NOT cache it)
+  const list = await getOkxSwapInstrumentListCached();
   if (!Array.isArray(list)) {
-    const guess = `${base}-USDT-SWAP`;
-    reqCache.instMap.set(base, guess);
-    return guess;
+    // If OKX list fetch fails, fall back to a guess (do NOT cache it).
+    return `${base}-USDT-SWAP`;
   }
 
-  // Build request-scope lookup map once
-  if (!reqCache.swapInstSet) {
-    const set = new Set();
-    for (const x of list) {
-      const id = String(x?.instId || "").toUpperCase();
-      if (id) set.add(id);
-    }
-    reqCache.swapInstSet = set;
-  }
+  const target = `${base}-USDT-SWAP`;
+  const found = list.find((x) => String(x?.instId || "").toUpperCase() === target);
 
-  const target = `${base}-USDT-SWAP`.toUpperCase();
-
-  if (reqCache.swapInstSet.has(target)) {
-    await redis.set(mapKey, target);
+  if (found?.instId) {
+    await redis.set(mapKey, String(found.instId));
     await redis.expire(mapKey, INST_MAP_TTL_SECONDS);
-    reqCache.instMap.set(base, target);
-    return target;
+    return String(found.instId);
   }
 
   await redis.set(mapKey, "__NONE__");
   await redis.expire(mapKey, INST_MAP_TTL_SECONDS);
-  reqCache.instMap.set(base, null);
   return null;
 }
 
 async function fetchOkxSwap(instId) {
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
-    fetchWithTimeout(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
-    fetchWithTimeout(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
-    fetchWithTimeout(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
+    fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
+    fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
+    fetch(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
   ]);
 
   if (!tickerRes.ok) return { ok: false, error: "ticker fetch failed" };
@@ -197,13 +167,13 @@ async function fetchOkxSwap(instId) {
   };
 }
 
-async function fetchOne(symbol, now, reqCache) {
+async function fetchOne(symbol, now, tf) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
   }
 
-  const instId = await resolveOkxSwapInstId(symbol, reqCache);
+  const instId = await resolveOkxSwapInstId(symbol);
   if (!instId) {
     return {
       ok: false,
@@ -225,6 +195,7 @@ async function fetchOne(symbol, now, reqCache) {
       ? open_interest_contracts * price
       : null;
 
+  // ---- Rolling 5-minute history append ----
   const bucket = Math.floor(now / BUCKET_MS);
 
   const seriesKey = `series5m:${instId}`;
@@ -245,49 +216,50 @@ async function fetchOne(symbol, now, reqCache) {
     await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
   }
 
-  const raw = await redis.lrange(seriesKey, -13, -1);
+  // ---- Timeframe deltas from the 5m series ----
+  const steps = TF_TO_STEPS[tf] || 1;
+  const neededPoints = steps + 1;
+
+  const raw = await redis.lrange(seriesKey, -neededPoints, -1);
   const points = (raw || []).map(safeJsonParse).filter(Boolean);
 
   const nowPoint = points.length >= 1 ? points[points.length - 1] : null;
-  const prevPoint5m = points.length >= 2 ? points[points.length - 2] : null;
-  const prevPoint1h = points.length >= 13 ? points[0] : null;
+  const prevTfPoint = points.length >= neededPoints ? points[0] : null;
 
-  const price_change_5m_pct = pctChange(nowPoint?.p, prevPoint5m?.p);
-  const oi_change_5m_pct = pctChange(nowPoint?.oi, prevPoint5m?.oi);
+  const price_change_tf_pct = pctChange(nowPoint?.p, prevTfPoint?.p);
+  const oi_change_tf_pct = pctChange(nowPoint?.oi, prevTfPoint?.oi);
 
-  const funding_change_5m =
-    Number.isFinite(nowPoint?.fr) && Number.isFinite(prevPoint5m?.fr)
-      ? nowPoint.fr - prevPoint5m.fr
+  const funding_change_tf =
+    Number.isFinite(nowPoint?.fr) && Number.isFinite(prevTfPoint?.fr)
+      ? nowPoint.fr - prevTfPoint.fr
       : null;
 
-  const oi_change_1h_pct = pctChange(nowPoint?.oi, prevPoint1h?.oi);
-
-  const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
+  const state = classifyState(price_change_tf_pct, oi_change_tf_pct);
   const { lean, why } = addLeanAndWhy(state, funding_rate);
 
-  const warmup_5m = !(nowPoint && prevPoint5m);
-  const warmup_1h = !(nowPoint && prevPoint1h);
+  const warmup_tf = !(nowPoint && prevTfPoint);
 
   return {
     ok: true,
     symbol,
     instId,
+    tf,
     price,
     funding_rate,
     open_interest_contracts,
     open_interest_usd,
 
-    price_change_5m_pct,
-    oi_change_5m_pct,
-    funding_change_5m,
-    oi_change_1h_pct,
+    // timeframe changes
+    price_change_tf_pct,
+    oi_change_tf_pct,
+    funding_change_tf,
 
+    // read
     state,
     lean,
     why,
 
-    warmup_5m,
-    warmup_1h,
+    warmup_tf,
 
     source: "okx_swap_public_api+upstash_series",
   };
@@ -295,8 +267,9 @@ async function fetchOne(symbol, now, reqCache) {
 
 export default async function handler(req, res) {
   try {
-    const symbolsRaw = String(req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT");
+    const tf = normalizeTf(req.query.tf);
 
+    const symbolsRaw = String(req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT");
     const symbols = symbolsRaw
       .split(",")
       .map((s) => s.trim().toUpperCase())
@@ -309,24 +282,19 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Too many symbols (max 50)." });
     }
 
-    // request-scope caches (no Redis writes; just faster execution)
-    const reqCache = {
-      swapList: null,
-      swapInstSet: null,
-      instMap: new Map(), // base -> instId|null
-    };
-
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, reqCache)));
+    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, tf)));
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       ts: now,
+      tf,
       symbols,
       results,
       note:
-        "OKX perps-only. Rolling 5m series (24h). warmup_5m=false after 2 points; warmup_1h=false after 13 points (~65m).",
+        "OKX perps-only. Rolling 5m series (24h). Timeframe deltas are derived from 5m points. warmup_tf=false once enough points exist for selected tf.",
+      tf_help: Object.keys(TF_TO_STEPS),
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: "server error", detail: String(err?.message || err) });
