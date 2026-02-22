@@ -91,10 +91,13 @@ async function fetchOne(symbol, now) {
 }
 
   // Compute deltas from last two stored buckets
-  const lastTwo = await redis.lrange(seriesKey, -2, -1);
-  const prevPoint = lastTwo?.[0] || null;
-  const nowPoint = lastTwo?.[1] || null;
+  const rawLastTwo = await redis.lrange(seriesKey, -2, -1);
+const lastTwo = rawLastTwo.map(v => {
+  try { return JSON.parse(v); } catch { return null; }
+});
 
+const prevPoint = lastTwo?.[0] || null;
+const nowPoint = lastTwo?.[1] || null;
   const price_change_5m_pct = pctChange(nowPoint?.p, prevPoint?.p);
   const oi_change_5m_pct = pctChange(nowPoint?.oi, prevPoint?.oi);
   const funding_change_5m =
