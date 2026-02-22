@@ -60,6 +60,52 @@ async function fetchOne(symbol, now) {
       ? open_interest_contracts * price
       : null;
 
+    // ---- Rolling 5-minute series (24h) ----
+  const bucketMs = 5 * 60 * 1000;
+  const bucket = Math.floor(now / bucketMs);
+
+  const seriesKey = `series5m:${instId}`;
+  const lastBucketKey = `lastBucket:${instId}`;
+
+  const lastBucket = await redis.get(lastBucketKey);
+
+  // Only append once per bucket
+  if (lastBucket !== bucket) {
+    const point = {
+      b: bucket,
+      ts: now,
+      p: price,
+      fr: funding_rate,
+      oi: open_interest_contracts,
+    };
+
+    await redis.rpush(seriesKey, point);
+    await redis.ltrim(seriesKey, -288, -1);          // keep last 24h (288 points)
+    await redis.set(lastBucketKey, bucket);
+    await redis.expire(seriesKey, 60 * 60 * 48);     // 48h TTL
+    await redis.expire(lastBucketKey, 60 * 60 * 48);
+  }
+
+  // Pull last two points to compute 5m deltas (true sequential bucket deltas)
+  const lastTwo = await redis.lrange(seriesKey, -2, -1);
+  const prevPoint = lastTwo?.[0] || null;
+  const nowPoint = lastTwo?.[1] || null;
+
+  const price_change_5m_pct = pctChange(nowPoint?.p, prevPoint?.p);
+  const oi_change_5m_pct = pctChange(nowPoint?.oi, prevPoint?.oi);
+  const funding_change_5m =
+    Number.isFinite(nowPoint?.fr) && Number.isFinite(prevPoint?.fr)
+      ? nowPoint.fr - prevPoint.fr
+      : null;
+
+  const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
+  
+  
+  
+  
+  
+  
+  
   // Strict 5m bucketing (same logic as /api/snapshot)
   const bucketMs = 5 * 60 * 1000;
   const bucket = Math.floor(now / bucketMs);
@@ -80,19 +126,6 @@ async function fetchOne(symbol, now) {
     await redis.set(keyNow, snapNow);
     await redis.expire(keyNow, 60 * 60 * 24); // 24h retention
   }
-
-  const price_change_5m_pct = pctChange(snapNow.price, snapPrev?.price);
-  const oi_change_5m_pct = pctChange(
-    snapNow.open_interest_contracts,
-    snapPrev?.open_interest_contracts
-  );
-  const funding_change_5m =
-    Number.isFinite(snapNow.funding_rate) && Number.isFinite(snapPrev?.funding_rate)
-      ? snapNow.funding_rate - snapPrev.funding_rate
-      : null;
-
-  const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
-
   return {
     ok: true,
     symbol,
