@@ -1,0 +1,14 @@
+name: Ping market gateway
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call multi endpoint
+        run: |
+          curl -sS "https://https://crypto-market-gateway.vercel.app/api/multi?symbols=ETHUSDT,LDOUSDT" | head -c 4000
