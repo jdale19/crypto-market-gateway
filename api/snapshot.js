@@ -64,25 +64,38 @@ export default async function handler(req, res) {
         : null;
 
     // Load previous snapshot from Redis
-    const key = `snapshot:${instId}`;
-    const prev = await redis.get(key);
+ // --- 5-minute bucketing ---
+const bucketMs = 5 * 60 * 1000; // 300,000 ms
+const now = Date.now();
+const bucket = Math.floor(now / bucketMs);
 
-    const price_change_pct = pctChange(price, prev?.price);
-    const oi_change_pct = pctChange(open_interest_contracts, prev?.open_interest_contracts);
-    const funding_change = (Number.isFinite(funding_rate) && Number.isFinite(prev?.funding_rate))
-      ? (funding_rate - prev.funding_rate)
-      : null;
+const keyNow = `snap5m:${instId}:${bucket}`;
+const keyPrev = `snap5m:${instId}:${bucket - 1}`;
 
-    const state = classifyState(price_change_pct, oi_change_pct);
+let snapNow = await redis.get(keyNow);
+const snapPrev = await redis.get(keyPrev);
 
-    // Store current snapshot for next call
-    const snapshot = {
-      price,
-      funding_rate,
-      open_interest_contracts,
-      ts: Date.now(),
-    };
-    await redis.set(key, snapshot);
+// Store one snapshot per 5-min bucket (anchor)
+if (!snapNow) {
+  snapNow = {
+    price,
+    funding_rate,
+    open_interest_contracts,
+    ts: now,
+  };
+  await redis.set(keyNow, snapNow);
+  // optional retention: 24h
+  await redis.expire(keyNow, 60 * 60 * 24);
+}
+
+const price_change_5m_pct = pctChange(snapNow.price, snapPrev?.price);
+const oi_change_5m_pct = pctChange(snapNow.open_interest_contracts, snapPrev?.open_interest_contracts);
+const funding_change_5m =
+  (Number.isFinite(snapNow.funding_rate) && Number.isFinite(snapPrev?.funding_rate))
+    ? (snapNow.funding_rate - snapPrev.funding_rate)
+    : null;
+
+const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
