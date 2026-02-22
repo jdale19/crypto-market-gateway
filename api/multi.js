@@ -203,7 +203,7 @@ function computeTfDeltas(points, tf, funding_rate) {
   };
 }
 
-async function fetchOne(symbol, now, driver_tf, debug) {
+async function fetchOne(symbol, now, driver_tf, debugMode) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
@@ -237,24 +237,32 @@ async function fetchOne(symbol, now, driver_tf, debug) {
   const lastBucketRaw = await redis.get(lastBucketKey);
   const lastBucketNum = lastBucketRaw == null ? null : Number(lastBucketRaw);
 
-  let did_append_this_call = false;
+  let wrotePoint = false;
 
   if (!Number.isFinite(lastBucketNum) || lastBucketNum !== bucket) {
     const point = { b: bucket, ts: now, p: price, fr: funding_rate, oi: open_interest_contracts };
 
     await redis.rpush(seriesKey, JSON.stringify(point));
-    await redis.ltrim(seriesKey, -SERIES_POINTS_24H, -1);
+    wrotePoint = true;
+
+    // Trim using POSITIVE indices (avoid negative-index quirks)
+    const lenAfter = await redis.llen(seriesKey);
+    if (Number.isFinite(lenAfter) && lenAfter > SERIES_POINTS_24H) {
+      const startKeep = Math.max(0, lenAfter - SERIES_POINTS_24H);
+      await redis.ltrim(seriesKey, startKeep, lenAfter - 1);
+    }
 
     await redis.set(lastBucketKey, String(bucket));
 
     await redis.expire(seriesKey, SERIES_TTL_SECONDS);
     await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
-
-    did_append_this_call = true;
   }
 
   // ---- Read once (max needed) then compute ALL timeframes in-memory ----
-  const raw = await redis.lrange(seriesKey, -MAX_NEEDED_POINTS, -1);
+  const seriesLen = await redis.llen(seriesKey);
+  const endIdx = Math.max(0, (seriesLen || 0) - 1);
+  const startIdx = Math.max(0, (seriesLen || 0) - MAX_NEEDED_POINTS);
+  const raw = seriesLen > 0 ? await redis.lrange(seriesKey, startIdx, endIdx) : [];
   const points = (raw || []).map(safeJsonParse).filter(Boolean);
 
   const deltas = {};
@@ -273,13 +281,11 @@ async function fetchOne(symbol, now, driver_tf, debug) {
     symbol,
     instId,
 
-    // current values
     price,
     funding_rate,
     open_interest_contracts,
     open_interest_usd,
 
-    // multi-timeframe package
     driver_tf,
     state,
     lean,
@@ -289,36 +295,25 @@ async function fetchOne(symbol, now, driver_tf, debug) {
     source: "okx_swap_public_api+upstash_series",
   };
 
-  if (debug) {
-    const series_len = await redis.llen(seriesKey);
+  if (debugMode) {
     out.debug = {
       bucket_now: bucket,
-      lastBucket_stored_raw: lastBucketRaw ?? null,
-      lastBucket_stored_num: Number.isFinite(lastBucketNum) ? lastBucketNum : null,
-      did_append_this_call,
-      series_len: Number.isFinite(series_len) ? series_len : series_len ?? null,
-      points_read: points.length,
-      last_point: points.length ? points[points.length - 1] : null,
-      first_point: points.length ? points[0] : null,
-      keys: { seriesKey, lastBucketKey },
+      last_bucket_stored: Number.isFinite(lastBucketNum) ? lastBucketNum : null,
+      wrote_point: wrotePoint,
+      series_len: Number.isFinite(seriesLen) ? seriesLen : null,
+      read_start: startIdx,
+      read_end: endIdx,
+      points_parsed: points.length,
     };
   }
 
   return out;
 }
 
-function wantsHtml(req) {
-  return String(req.query.view || "").toLowerCase() === "html";
-}
-
-function wantsDebug(req) {
-  return String(req.query.debug || "").toLowerCase() === "1";
-}
-
 export default async function handler(req, res) {
   try {
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
-    const debug = wantsDebug(req);
+    const debugMode = String(req.query.debug || "") === "1";
 
     const symbolsRaw = String(req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT");
     const symbols = symbolsRaw
@@ -334,60 +329,7 @@ export default async function handler(req, res) {
     }
 
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf, debug)));
-
-    // iPhone-friendly HTML view (auto-refresh)
-    if (wantsHtml(req)) {
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.setHeader("Cache-Control", "no-store");
-
-      const qs = new URLSearchParams(req.query);
-      // Ensure HTML view loads JSON view from same endpoint but without view=html
-      qs.delete("view");
-      const jsonUrl = `/api/multi?${qs.toString()}`;
-
-      return res.status(200).send(`<!doctype html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>crypto-market-gateway</title>
-  <style>
-    body { font-family: -apple-system, system-ui, Arial; margin: 12px; }
-    pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; }
-    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-    button { padding: 8px 10px; font-size: 14px; }
-    input { width: 80px; padding: 6px; font-size: 14px; }
-  </style>
-</head>
-<body>
-  <div class="row">
-    <button onclick="load()">Refresh</button>
-    <span>Auto:</span>
-    <input id="sec" type="number" value="10" min="3" />
-    <button onclick="toggle()">Start/Stop</button>
-    <span id="status">stopped</span>
-  </div>
-  <div><strong>JSON:</strong> ${jsonUrl}</div>
-  <pre id="out">Loading...</pre>
-<script>
-  let t = null;
-  async function load() {
-    const r = await fetch("${jsonUrl}", { cache: "no-store" });
-    const j = await r.json();
-    document.getElementById("out").textContent = JSON.stringify(j, null, 2);
-  }
-  function toggle() {
-    const s = document.getElementById("status");
-    if (t) { clearInterval(t); t = null; s.textContent = "stopped"; return; }
-    const sec = Math.max(3, Number(document.getElementById("sec").value || 10));
-    t = setInterval(load, sec * 1000);
-    s.textContent = "running";
-  }
-  load();
-</script>
-</body>
-</html>`);
-    }
+    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf, debugMode)));
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
@@ -398,8 +340,8 @@ export default async function handler(req, res) {
       timeframes: TF_ORDER,
       results,
       note:
-        "OKX perps-only. Rolling 5m series (24h). Each response includes deltas for 5m/15m/30m/1h/4h derived from 5m points. warmup per timeframe goes false once enough points exist.",
-      tip: "Set driver_tf=4h when you want the top-level lean/why to reflect longer-term positioning.",
+        "OKX perps-only. Rolling 5m series (24h). Each response includes deltas for 5m/15m/30m/1h/4h derived from 5m points.",
+      tip: "Add &debug=1 to see series_len / wrote_point / bucket info.",
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: "server error", detail: String(err?.message || err) });
