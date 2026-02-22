@@ -19,6 +19,8 @@ const SERIES_TTL_SECONDS = 60 * 60 * 48; // 48h
 const INST_MAP_TTL_SECONDS = 60 * 60 * 24; // 24h
 const INST_LIST_TTL_SECONDS = 60 * 60 * 12; // 12h
 
+const FETCH_TIMEOUT_MS = 8000;
+
 function pctChange(now, prev) {
   if (prev == null || !Number.isFinite(prev) || prev === 0) return null;
   if (now == null || !Number.isFinite(now)) return null;
@@ -40,7 +42,6 @@ function baseFromSymbolUSDT(symbol) {
 }
 
 // Using 5m as default for the "lean" because you wanted scalp + positioning.
-// (You can later add ?tf=1h to swap the driver, but keeping it simple now.)
 function classifyState(priceChgPct, oiChgPct) {
   if (priceChgPct == null || oiChgPct == null) return "unknown";
   const pUp = priceChgPct > 0;
@@ -54,8 +55,6 @@ function classifyState(priceChgPct, oiChgPct) {
 }
 
 function addLeanAndWhy(state, funding_rate) {
-  // Keep it readable and directional.
-  // funding_rate just adds a hint, it shouldn't override the state.
   if (state === "longs opening") {
     return { lean: "long", why: "Price up while positions grew (buyers adding)." };
   }
@@ -66,11 +65,9 @@ function addLeanAndWhy(state, funding_rate) {
     return { lean: "long", why: "Price up while positions shrank (shorts exiting pushed up)." };
   }
   if (state === "longs closing") {
-    // Could bounce, but the clean read is “risk-off / exits”
     return { lean: "short", why: "Price down while positions shrank (longs exiting pushed down)." };
   }
 
-  // If we can't classify, use funding as a tiny tie-breaker (still neutral).
   if (Number.isFinite(funding_rate)) {
     if (funding_rate > 0) return { lean: "neutral", why: "Not enough change data yet; funding slightly positive." };
     if (funding_rate < 0) return { lean: "neutral", why: "Not enough change data yet; funding slightly negative." };
@@ -78,16 +75,34 @@ function addLeanAndWhy(state, funding_rate) {
   return { lean: "neutral", why: "Not enough change data yet." };
 }
 
-async function getOkxSwapInstrumentListCached() {
+async function fetchWithTimeout(url) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ---- OKX instruments list (Redis cached) ----
+async function getOkxSwapInstrumentListCached(reqCache) {
+  // request-scope memory cache first
+  if (reqCache.swapList) return reqCache.swapList;
+
   const cacheKey = `okx:instruments:swap:list:v1`;
   const cached = await redis.get(cacheKey);
+
   if (cached) {
     const list = safeJsonParse(cached);
-    if (Array.isArray(list)) return list;
+    if (Array.isArray(list)) {
+      reqCache.swapList = list;
+      return list;
+    }
   }
 
   const url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
-  const r = await fetch(url);
+  const r = await fetchWithTimeout(url);
   if (!r.ok) return null;
 
   const j = await r.json();
@@ -96,42 +111,66 @@ async function getOkxSwapInstrumentListCached() {
 
   await redis.set(cacheKey, JSON.stringify(list));
   await redis.expire(cacheKey, INST_LIST_TTL_SECONDS);
+
+  reqCache.swapList = list;
   return list;
 }
 
-async function resolveOkxSwapInstId(symbol) {
+// Resolve real OKX SWAP instId (perps-only mode)
+async function resolveOkxSwapInstId(symbol, reqCache) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) return null;
 
+  // request-scope memory cache
+  if (reqCache.instMap.has(base)) return reqCache.instMap.get(base);
+
   const mapKey = `instmap:okx:swap:${base}`;
   const cached = await redis.get(mapKey);
-  if (cached) return cached === "__NONE__" ? null : cached;
-
-  const list = await getOkxSwapInstrumentListCached();
-  if (!Array.isArray(list)) {
-    // If OKX list fetch fails, fall back to a guess (do NOT cache it).
-    return `${base}-USDT-SWAP`;
+  if (cached) {
+    const v = cached === "__NONE__" ? null : String(cached);
+    reqCache.instMap.set(base, v);
+    return v;
   }
 
-  const target = `${base}-USDT-SWAP`;
-  const found = list.find((x) => String(x?.instId || "").toUpperCase() === target);
+  const list = await getOkxSwapInstrumentListCached(reqCache);
 
-  if (found?.instId) {
-    await redis.set(mapKey, String(found.instId));
+  // If list fetch fails, fall back to guess (do NOT cache it)
+  if (!Array.isArray(list)) {
+    const guess = `${base}-USDT-SWAP`;
+    reqCache.instMap.set(base, guess);
+    return guess;
+  }
+
+  // Build request-scope lookup map once
+  if (!reqCache.swapInstSet) {
+    const set = new Set();
+    for (const x of list) {
+      const id = String(x?.instId || "").toUpperCase();
+      if (id) set.add(id);
+    }
+    reqCache.swapInstSet = set;
+  }
+
+  const target = `${base}-USDT-SWAP`.toUpperCase();
+
+  if (reqCache.swapInstSet.has(target)) {
+    await redis.set(mapKey, target);
     await redis.expire(mapKey, INST_MAP_TTL_SECONDS);
-    return String(found.instId);
+    reqCache.instMap.set(base, target);
+    return target;
   }
 
   await redis.set(mapKey, "__NONE__");
   await redis.expire(mapKey, INST_MAP_TTL_SECONDS);
+  reqCache.instMap.set(base, null);
   return null;
 }
 
 async function fetchOkxSwap(instId) {
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
-    fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
-    fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
-    fetch(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
+    fetchWithTimeout(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
+    fetchWithTimeout(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
+    fetchWithTimeout(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
   ]);
 
   if (!tickerRes.ok) return { ok: false, error: "ticker fetch failed" };
@@ -158,13 +197,13 @@ async function fetchOkxSwap(instId) {
   };
 }
 
-async function fetchOne(symbol, now) {
+async function fetchOne(symbol, now, reqCache) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
   }
 
-  const instId = await resolveOkxSwapInstId(symbol);
+  const instId = await resolveOkxSwapInstId(symbol, reqCache);
   if (!instId) {
     return {
       ok: false,
@@ -191,11 +230,9 @@ async function fetchOne(symbol, now) {
   const seriesKey = `series5m:${instId}`;
   const lastBucketKey = `lastBucket:${instId}`;
 
-  // Upstash GET returns strings; normalize
   const lastBucketRaw = await redis.get(lastBucketKey);
   const lastBucketNum = lastBucketRaw == null ? null : Number(lastBucketRaw);
 
-  // Append once per bucket
   if (!Number.isFinite(lastBucketNum) || lastBucketNum !== bucket) {
     const point = { b: bucket, ts: now, p: price, fr: funding_rate, oi: open_interest_contracts };
 
@@ -208,16 +245,16 @@ async function fetchOne(symbol, now) {
     await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
   }
 
-  // Last 13 points -> 5m + ~1h deltas
   const raw = await redis.lrange(seriesKey, -13, -1);
   const points = (raw || []).map(safeJsonParse).filter(Boolean);
 
   const nowPoint = points.length >= 1 ? points[points.length - 1] : null;
   const prevPoint5m = points.length >= 2 ? points[points.length - 2] : null;
-  const prevPoint1h = points.length >= 13 ? points[0] : null; // 12 intervals back ~60m
+  const prevPoint1h = points.length >= 13 ? points[0] : null;
 
   const price_change_5m_pct = pctChange(nowPoint?.p, prevPoint5m?.p);
   const oi_change_5m_pct = pctChange(nowPoint?.oi, prevPoint5m?.oi);
+
   const funding_change_5m =
     Number.isFinite(nowPoint?.fr) && Number.isFinite(prevPoint5m?.fr)
       ? nowPoint.fr - prevPoint5m.fr
@@ -240,13 +277,11 @@ async function fetchOne(symbol, now) {
     open_interest_contracts,
     open_interest_usd,
 
-    // changes
     price_change_5m_pct,
     oi_change_5m_pct,
     funding_change_5m,
     oi_change_1h_pct,
 
-    // read
     state,
     lean,
     why,
@@ -274,8 +309,15 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Too many symbols (max 50)." });
     }
 
+    // request-scope caches (no Redis writes; just faster execution)
+    const reqCache = {
+      swapList: null,
+      swapInstSet: null,
+      instMap: new Map(), // base -> instId|null
+    };
+
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now)));
+    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, reqCache)));
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
