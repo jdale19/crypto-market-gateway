@@ -33,14 +33,30 @@ function classifyState(priceChgPct, oiChgPct) {
 async function fetchOne(symbol, now) {
   const instId = toOkxInstId(symbol);
   if (!instId) {
-    return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
+    return {
+      ok: false,
+      symbol,
+      error: "unsupported symbol format (expected like ETHUSDT)",
+    };
   }
 
   // ---- Fetch OKX current values ----
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
-    fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
-    fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
-    fetch(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
+    fetch(
+      `https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(
+        instId
+      )}`
+    ),
+    fetch(
+      `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(
+        instId
+      )}`
+    ),
+    fetch(
+      `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(
+        instId
+      )}`
+    ),
   ]);
 
   if (!tickerRes.ok) return { ok: false, symbol, instId, error: "ticker fetch failed" };
@@ -67,43 +83,65 @@ async function fetchOne(symbol, now) {
   const seriesKey = `series5m:${instId}`;
   const lastBucketKey = `lastBucket:${instId}`;
 
-  const lastBucket = await redis.get(lastBucketKey);
+  // Upstash returns strings; normalize to number for comparison
+  const lastBucketRaw = await redis.get(lastBucketKey);
+  const lastBucket = lastBucketRaw == null ? null : Number(lastBucketRaw);
 
   // Append only once per bucket
   if (lastBucket !== bucket) {
-  const point = {
-    b: bucket,
-    ts: now,
-    p: price,
-    fr: funding_rate,
-    oi: open_interest_contracts,
-  };
+    const point = {
+      b: bucket,
+      ts: now,
+      p: price,
+      fr: funding_rate,
+      oi: open_interest_contracts,
+    };
 
-  try {
-    await redis.rpush(seriesKey, JSON.stringify(point));
-    await redis.ltrim(seriesKey, -288, -1);
-    await redis.set(lastBucketKey, bucket);
-    await redis.expire(seriesKey, 60 * 60 * 48);
-    await redis.expire(lastBucketKey, 60 * 60 * 48);
-  } catch (e) {
-    console.error("Redis write failed:", e?.message || e);
+    try {
+      await redis.rpush(seriesKey, JSON.stringify(point));
+      await redis.ltrim(seriesKey, -288, -1);
+      await redis.set(lastBucketKey, String(bucket));
+      await redis.expire(seriesKey, 60 * 60 * 48);
+      await redis.expire(lastBucketKey, 60 * 60 * 48);
+    } catch (e) {
+      console.error("Redis write failed:", e?.message || e);
+    }
   }
-}
 
-  // Compute deltas from last two stored buckets
+  // ---- Compute deltas from stored buckets ----
+  const parseList = (raw) =>
+    (raw || []).map((v) => {
+      try {
+        return JSON.parse(v);
+      } catch {
+        return null;
+      }
+    });
+
+  // 5m deltas: last two points
   const rawLastTwo = await redis.lrange(seriesKey, -2, -1);
-const lastTwo = rawLastTwo.map(v => {
-  try { return JSON.parse(v); } catch { return null; }
-});
+  const lastTwo = parseList(rawLastTwo);
 
-const prevPoint = lastTwo?.[0] || null;
-const nowPoint = lastTwo?.[1] || null;
+  const prevPoint = lastTwo?.[0] || null;
+  const nowPoint = lastTwo?.[1] || null;
+
   const price_change_5m_pct = pctChange(nowPoint?.p, prevPoint?.p);
   const oi_change_5m_pct = pctChange(nowPoint?.oi, prevPoint?.oi);
   const funding_change_5m =
     Number.isFinite(nowPoint?.fr) && Number.isFinite(prevPoint?.fr)
       ? nowPoint.fr - prevPoint.fr
       : null;
+
+  // 1h OI change: 12 buckets back (13 points including now)
+  const rawLast13 = await redis.lrange(seriesKey, -13, -1);
+  const last13 = parseList(rawLast13);
+
+  let oi_change_1h_pct = null;
+  if (Array.isArray(last13) && last13.length === 13) {
+    const point1hAgo = last13[0];
+    const pointNow = last13[12];
+    oi_change_1h_pct = pctChange(pointNow?.oi, point1hAgo?.oi);
+  }
 
   const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
   const warmup = !(prevPoint && nowPoint);
@@ -116,9 +154,15 @@ const nowPoint = lastTwo?.[1] || null;
     funding_rate,
     open_interest_contracts,
     open_interest_usd,
+
+    // 5m
     price_change_5m_pct,
     oi_change_5m_pct,
     funding_change_5m,
+
+    // 1h
+    oi_change_1h_pct,
+
     state,
     warmup,
     source: "okx_swap_public_api+upstash_series",
@@ -128,9 +172,7 @@ const nowPoint = lastTwo?.[1] || null;
 export default async function handler(req, res) {
   try {
     const symbolsRaw = String(
-      req.query.symbols ||
-      process.env.DEFAULT_SYMBOLS ||
-      "ETHUSDT,LDOUSDT"
+      req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT"
     );
 
     const symbols = symbolsRaw
@@ -146,9 +188,7 @@ export default async function handler(req, res) {
     }
 
     const now = Date.now();
-    const results = await Promise.all(
-      symbols.map((sym) => fetchOne(sym, now))
-    );
+    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now)));
 
     res.setHeader("Cache-Control", "no-store");
 
@@ -157,7 +197,7 @@ export default async function handler(req, res) {
       ts: now,
       symbols,
       results,
-      note: "Rolling 5-minute series (24h). warmup=true until 2 buckets exist.",
+      note: "Rolling 5-minute series (24h). warmup=true until 2 buckets exist. oi_change_1h_pct needs 13 points (~65 minutes) to populate.",
     });
   } catch (err) {
     return res.status(500).json({
