@@ -9,12 +9,9 @@ const BUCKET_MS = 5 * 60 * 1000;
 const SERIES_POINTS_24H = 288; // 24h / 5m
 const SERIES_TTL_SECONDS = 60 * 60 * 48; // 48h
 
-function toOkxInstId(symbol) {
-  const s = String(symbol || "").toUpperCase();
-  if (!s.endsWith("USDT")) return null;
-  const base = s.slice(0, -4);
-  return `${base}-USDT-SWAP`;
-}
+// OKX instrument discovery cache
+const INST_MAP_TTL_SECONDS = 60 * 60 * 24; // 24h
+const INST_LIST_TTL_SECONDS = 60 * 60 * 12; // 12h (list is big; cache it)
 
 function pctChange(now, prev) {
   if (prev == null || !Number.isFinite(prev) || prev === 0) return null;
@@ -42,11 +39,83 @@ function classifyState(priceChgPct, oiChgPct) {
   return "unknown";
 }
 
+function baseFromSymbolUSDT(symbol) {
+  const s = String(symbol || "").toUpperCase();
+  if (!s.endsWith("USDT")) return null;
+  return s.slice(0, -4);
+}
+
+// Fetch and cache OKX SWAP instruments list (so we don't hammer OKX)
+async function getOkxSwapInstrumentListCached() {
+  const cacheKey = `okx:instruments:swap:list:v1`;
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    const list = safeJsonParse(cached);
+    if (Array.isArray(list)) return list;
+  }
+
+  const url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
+  const r = await fetch(url);
+  if (!r.ok) return null;
+
+  const j = await r.json();
+  const list = Array.isArray(j?.data) ? j.data : null;
+  if (!Array.isArray(list)) return null;
+
+  // Store as JSON string
+  await redis.set(cacheKey, JSON.stringify(list));
+  await redis.expire(cacheKey, INST_LIST_TTL_SECONDS);
+
+  return list;
+}
+
+// Resolve the real OKX SWAP instId for a symbol like FETUSDT,
+// instead of guessing `${base}-USDT-SWAP`.
+async function resolveOkxSwapInstId(symbol) {
+  const base = baseFromSymbolUSDT(symbol);
+  if (!base) return null;
+
+  const mapKey = `instmap:okx:swap:${base}`;
+  const cached = await redis.get(mapKey);
+
+  // cache may be actual instId string or "__NONE__"
+  if (cached) return cached === "__NONE__" ? null : cached;
+
+  const list = await getOkxSwapInstrumentListCached();
+
+  // If list fetch fails, fall back to old guess (don’t poison cache)
+  if (!Array.isArray(list)) {
+    return `${base}-USDT-SWAP`;
+  }
+
+  const target = `${base}-USDT-SWAP`;
+  const found = list.find((x) => String(x?.instId || "").toUpperCase() === target);
+
+  if (found?.instId) {
+    await redis.set(mapKey, String(found.instId));
+    await redis.expire(mapKey, INST_MAP_TTL_SECONDS);
+    return String(found.instId);
+  }
+
+  // Not found: cache that fact so we don't refetch repeatedly
+  await redis.set(mapKey, "__NONE__");
+  await redis.expire(mapKey, INST_MAP_TTL_SECONDS);
+  return null;
+}
+
 async function fetchOkx(instId) {
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
-    fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
-    fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
-    fetch(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
+    fetch(
+      `https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`
+    ),
+    fetch(
+      `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`
+    ),
+    fetch(
+      `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(
+        instId
+      )}`
+    ),
   ]);
 
   if (!tickerRes.ok) return { ok: false, error: "ticker fetch failed" };
@@ -75,9 +144,23 @@ async function fetchOkx(instId) {
 }
 
 async function fetchOne(symbol, now) {
-  const instId = toOkxInstId(symbol);
+  const base = baseFromSymbolUSDT(symbol);
+  if (!base) {
+    return {
+      ok: false,
+      symbol,
+      error: "unsupported symbol format (expected like ETHUSDT)",
+    };
+  }
+
+  const instId = await resolveOkxSwapInstId(symbol);
   if (!instId) {
-    return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
+    return {
+      ok: false,
+      symbol,
+      instId: `${base}-USDT-SWAP`,
+      error: "no OKX USDT swap market found for this symbol",
+    };
   }
 
   const okx = await fetchOkx(instId);
@@ -172,9 +255,7 @@ async function fetchOne(symbol, now) {
 export default async function handler(req, res) {
   try {
     const symbolsRaw = String(
-      req.query.symbols ||
-      process.env.DEFAULT_SYMBOLS ||
-      "ETHUSDT,LDOUSDT"
+      req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT"
     );
 
     const symbols = symbolsRaw
@@ -207,7 +288,7 @@ export default async function handler(req, res) {
       symbols,
       results,
       note:
-        "Rolling 5-minute series (24h). warmup_5m=false after 2 points. warmup_1h=false after 13 points (~65m window).",
+        "Rolling 5-minute series (24h). warmup_5m=false after 2 points. warmup_1h=false after 13 points (~65m window). OKX SWAP instId is discovered/cached (24h) instead of guessed.",
     });
   } catch (err) {
     return res.status(500).json({
