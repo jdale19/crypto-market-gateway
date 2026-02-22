@@ -71,20 +71,24 @@ async function fetchOne(symbol, now) {
 
   // Append only once per bucket
   if (lastBucket !== bucket) {
-    const point = {
-      b: bucket,
-      ts: now,
-      p: price,
-      fr: funding_rate,
-      oi: open_interest_contracts,
-    };
+  const point = {
+    b: bucket,
+    ts: now,
+    p: price,
+    fr: funding_rate,
+    oi: open_interest_contracts,
+  };
 
-    await redis.rpush(seriesKey, point);
-    await redis.ltrim(seriesKey, -288, -1); // keep last 24h (288 buckets)
+  try {
+    await redis.rpush(seriesKey, JSON.stringify(point));
+    await redis.ltrim(seriesKey, -288, -1);
     await redis.set(lastBucketKey, bucket);
     await redis.expire(seriesKey, 60 * 60 * 48);
     await redis.expire(lastBucketKey, 60 * 60 * 48);
+  } catch (e) {
+    console.error("Redis write failed:", e?.message || e);
   }
+}
 
   // Compute deltas from last two stored buckets
   const lastTwo = await redis.lrange(seriesKey, -2, -1);
