@@ -36,7 +36,7 @@ async function fetchOne(symbol, now) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
   }
 
-  // OKX current values
+  // ---- Fetch OKX current values ----
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
     fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
     fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
@@ -60,7 +60,7 @@ async function fetchOne(symbol, now) {
       ? open_interest_contracts * price
       : null;
 
-    // ---- Rolling 5-minute series (24h) ----
+  // ---- Rolling 5-minute history (24h) ----
   const bucketMs = 5 * 60 * 1000;
   const bucket = Math.floor(now / bucketMs);
 
@@ -69,7 +69,7 @@ async function fetchOne(symbol, now) {
 
   const lastBucket = await redis.get(lastBucketKey);
 
-  // Only append once per bucket
+  // Append only once per bucket
   if (lastBucket !== bucket) {
     const point = {
       b: bucket,
@@ -80,13 +80,13 @@ async function fetchOne(symbol, now) {
     };
 
     await redis.rpush(seriesKey, point);
-    await redis.ltrim(seriesKey, -288, -1);          // keep last 24h (288 points)
+    await redis.ltrim(seriesKey, -288, -1); // keep last 24h (288 buckets)
     await redis.set(lastBucketKey, bucket);
-    await redis.expire(seriesKey, 60 * 60 * 48);     // 48h TTL
+    await redis.expire(seriesKey, 60 * 60 * 48);
     await redis.expire(lastBucketKey, 60 * 60 * 48);
   }
 
-  // Pull last two points to compute 5m deltas (true sequential bucket deltas)
+  // Compute deltas from last two stored buckets
   const lastTwo = await redis.lrange(seriesKey, -2, -1);
   const prevPoint = lastTwo?.[0] || null;
   const nowPoint = lastTwo?.[1] || null;
@@ -99,33 +99,8 @@ async function fetchOne(symbol, now) {
       : null;
 
   const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
-  
-  
-  
-  
-  
-  
-  
-  // Strict 5m bucketing (same logic as /api/snapshot)
-  const bucketMs = 5 * 60 * 1000;
-  const bucket = Math.floor(now / bucketMs);
+  const warmup = !(prevPoint && nowPoint);
 
-  const keyNow = `snap5m:${instId}:${bucket}`;
-  const keyPrev = `snap5m:${instId}:${bucket - 1}`;
-
-  let snapNow = await redis.get(keyNow);
-  const snapPrev = await redis.get(keyPrev);
-
-  if (!snapNow) {
-    snapNow = {
-      price,
-      funding_rate,
-      open_interest_contracts,
-      ts: now,
-    };
-    await redis.set(keyNow, snapNow);
-    await redis.expire(keyNow, 60 * 60 * 24); // 24h retention
-  }
   return {
     ok: true,
     symbol,
@@ -138,37 +113,50 @@ async function fetchOne(symbol, now) {
     oi_change_5m_pct,
     funding_change_5m,
     state,
-    source: "okx_swap_public_api+upstash_state",
+    warmup,
+    source: "okx_swap_public_api+upstash_series",
   };
 }
 
 export default async function handler(req, res) {
   try {
-    const symbolsRaw = String(req.query.symbols || "ETHUSDT,LDOUSDT");
+    const symbolsRaw = String(
+      req.query.symbols ||
+      process.env.DEFAULT_SYMBOLS ||
+      "ETHUSDT,LDOUSDT"
+    );
+
     const symbols = symbolsRaw
       .split(",")
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean);
 
     if (symbols.length === 0) {
-      return res.status(400).json({ ok: false, error: "No symbols provided. Use ?symbols=ETHUSDT,LDOUSDT" });
-    }
-    if (symbols.length > 10) {
-      return res.status(400).json({ ok: false, error: "Too many symbols (max 10)." });
+      return res.status(400).json({
+        ok: false,
+        error: "No symbols provided. Use ?symbols=ETHUSDT,LDOUSDT",
+      });
     }
 
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now)));
+    const results = await Promise.all(
+      symbols.map((sym) => fetchOne(sym, now))
+    );
 
     res.setHeader("Cache-Control", "no-store");
+
     return res.status(200).json({
       ok: true,
       ts: now,
       symbols,
       results,
-      note: "Strict 5-minute deltas per symbol (bucketed). Call twice within a bucket; deltas stay constant.",
+      note: "Rolling 5-minute series (24h). warmup=true until 2 buckets exist.",
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: "server error", detail: String(err?.message || err) });
+    return res.status(500).json({
+      ok: false,
+      error: "server error",
+      detail: String(err?.message || err),
+    });
   }
 }
