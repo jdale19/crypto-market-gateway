@@ -39,12 +39,24 @@ function pctChange(now, prev) {
   return ((now - prev) / prev) * 100;
 }
 
+// ✅ FIX: handle string OR already-parsed object
 function safeJsonParse(v) {
-  try {
-    return JSON.parse(v);
-  } catch {
-    return null;
+  if (v == null) return null;
+
+  // If Upstash already decoded JSON into an object, keep it.
+  if (typeof v === "object") return v;
+
+  // If it's a string, parse it.
+  if (typeof v === "string") {
+    try {
+      return JSON.parse(v);
+    } catch {
+      return null;
+    }
   }
+
+  // Anything else (number, boolean) isn't valid for our points
+  return null;
 }
 
 function baseFromSymbolUSDT(symbol) {
@@ -146,7 +158,9 @@ async function fetchOkxSwap(instId) {
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
     fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
     fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
-    fetch(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
+    fetch(
+      `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`
+    ),
   ]);
 
   if (!tickerRes.ok) return { ok: false, error: "ticker fetch failed" };
@@ -263,6 +277,8 @@ async function fetchOne(symbol, now, driver_tf, debugMode) {
   const endIdx = Math.max(0, (seriesLen || 0) - 1);
   const startIdx = Math.max(0, (seriesLen || 0) - MAX_NEEDED_POINTS);
   const raw = seriesLen > 0 ? await redis.lrange(seriesKey, startIdx, endIdx) : [];
+
+  // ✅ With fixed safeJsonParse, this will stop being 0
   const points = (raw || []).map(safeJsonParse).filter(Boolean);
 
   const deltas = {};
@@ -304,6 +320,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode) {
       read_start: startIdx,
       read_end: endIdx,
       points_parsed: points.length,
+      raw_type_sample: raw?.[0] == null ? null : typeof raw[0], // quick visibility
     };
   }
 
