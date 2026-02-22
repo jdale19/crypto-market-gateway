@@ -11,4 +11,4 @@ jobs:
     steps:
       - name: Call multi endpoint
         run: |
-          curl -sS "https://https://crypto-market-gateway.vercel.app/api/multi?symbols=ETHUSDT,LDOUSDT" | head -c 4000
+          curl -sS "https://crypto-market-gateway.vercel.app/api/multi?symbols=ETHUSDT,LDOUSDT" | head -c 4000
