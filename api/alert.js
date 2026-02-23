@@ -41,16 +41,15 @@ async function sendTelegram(text) {
 
 function fmtPct(x) {
   if (x == null || !Number.isFinite(x)) return "n/a";
-  const s = x.toFixed(3);
-  return `${s}%`;
+  return `${x.toFixed(3)}%`;
 }
 
 export default async function handler(req, res) {
   try {
-    const symbols =
-      normalizeSymbols(req.query.symbols) ||
-      normalizeSymbols(process.env.DEFAULT_SYMBOLS) ||
-      ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
+    // IMPORTANT: [] is truthy in JS, so we must check length (this was your bug)
+    let symbols = normalizeSymbols(req.query.symbols);
+    if (symbols.length === 0) symbols = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
+    if (symbols.length === 0) symbols = ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
 
     const driver_tf = String(req.query.driver_tf || "5m").toLowerCase();
     const debug = String(req.query.debug || "") === "1";
@@ -69,7 +68,7 @@ export default async function handler(req, res) {
     const j = await r.json();
 
     if (!r.ok || !j?.ok) {
-      return res.status(500).json({ ok: false, error: "multi fetch failed", detail: j || null });
+      return res.status(500).json({ ok: false, error: "multi fetch failed", detail: j || null, multiUrl });
     }
 
     // Build a tight DM
@@ -105,7 +104,9 @@ export default async function handler(req, res) {
     const tg = await sendTelegram(text);
 
     if (!tg.ok) {
-      return res.status(500).json({ ok: false, error: tg.error, detail: tg.detail || null });
+      return res
+        .status(500)
+        .json({ ok: false, error: tg.error, detail: tg.detail || null, symbols, driver_tf, multiUrl });
     }
 
     res.setHeader("Cache-Control", "no-store");
