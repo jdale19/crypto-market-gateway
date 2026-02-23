@@ -52,11 +52,15 @@ function fmtPct(x) {
 
 export default async function handler(req, res) {
   try {
-    // ✅ FIX: [] is truthy. Must check .length and handle "symbols=" explicitly.
+    // FIX: [] is truthy. Must check .length and handle "symbols=" explicitly.
     const querySymbols = normalizeSymbols(req.query.symbols);
     const envSymbols = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
     const symbols =
-      querySymbols.length > 0 ? querySymbols : envSymbols.length > 0 ? envSymbols : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
+      querySymbols.length > 0
+        ? querySymbols
+        : envSymbols.length > 0
+        ? envSymbols
+        : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
 
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
     const debug = String(req.query.debug || "") === "1";
@@ -65,7 +69,7 @@ export default async function handler(req, res) {
     const host = req.headers["x-forwarded-host"] || req.headers.host;
     const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 
-    // ✅ FIX: never send symbols= (blank). Only include symbols param if non-empty.
+    // FIX: never send symbols= (blank). Always include a non-empty list.
     const qs = new URLSearchParams();
     qs.set("symbols", symbols.join(","));
     qs.set("driver_tf", driver_tf);
@@ -89,7 +93,7 @@ export default async function handler(req, res) {
 
     // Build DM
     const lines = [];
-    lines.push(`⚡️ OKX perps snapshot (${driver_tf})`);
+    lines.push(`OKX perps snapshot (${driver_tf})`);
     lines.push(new Date(j.ts).toISOString());
 
     for (const item of j.results || []) {
