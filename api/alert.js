@@ -15,8 +15,8 @@
 // - symbols=BTCUSDT,ETHUSDT   (optional; falls back to env; then fallback list)
 // - driver_tf=5m|15m|30m|1h|4h (optional; default 5m)
 // - debug=1 (optional; adds debug fields to response JSON)
-// - force=1 (optional; bypass criteria + cooldown; sends full snapshot for all symbols)
-// - dry=1   (optional; NEVER sends Telegram, NEVER writes cooldown/lastState; returns would_send)
+// - force=1 (optional; bypass criteria + cooldown; sends snapshot for all symbols)
+// - dry=1 (optional; NEVER sends Telegram, returns would-send payload)
 //
 // Criteria v1 (per symbol):
 // 1) Setup flip: 15m state changed since last check
@@ -124,7 +124,8 @@ async function sendTelegram(text) {
   return { ok: true };
 }
 
-// Pull last N points from the stored series and compute hi/lo/mid
+// Pull last N points from the stored series and compute hi/lo/mid.
+// Points are objects like { b, ts, p, fr, oi } written by /api/multi.js
 async function computeLevelsFromSeries(instId) {
   const seriesKey = CFG.keys.series5m(instId);
   const out = {};
@@ -171,8 +172,12 @@ function playbookLine(bias, levels) {
   const lo = fmtPrice(l1h.lo);
   const mid = fmtPrice(l1h.mid);
 
-  if (bias === "short") return `Watch: breakdown < 1h low (${lo}) = continuation; reclaim > 1h mid (${mid}) = fade risk. (1h hi ${hi})`;
-  if (bias === "long") return `Watch: breakout > 1h high (${hi}) = continuation; lose < 1h mid (${mid}) = fade risk. (1h low ${lo})`;
+  if (bias === "short") {
+    return `Watch: breakdown < 1h low (${lo}) = continuation; reclaim > 1h mid (${mid}) = fade risk. (1h hi ${hi})`;
+  }
+  if (bias === "long") {
+    return `Watch: breakout > 1h high (${hi}) = continuation; lose < 1h mid (${mid}) = fade risk. (1h low ${lo})`;
+  }
   return `Watch: range until break of 1h hi/lo (${hi}/${lo}). Mid=${mid}.`;
 }
 
@@ -230,11 +235,17 @@ export default async function handler(req, res) {
     const dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
+    // symbols: query -> env -> fallback
     const querySymbols = normalizeSymbols(req.query.symbols);
     const envSymbols = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
     const symbols =
-      querySymbols.length > 0 ? querySymbols : envSymbols.length > 0 ? envSymbols : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
+      querySymbols.length > 0
+        ? querySymbols
+        : envSymbols.length > 0
+          ? envSymbols
+          : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
 
+    // Build absolute URL to /api/multi on same host
     const host = req.headers["x-forwarded-host"] || req.headers.host;
     const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 
@@ -247,7 +258,15 @@ export default async function handler(req, res) {
     const j = await r.json().catch(() => null);
 
     if (!r.ok || !j?.ok) {
-      return res.status(500).json({ ok: false, error: "multi fetch failed", detail: j || null, multiUrl, symbols, driver_tf });
+      return res.status(500).json({
+        ok: false,
+        error: "multi fetch failed",
+        detail: j || null,
+        multiUrl,
+        symbols,
+        driver_tf,
+        dry,
+      });
     }
 
     const now = Date.now();
@@ -256,6 +275,7 @@ export default async function handler(req, res) {
     const triggered = [];
     const skipped = [];
 
+    // Evaluate each symbol
     for (const item of j.results || []) {
       if (!item?.ok) {
         skipped.push({ symbol: item?.symbol || "?", reason: `error: ${item?.error || "unknown"}` });
@@ -278,7 +298,8 @@ export default async function handler(req, res) {
 
       const triggers = force ? [{ code: "force", msg: "force=1" }] : evalRes.triggers;
 
-      const inCooldown = !force && Number.isFinite(lastSentAt) && lastSentAt != null && now - lastSentAt < cooldownMs;
+      const inCooldown =
+        !force && Number.isFinite(lastSentAt) && lastSentAt != null && now - lastSentAt < cooldownMs;
 
       if (triggers.length === 0) {
         skipped.push({ symbol, reason: "no criteria hit" });
@@ -298,47 +319,31 @@ export default async function handler(req, res) {
           instId,
           price: item.price,
           bias,
+          state_driver: item.state,
+          lean_driver: item.lean,
           triggers,
           levels,
           watch,
         });
 
-        // IMPORTANT: dry=1 means do NOT mutate state (no cooldown set)
+        // Only persist "sent" time if we are NOT in dry-run
         if (!dry) {
           await redis.set(CFG.keys.lastSentAt(instId), String(now));
         }
       }
 
-      // IMPORTANT: dry=1 means do NOT mutate state (no lastState set)
-      if (!dry && cur15mState) {
+      // Always store current 15m state (even in dry-run)
+      if (cur15mState) {
         await redis.set(CFG.keys.last15mState(instId), cur15mState);
       }
     }
 
-    const would_send = force || triggered.length > 0;
-
-    // If dry=1, NEVER send TG — just return what would happen.
-    if (dry) {
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        sent: false,
-        dry: true,
-        would_send,
-        force,
-        driver_tf,
-        symbols,
-        multiUrl,
-        triggered_count: triggered.length,
-        ...(debug ? { triggered, skipped } : {}),
-      });
-    }
-
-    // If nothing triggered and not force, do not DM
+    // Nothing triggered (and not force) => no DM
     if (!force && triggered.length === 0) {
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
         ok: true,
+        dry,
         sent: false,
         reason: "no triggers",
         driver_tf,
@@ -349,9 +354,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // Build Telegram message
+    // Build Telegram message (or "would send" payload)
     const lines = [];
-    lines.push(`⚡️ OKX perps alert (${driver_tf})${force ? " [FORCE]" : ""}`);
+    lines.push(`⚡️ OKX perps alert (${driver_tf})${force ? " [FORCE]" : ""}${dry ? " [DRY]" : ""}`);
     lines.push(new Date(j.ts || now).toISOString());
     lines.push("");
 
@@ -399,13 +404,27 @@ export default async function handler(req, res) {
       const l4h = t.levels?.["4h"];
       const lvlParts = [];
 
-      if (l1h && !l1h.warmup) lvlParts.push(`1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)} mid=${fmtPrice(l1h.mid)}`);
-      else lvlParts.push(`1h levels: warmup`);
-      if (l4h && !l4h.warmup) lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
+      if (l1h && !l1h.warmup) {
+        lvlParts.push(`1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)} mid=${fmtPrice(l1h.mid)}`);
+      } else {
+        lvlParts.push(`1h levels: warmup`);
+      }
+
+      if (l4h && !l4h.warmup) {
+        lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
+      }
 
       lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`);
-      lines.push(`15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(d15?.oi_change_pct)}`);
-      lines.push(`5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(d5?.oi_change_pct)}`);
+      lines.push(
+        `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(
+          d15?.oi_change_pct
+        )}`
+      );
+      lines.push(
+        `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(
+          d5?.oi_change_pct
+        )}`
+      );
       lines.push(`Levels: ${lvlParts.join(" | ")}`);
       lines.push(t.watch);
       lines.push("");
@@ -414,18 +433,44 @@ export default async function handler(req, res) {
     lines.push(multiUrl);
 
     const text = lines.join("\n");
-    const tg = await sendTelegram(text);
 
+    // ✅ DRY-RUN: never send Telegram
+    if (dry) {
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({
+        ok: true,
+        dry: true,
+        sent: false,
+        would_send: true,
+        driver_tf,
+        force,
+        symbols,
+        multiUrl,
+        triggered_count: triggered.length,
+        preview: text,
+        ...(debug ? { triggered, skipped } : {}),
+      });
+    }
+
+    // Real send
+    const tg = await sendTelegram(text);
     if (!tg.ok) {
-      return res.status(500).json({ ok: false, error: tg.error, detail: tg.detail || null, multiUrl, symbols, driver_tf });
+      return res.status(500).json({
+        ok: false,
+        error: tg.error,
+        detail: tg.detail || null,
+        multiUrl,
+        symbols,
+        driver_tf,
+        dry,
+      });
     }
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
-      sent: true,
       dry: false,
-      would_send: true,
+      sent: true,
       force,
       driver_tf,
       symbols,
