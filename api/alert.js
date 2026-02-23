@@ -1,6 +1,5 @@
 // /api/alert.js
-// Alert Engine v1
-// Evaluates signal rules and sends Telegram DM only when triggered.
+// Alert Criteria v1
 // Requires:
 // - TELEGRAM_BOT_TOKEN
 // - TELEGRAM_CHAT_ID
@@ -26,8 +25,8 @@ function normalizeSymbols(raw) {
 }
 
 function normalizeDriverTf(raw) {
-  const tf = String(raw || "5m").toLowerCase();
   const allowed = new Set(["5m", "15m", "30m", "1h", "4h"]);
+  const tf = String(raw || "5m").toLowerCase();
   return allowed.has(tf) ? tf : "5m";
 }
 
@@ -57,14 +56,16 @@ async function sendTelegram(text) {
 
   const j = await r.json().catch(() => null);
   if (!r.ok || !j?.ok) {
-    return { ok: false, error: "Telegram send failed", detail: j || null };
+    return { ok: false, error: "Telegram send failed", detail: j };
   }
+
   return { ok: true };
 }
 
 export default async function handler(req, res) {
   try {
     const force = String(req.query.force || "") === "1";
+    const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
     const querySymbols = normalizeSymbols(req.query.symbols);
     const envSymbols = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
@@ -75,20 +76,21 @@ export default async function handler(req, res) {
         ? envSymbols
         : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
 
-    const driver_tf = normalizeDriverTf(req.query.driver_tf);
-
     const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+    const proto = (req.headers["x-forwarded-proto"] || "https")
+      .split(",")[0]
+      .trim();
 
     const multiUrl =
-      `${proto}://${host}/api/multi?symbols=${encodeURIComponent(symbols.join(","))}` +
-      `&driver_tf=${driver_tf}&debug=1`;
+      `${proto}://${host}/api/multi` +
+      `?symbols=${encodeURIComponent(symbols.join(","))}` +
+      `&driver_tf=${driver_tf}`;
 
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
-    const j = await r.json();
+    const j = await r.json().catch(() => null);
 
     if (!r.ok || !j?.ok) {
-      return res.status(500).json({ ok: false, error: "multi fetch failed", detail: j || null });
+      return res.status(500).json({ ok: false, error: "multi fetch failed", detail: j });
     }
 
     const now = Date.now();
@@ -97,86 +99,82 @@ export default async function handler(req, res) {
     for (const item of j.results || []) {
       if (!item?.ok) continue;
 
-      const symbol = item.symbol;
+      const sym = item.symbol;
       const d5 = item.deltas?.["5m"];
       const d15 = item.deltas?.["15m"];
 
       if (!d5 || !d15) continue;
 
-      const stateKey = `alert:last15mState:${symbol}`;
-      const cooldownKey = `alert:lastSent:${symbol}`;
+      let shouldAlert = false;
+      let reason = "";
 
+      // 1️⃣ Setup Flip (15m state change)
+      const stateKey = `alert:last15mState:${sym}`;
       const prevState = await redis.get(stateKey);
-      const lastSentRaw = await redis.get(cooldownKey);
-      const lastSent = lastSentRaw ? Number(lastSentRaw) : 0;
-
-      const cooldownActive = now - lastSent < COOLDOWN_MS;
-
-      let fire = false;
-      let reason = null;
-
-      // 1) Setup flip (15m state change)
-      if (!force && prevState && prevState !== d15.state) {
-        fire = true;
-        reason = "Setup flip (15m state changed)";
+      if (prevState && prevState !== d15.state) {
+        shouldAlert = true;
+        reason = `15m flip ${prevState} → ${d15.state}`;
       }
 
-      // 2) Momentum confirmation
+      // 2️⃣ Momentum Confirmation
       if (
-        !force &&
-        !fire &&
+        !shouldAlert &&
         d5.lean === d15.lean &&
-        Math.abs(d5.price_change_pct || 0) >= 0.1
+        Math.abs(d5.price_change_pct || 0) >= 0.10
       ) {
-        fire = true;
-        reason = "Momentum confirmation";
+        shouldAlert = true;
+        reason = "5m + 15m momentum alignment";
       }
 
-      // 3) Positioning shock
+      // 3️⃣ Positioning Shock
       if (
-        !force &&
-        !fire &&
+        !shouldAlert &&
         Math.abs(d15.oi_change_pct || 0) >= 0.5 &&
         Math.abs(d15.price_change_pct || 0) >= 0.2
       ) {
-        fire = true;
-        reason = "Positioning shock";
+        shouldAlert = true;
+        reason = "15m positioning expansion";
       }
 
-      // Apply cooldown unless forced
-      if (fire && !force && cooldownActive) {
-        fire = false;
+      // 4️⃣ Cooldown
+      const lastSentKey = `alert:lastSent:${sym}`;
+      const lastSentRaw = await redis.get(lastSentKey);
+      const lastSent = lastSentRaw ? Number(lastSentRaw) : 0;
+
+      if (!force && shouldAlert && now - lastSent < COOLDOWN_MS) {
+        shouldAlert = false;
       }
 
-      if (fire || force) {
+      if (force) {
+        shouldAlert = true;
+        reason = "manual override";
+      }
+
+      if (shouldAlert) {
+        await redis.set(stateKey, d15.state);
+        await redis.set(lastSentKey, String(now));
+
         triggered.push({
-          symbol,
+          symbol: sym,
           price: item.price,
-          state: item.state,
-          lean: item.lean,
-          reason: force ? "Manual override" : reason,
+          reason,
           d5,
           d15,
         });
-
-        await redis.set(stateKey, d15.state);
-        await redis.set(cooldownKey, String(now));
-      } else {
-        // Update state without triggering
-        await redis.set(stateKey, d15.state);
       }
     }
 
-    if (!force && triggered.length === 0) {
+    if (triggered.length === 0) {
       return res.status(200).json({
         ok: true,
         sent: false,
-        message: "No alert criteria met.",
+        message: "No triggers",
       });
     }
 
+    // Build DM
     const lines = [];
-    lines.push(`ALERT ENGINE V1 (${driver_tf})`);
+    lines.push(`ALERT (${driver_tf})`);
     lines.push(new Date(j.ts).toISOString());
     lines.push("");
 
@@ -184,30 +182,31 @@ export default async function handler(req, res) {
       lines.push(
         [
           `${t.symbol} $${t.price}`,
-          `driver=${t.state}/${t.lean}`,
+          t.reason,
           `5m p=${fmtPct(t.d5.price_change_pct)} oi=${fmtPct(t.d5.oi_change_pct)}`,
           `15m p=${fmtPct(t.d15.price_change_pct)} oi=${fmtPct(t.d15.oi_change_pct)}`,
-          `reason=${t.reason}`,
         ].join(" | ")
       );
     }
 
-    lines.push("");
-    lines.push(multiUrl);
-
-    const tg = await sendTelegram(lines.join("\n"));
+    const text = lines.join("\n");
+    const tg = await sendTelegram(text);
 
     if (!tg.ok) {
-      return res.status(500).json({ ok: false, error: tg.error });
+      return res.status(500).json({ ok: false, error: tg.error, detail: tg.detail });
     }
 
-    res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       sent: true,
       triggered: triggered.map((t) => t.symbol),
     });
+
   } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({
+      ok: false,
+      error: "server error",
+      detail: String(err?.message || err),
+    });
   }
 }
