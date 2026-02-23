@@ -2,6 +2,9 @@
 // V1 Alerts: pulls /api/multi, evaluates trigger criteria, applies cooldown, sends Telegram DM.
 // Adds "levels" (1h/4h hi/lo/mid) computed from stored 5m series in Upstash.
 //
+// NEW:
+// - dry=1 -> NO Telegram DM. Returns JSON only. Also does NOT write lastSentAt/lastState15m (no side effects).
+//
 // Env vars required:
 // - TELEGRAM_BOT_TOKEN
 // - TELEGRAM_CHAT_ID
@@ -12,10 +15,11 @@
 // - ALERT_COOLDOWN_MINUTES (default 20)
 //
 // Query params:
-// - symbols=BTCUSDT,ETHUSDT   (optional; falls back to env; then fallback list)
+// - symbols=BTCUSDT,ETHUSDT    (optional; falls back to env; then fallback list)
 // - driver_tf=5m|15m|30m|1h|4h (optional; default 5m)
-// - debug=1 (optional; adds debug fields to response JSON)
-// - force=1 (optional; bypass criteria + cooldown; sends full snapshot for all symbols)
+// - debug=1                   (optional; adds debug fields to response JSON)
+// - force=1                   (optional; bypass criteria + cooldown; sends full snapshot for all symbols)
+// - dry=1                     (optional; no DM, no writes; JSON only)
 //
 // Criteria v1 (per symbol):
 // 1) Setup flip: 15m state changed since last check
@@ -84,7 +88,6 @@ function fmtPct(x) {
 
 function fmtPrice(x) {
   if (x == null || !Number.isFinite(x)) return "n/a";
-  // keep it readable for small alts
   if (x < 1) return x.toFixed(6);
   if (x < 100) return x.toFixed(4);
   return x.toFixed(2);
@@ -124,20 +127,15 @@ async function sendTelegram(text) {
   return { ok: true };
 }
 
-// Pull last N points from the stored series and compute hi/lo/mid + “watch” guidance.
-// Points are objects like { b, ts, p, fr, oi } written by /api/multi.js
+// Pull last N points from the stored series and compute hi/lo/mid
 async function computeLevelsFromSeries(instId) {
   const seriesKey = CFG.keys.series5m(instId);
   const out = {};
 
-  // We only need max(48) points for 4h window; read up to 48.
   const maxNeeded = Math.max(...Object.values(CFG.levelWindows));
   const raw = await redis.lrange(seriesKey, -maxNeeded, -1);
   const points = (raw || []).map(safeJsonParse).filter(Boolean);
 
-  const prices = points.map((pt) => asNum(pt?.p)).filter((x) => x != null);
-
-  // helper for a window
   function windowLevels(windowPoints) {
     const ps = windowPoints.map((pt) => asNum(pt?.p)).filter((x) => x != null);
     if (ps.length === 0) return null;
@@ -158,9 +156,7 @@ async function computeLevelsFromSeries(instId) {
     }
     const slice = points.slice(points.length - n);
     const lv = windowLevels(slice);
-    out[label] = lv
-      ? { warmup: false, ...lv }
-      : { warmup: true, hi: null, lo: null, mid: null };
+    out[label] = lv ? { warmup: false, ...lv } : { warmup: true, hi: null, lo: null, mid: null };
   }
 
   return out;
@@ -170,7 +166,6 @@ async function computeLevelsFromSeries(instId) {
 function playbookLine(bias, levels) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup || !Number.isFinite(l1h.hi) || !Number.isFinite(l1h.lo) || !Number.isFinite(l1h.mid)) {
-    // fallback if no levels
     if (bias === "short") return "Watch: continuation lower if weakness persists; wait for 15m confirmation.";
     if (bias === "long") return "Watch: continuation higher if strength persists; wait for 15m confirmation.";
     return "Watch: wait for 15m alignment; avoid noise.";
@@ -180,17 +175,12 @@ function playbookLine(bias, levels) {
   const lo = fmtPrice(l1h.lo);
   const mid = fmtPrice(l1h.mid);
 
-  if (bias === "short") {
-    return `Watch: breakdown < 1h low (${lo}) = continuation; reclaim > 1h mid (${mid}) = fade risk. (1h hi ${hi})`;
-  }
-  if (bias === "long") {
-    return `Watch: breakout > 1h high (${hi}) = continuation; lose < 1h mid (${mid}) = fade risk. (1h low ${lo})`;
-  }
+  if (bias === "short") return `Watch: breakdown < 1h low (${lo}) = continuation; reclaim > 1h mid (${mid}) = fade risk. (1h hi ${hi})`;
+  if (bias === "long") return `Watch: breakout > 1h high (${hi}) = continuation; lose < 1h mid (${mid}) = fade risk. (1h low ${lo})`;
   return `Watch: range until break of 1h hi/lo (${hi}/${lo}). Mid=${mid}.`;
 }
 
 function biasFromItem(item) {
-  // Use 15m lean if available; otherwise driver lean
   const lean15 = item?.deltas?.["15m"]?.lean;
   const leanDriver = item?.lean;
   const lean = (lean15 || leanDriver || "neutral").toLowerCase();
@@ -206,13 +196,11 @@ function evaluateCriteria(item, last15mState) {
 
   const triggers = [];
 
-  // 1) Setup flip (15m state changed)
   const cur15mState = String(d15?.state || "unknown");
   if (last15mState && cur15mState && last15mState !== cur15mState) {
     triggers.push({ code: "setup_flip", msg: `15m state flip: ${last15mState} → ${cur15mState}` });
   }
 
-  // 2) Momentum confirmation
   const lean5 = String(d5?.lean || "neutral");
   const lean15 = String(d15?.lean || "neutral");
   const absP5 = abs(d5?.price_change_pct);
@@ -223,7 +211,6 @@ function evaluateCriteria(item, last15mState) {
     });
   }
 
-  // 3) Positioning shock
   const oi15 = d15?.oi_change_pct;
   const absP15 = abs(d15?.price_change_pct);
   if ((oi15 ?? -Infinity) >= CFG.shockOi15mPct && (absP15 ?? 0) >= CFG.shockAbs15mPricePct) {
@@ -241,17 +228,14 @@ export default async function handler(req, res) {
   try {
     const debug = String(req.query.debug || "") === "1";
     const force = String(req.query.force || "") === "1";
+    const dry = String(req.query.dry || "") === "1"; // NEW
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
     // symbols: query -> env -> fallback
     const querySymbols = normalizeSymbols(req.query.symbols);
     const envSymbols = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
     const symbols =
-      querySymbols.length > 0
-        ? querySymbols
-        : envSymbols.length > 0
-          ? envSymbols
-          : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
+      querySymbols.length > 0 ? querySymbols : envSymbols.length > 0 ? envSymbols : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
 
     // Build absolute URL to /api/multi on same host
     const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -260,7 +244,6 @@ export default async function handler(req, res) {
     const qs = new URLSearchParams();
     qs.set("symbols", symbols.join(","));
     qs.set("driver_tf", driver_tf);
-    // we do NOT forward debug to multi by default; multi debug is separate noise.
     const multiUrl = `${proto}://${host}/api/multi?${qs.toString()}`;
 
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
@@ -302,14 +285,11 @@ export default async function handler(req, res) {
       const lastState15m = lastState15mRaw ? String(lastState15mRaw) : null;
       const lastSentAt = lastSentRaw ? Number(lastSentRaw) : null;
 
-      // Always update last 15m state for next time (even if warmup)
       const evalRes = evaluateCriteria(item, lastState15m);
       const cur15mState = evalRes.cur15mState;
 
-      // Decide if it triggers
       const triggers = force ? [{ code: "force", msg: "force=1" }] : evalRes.triggers;
 
-      // Cooldown check (unless force)
       const inCooldown =
         !force && Number.isFinite(lastSentAt) && lastSentAt != null && now - lastSentAt < cooldownMs;
 
@@ -322,7 +302,6 @@ export default async function handler(req, res) {
           triggers,
         });
       } else {
-        // Compute levels (from Upstash series)
         const levels = await computeLevelsFromSeries(instId);
         const bias = biasFromItem(item);
         const watch = playbookLine(bias, levels);
@@ -339,17 +318,34 @@ export default async function handler(req, res) {
           watch,
         });
 
-        // Set lastSentAt now
-        await redis.set(CFG.keys.lastSentAt(instId), String(now));
+        // Side effects ONLY if not dry
+        if (!dry) {
+          await redis.set(CFG.keys.lastSentAt(instId), String(now));
+        }
       }
 
-      // Store current 15m state (even if unknown)
-      if (cur15mState) {
+      // Store current 15m state ONLY if not dry
+      if (!dry && cur15mState) {
         await redis.set(CFG.keys.last15mState(instId), cur15mState);
       }
     }
 
-    // If nothing triggered and not force, do not DM (but return JSON for debugging)
+    // If dry, never DM — return what WOULD happen
+    if (dry) {
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({
+        ok: true,
+        dry: true,
+        would_send: force ? true : triggered.length > 0,
+        driver_tf,
+        symbols,
+        multiUrl,
+        triggered_count: triggered.length,
+        ...(debug ? { triggered, skipped } : {}),
+      });
+    }
+
+    // If nothing triggered and not force, do not DM
     if (!force && triggered.length === 0) {
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
@@ -371,8 +367,7 @@ export default async function handler(req, res) {
     lines.push("");
 
     const listToSend = force
-      ? // for force=1, send ALL symbols (even if they didn't meet criteria), but still include playbook/levels
-        await Promise.all(
+      ? await Promise.all(
           (j.results || [])
             .filter((it) => it?.ok)
             .map(async (it) => {
@@ -392,7 +387,6 @@ export default async function handler(req, res) {
             })
         )
       : triggered.map((t) => {
-          // attach deltas for formatting
           const orig = (j.results || []).find((x) => x?.ok && x.symbol === t.symbol);
           return {
             symbol: t.symbol,
@@ -410,47 +404,34 @@ export default async function handler(req, res) {
       const d5 = t.d5;
       const d15 = t.d15;
 
-      // Trigger reasons (tight)
       const reason = (t.triggers || []).map((x) => x.code).join(",");
 
-      // Levels formatting
       const l1h = t.levels?.["1h"];
       const l4h = t.levels?.["4h"];
       const lvlParts = [];
 
       if (l1h && !l1h.warmup) {
-        lvlParts.push(
-          `1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)} mid=${fmtPrice(l1h.mid)}`
-        );
+        lvlParts.push(`1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)} mid=${fmtPrice(l1h.mid)}`);
       } else {
         lvlParts.push(`1h levels: warmup`);
       }
 
       if (l4h && !l4h.warmup) {
-        lvlParts.push(
-          `4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`
-        );
+        lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
       }
 
+      lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`);
       lines.push(
-        `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`
+        `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(d15?.oi_change_pct)}`
       );
       lines.push(
-        `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(
-          d15?.oi_change_pct
-        )}`
-      );
-      lines.push(
-        `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(
-          d5?.oi_change_pct
-        )}`
+        `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(d5?.oi_change_pct)}`
       );
       lines.push(`Levels: ${lvlParts.join(" | ")}`);
       lines.push(t.watch);
       lines.push("");
     }
 
-    // include the multiUrl for quick drill-down
     lines.push(multiUrl);
 
     const text = lines.join("\n");
