@@ -31,6 +31,30 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// ---- Deploy stamp (to verify what's actually deployed) ----
+function getDeployInfo() {
+  const sha =
+    process.env.VERCEL_GIT_COMMIT_SHA ||
+    process.env.VERCEL_GITHUB_COMMIT_SHA ||
+    process.env.GITHUB_SHA ||
+    null;
+
+  const ref =
+    process.env.VERCEL_GIT_COMMIT_REF ||
+    process.env.VERCEL_GITHUB_COMMIT_REF ||
+    process.env.GITHUB_REF_NAME ||
+    null;
+
+  return {
+    vercel: process.env.VERCEL ? true : false,
+    env: process.env.VERCEL_ENV || process.env.NODE_ENV || null,
+    sha,
+    ref,
+    deploymentId: process.env.VERCEL_DEPLOYMENT_ID || null,
+    buildId: process.env.VERCEL_BUILD_ID || null,
+  };
+}
+
 // ---- Config (easy to modify later) ----
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
@@ -262,6 +286,7 @@ export default async function handler(req, res) {
         symbols,
         driver_tf,
         dry,
+        ...(debug ? { deploy: getDeployInfo() } : {}),
       });
     }
 
@@ -281,7 +306,7 @@ export default async function handler(req, res) {
       const instId = String(item.instId || "");
       const symbol = String(item.symbol || "?");
 
-      // NOTE: in dry mode we still read state from Upstash (read-only), but we DO NOT write anything.
+      // In dry mode we still read state from Upstash (read-only), but we DO NOT write anything.
       const [lastState15mRaw, lastSentRaw] = await Promise.all([
         redis.get(CFG.keys.last15mState(instId)),
         redis.get(CFG.keys.lastSentAt(instId)),
@@ -299,12 +324,17 @@ export default async function handler(req, res) {
         !force && Number.isFinite(lastSentAt) && lastSentAt != null && now - lastSentAt < cooldownMs;
 
       if (triggers.length === 0) {
-        skipped.push({ symbol, reason: "no criteria hit" });
+        skipped.push({
+          symbol,
+          reason: "no criteria hit",
+          ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
+        });
       } else if (inCooldown) {
         skipped.push({
           symbol,
           reason: `cooldown (${Math.ceil((cooldownMs - (now - lastSentAt)) / 60000)}m remaining)`,
           triggers,
+          ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
       } else {
         const levels = await computeLevelsFromSeries(instId);
@@ -321,8 +351,7 @@ export default async function handler(req, res) {
           triggers,
           levels,
           watch,
-          // useful for dry-mode debugging without writing:
-          nextState15m: cur15mState,
+          ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
 
         // ✅ Writes only when NOT dry-run
@@ -334,8 +363,7 @@ export default async function handler(req, res) {
         }
       }
 
-      // ✅ IMPORTANT: If NOT triggered, we still want to advance lastState15m for setup-flip detection
-      // BUT only in non-dry mode (dry must be read-only).
+      // ✅ IMPORTANT: advance lastState15m even when NOT triggered (for setup-flip), but ONLY if not dry
       if (!dry && triggers.length === 0 && cur15mState) {
         await redis.set(CFG.keys.last15mState(instId), cur15mState);
       }
@@ -353,7 +381,7 @@ export default async function handler(req, res) {
         symbols,
         multiUrl,
         triggered_count: 0,
-        ...(debug ? { skipped } : {}),
+        ...(debug ? { deploy: getDeployInfo(), skipped } : {}),
       });
     }
 
@@ -361,6 +389,10 @@ export default async function handler(req, res) {
     const lines = [];
     lines.push(`⚡️ OKX perps alert (${driver_tf})${force ? " [FORCE]" : ""}${dry ? " [DRY]" : ""}`);
     lines.push(new Date(j.ts || now).toISOString());
+    if (debug) {
+      const d = getDeployInfo();
+      lines.push(`deploy: ${d.sha || "no-sha"} ${d.env || ""} ${d.ref || ""}`.trim());
+    }
     lines.push("");
 
     const listToSend = force
@@ -416,7 +448,6 @@ export default async function handler(req, res) {
       if (l4h && !l4h.warmup) {
         lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
       } else {
-        // keep it explicit if 4h isn't ready
         lvlParts.push(`4h levels: warmup`);
       }
 
@@ -454,7 +485,7 @@ export default async function handler(req, res) {
         multiUrl,
         triggered_count: triggered.length,
         preview: text,
-        ...(debug ? { triggered, skipped } : {}),
+        ...(debug ? { deploy: getDeployInfo(), triggered, skipped } : {}),
       });
     }
 
@@ -469,6 +500,7 @@ export default async function handler(req, res) {
         symbols,
         driver_tf,
         dry,
+        ...(debug ? { deploy: getDeployInfo() } : {}),
       });
     }
 
@@ -482,9 +514,14 @@ export default async function handler(req, res) {
       symbols,
       multiUrl,
       triggered_count: triggered.length,
-      ...(debug ? { triggered, skipped } : {}),
+      ...(debug ? { deploy: getDeployInfo(), triggered, skipped } : {}),
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: "server error", detail: String(err?.message || err) });
+    return res.status(500).json({
+      ok: false,
+      error: "server error",
+      detail: String(err?.message || err),
+      ...(String(req?.query?.debug || "") === "1" ? { deploy: getDeployInfo() } : {}),
+    });
   }
 }
