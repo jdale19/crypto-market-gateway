@@ -12,6 +12,7 @@
 // - ALERT_COOLDOWN_MINUTES (default 20)
 //
 // Query params:
+// - key=... (required) must match ALERT_SECRET
 // - symbols=BTCUSDT,ETHUSDT   (optional; falls back to env; then fallback list)
 // - driver_tf=5m|15m|30m|1h|4h (optional; default 5m)
 // - debug=1 (optional; adds debug fields to response JSON ONLY)
@@ -253,12 +254,14 @@ function evaluateCriteria(item, last15mState) {
 
 // ---- main handler ----
 export default async function handler(req, res) {
-  try {    const key = String(req.query.key || "");
+  try {
+    const key = String(req.query.key || "");
     const secret = process.env.ALERT_SECRET || "";
 
     if (!secret || key !== secret) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
+
     const debug = String(req.query.debug || "") === "1";
     const force = String(req.query.force || "") === "1";
     const dry = String(req.query.dry || "") === "1";
@@ -301,6 +304,10 @@ export default async function handler(req, res) {
     const triggered = [];
     const skipped = [];
 
+    // ✅ NEW: counters so top-level reason is correct
+    let criteriaHitCount = 0;      // triggers existed (even if blocked)
+    let cooldownBlockedCount = 0;  // triggers existed but blocked by cooldown
+
     // Evaluate each symbol
     for (const item of j.results || []) {
       if (!item?.ok) {
@@ -335,6 +342,10 @@ export default async function handler(req, res) {
           ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
       } else if (inCooldown) {
+        // ✅ NEW: record that criteria DID hit, but cooldown blocked it
+        criteriaHitCount += 1;
+        cooldownBlockedCount += 1;
+
         skipped.push({
           symbol,
           reason: `cooldown (${Math.ceil((cooldownMs - (now - lastSentAt)) / 60000)}m remaining)`,
@@ -342,6 +353,9 @@ export default async function handler(req, res) {
           ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
       } else {
+        // ✅ NEW: record that criteria DID hit and was allowed
+        criteriaHitCount += 1;
+
         const levels = await computeLevelsFromSeries(instId);
         const bias = biasFromItem(item);
         const watch = playbookLine(bias, levels);
@@ -376,16 +390,21 @@ export default async function handler(req, res) {
 
     // Nothing triggered (and not force) => no DM
     if (!force && triggered.length === 0) {
+      const reason = cooldownBlockedCount > 0 ? "cooldown" : "no triggers";
+
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
         ok: true,
         dry,
         sent: false,
-        reason: "no triggers",
+        reason,
         driver_tf,
         symbols,
         multiUrl,
         triggered_count: 0,
+        // ✅ NEW: makes it obvious this wasn't “no triggers”
+        criteria_hit_count: criteriaHitCount,
+        cooldown_blocked_count: cooldownBlockedCount,
         ...(debug ? { deploy: getDeployInfo(), skipped } : {}),
       });
     }
