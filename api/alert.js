@@ -71,8 +71,8 @@ const CFG = {
     "4h": 48, // 48 * 5m
   },
 
-  // Telegram message limits (Telegram hard limit is 4096 chars)
-  telegramMaxChars: 3900, // keep a safety buffer
+  // Telegram hard limit is 4096 chars; keep a buffer
+  telegramMaxChars: 3900,
 
   // Redis keys
   keys: {
@@ -126,40 +126,14 @@ function safeJsonParse(v) {
   }
 }
 
-// Split long Telegram messages safely.
-// Prefer splitting on newlines; fall back to hard splits.
-function chunkText(text, maxLen) {
-  const s = String(text || "");
-  if (s.length <= maxLen) return [s];
+async function sendTelegram(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  const chunks = [];
-  let i = 0;
-
-  while (i < s.length) {
-    const remaining = s.length - i;
-    if (remaining <= maxLen) {
-      chunks.push(s.slice(i));
-      break;
-    }
-
-    // Try to split at last newline before the limit.
-    const window = s.slice(i, i + maxLen);
-    const cutAt = window.lastIndexOf("\n");
-
-    if (cutAt > Math.floor(maxLen * 0.5)) {
-      chunks.push(s.slice(i, i + cutAt));
-      i = i + cutAt + 1; // skip the newline
-    } else {
-      // Hard split if no good newline found
-      chunks.push(s.slice(i, i + maxLen));
-      i = i + maxLen;
-    }
+  if (!token || !chatId) {
+    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
   }
 
-  return chunks.filter((c) => c && c.trim().length > 0);
-}
-
-async function sendTelegramMessage(token, chatId, text) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const r = await fetch(url, {
     method: "POST",
@@ -175,47 +149,6 @@ async function sendTelegramMessage(token, chatId, text) {
   if (!r.ok || !j?.ok) {
     return { ok: false, error: "Telegram send failed", detail: j || null };
   }
-  return { ok: true };
-}
-
-// ✅ UPDATED: chunk long messages so Telegram never rejects "message is too long"
-async function sendTelegram(text) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-
-  if (!token || !chatId) {
-    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
-  }
-
-  const parts = chunkText(text, CFG.telegramMaxChars);
-
-  // Single message (fast path)
-  if (parts.length === 1) {
-    return await sendTelegramMessage(token, chatId, parts[0]);
-  }
-
-  // Multi-part: add a small header so you can tell ordering
-  const total = parts.length;
-  for (let idx = 0; idx < total; idx++) {
-    const header = `(${idx + 1}/${total}) `;
-    let body = parts[idx];
-
-    // Ensure header+body still within limit
-    if (header.length + body.length > CFG.telegramMaxChars) {
-      body = body.slice(0, Math.max(0, CFG.telegramMaxChars - header.length));
-    }
-
-    const msg = header + body;
-    const r = await sendTelegramMessage(token, chatId, msg);
-    if (!r.ok) {
-      return {
-        ok: false,
-        error: "Telegram send failed",
-        detail: { part: idx + 1, total, response: r.detail || null },
-      };
-    }
-  }
-
   return { ok: true };
 }
 
@@ -322,6 +255,110 @@ function evaluateCriteria(item, last15mState) {
   return { triggers, cur15mState };
 }
 
+// ---- NEW: format one ticker as an atomic “block” ----
+function formatTickerBlock(t) {
+  const d5 = t.d5;
+  const d15 = t.d15;
+  const reason = (t.triggers || []).map((x) => x.code).join(",");
+
+  const l1h = t.levels?.["1h"];
+  const l4h = t.levels?.["4h"];
+  const lvlParts = [];
+
+  if (l1h && !l1h.warmup) {
+    lvlParts.push(`1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)} mid=${fmtPrice(l1h.mid)}`);
+  } else {
+    lvlParts.push(`1h levels: warmup`);
+  }
+
+  if (l4h && !l4h.warmup) {
+    lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
+  } else {
+    lvlParts.push(`4h levels: warmup`);
+  }
+
+  const lines = [];
+  lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`);
+  lines.push(
+    `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(d15?.oi_change_pct)}`
+  );
+  lines.push(
+    `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(d5?.oi_change_pct)}`
+  );
+  lines.push(`Levels: ${lvlParts.join(" | ")}`);
+  lines.push(t.watch);
+
+  return lines.join("\n");
+}
+
+// If a block is too big (rare), produce a shorter version (still atomic).
+function formatTickerBlockShort(t) {
+  const reason = (t.triggers || []).map((x) => x.code).join(",");
+  return [
+    `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`,
+    t.watch,
+  ].join("\n");
+}
+
+// ---- NEW: chunk by blocks, not by raw text ----
+function chunkTelegramByBlocks({ headerLines, blocks, footerLines, maxChars }) {
+  const header = headerLines.join("\n");
+  const footer = footerLines.length ? "\n" + footerLines.join("\n") : "";
+
+  const baseOverhead = header.length + 2; // header + blank line
+  const out = [];
+
+  let curBlocks = [];
+  let curLen = baseOverhead;
+
+  const flush = () => {
+    if (!curBlocks.length) return;
+    out.push([header, "", ...curBlocks].join("\n"));
+    curBlocks = [];
+    curLen = baseOverhead;
+  };
+
+  for (const b of blocks) {
+    const addLen = (curBlocks.length ? 2 : 0) + b.length; // 2 for "\n\n" between blocks
+    if (curLen + addLen + footer.length <= maxChars) {
+      if (curBlocks.length) curBlocks.push(""); // blank line between blocks
+      curBlocks.push(b);
+      curLen += addLen;
+      continue;
+    }
+
+    // doesn't fit -> flush current and start new
+    flush();
+
+    // If block alone still doesn't fit, shorten it (still atomic)
+    if (baseOverhead + b.length + footer.length > maxChars) {
+      // caller should have already provided short version if needed,
+      // but keep this as a safety net: hard truncate.
+      const allowed = Math.max(200, maxChars - baseOverhead - footer.length - 10);
+      const truncated = b.slice(0, allowed) + "\n…";
+      curBlocks.push(truncated);
+      flush();
+      continue;
+    }
+
+    curBlocks.push(b);
+    curLen = baseOverhead + b.length;
+  }
+
+  flush();
+
+  // Put footer only on the last message (keeps earlier chunks smaller/cleaner)
+  if (out.length && footer) {
+    out[out.length - 1] = out[out.length - 1] + footer;
+  }
+
+  // Add (i/N) prefix to header line
+  if (out.length > 1) {
+    return out.map((txt, i) => txt.replace(headerLines[0], `(${i + 1}/${out.length}) ${headerLines[0]}`));
+  }
+  return out;
+}
+
 // ---- main handler ----
 export default async function handler(req, res) {
   try {
@@ -374,9 +411,8 @@ export default async function handler(req, res) {
     const triggered = [];
     const skipped = [];
 
-    // ✅ counters so top-level reason is correct
-    let criteriaHitCount = 0; // triggers existed (even if blocked)
-    let cooldownBlockedCount = 0; // triggers existed but blocked by cooldown
+    let criteriaHitCount = 0;
+    let cooldownBlockedCount = 0;
 
     // Evaluate each symbol
     for (const item of j.results || []) {
@@ -388,7 +424,6 @@ export default async function handler(req, res) {
       const instId = String(item.instId || "");
       const symbol = String(item.symbol || "?");
 
-      // In dry mode we still read state from Upstash (read-only), but we DO NOT write anything.
       const [lastState15mRaw, lastSentRaw] = await Promise.all([
         redis.get(CFG.keys.last15mState(instId)),
         redis.get(CFG.keys.lastSentAt(instId)),
@@ -433,15 +468,14 @@ export default async function handler(req, res) {
           instId,
           price: item.price,
           bias,
-          state_driver: item.state,
-          lean_driver: item.lean,
+          d5: item.deltas?.["5m"],
+          d15: item.deltas?.["15m"],
           triggers,
           levels,
           watch,
           ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
 
-        // ✅ Writes only when NOT dry-run
         if (!dry) {
           await redis.set(CFG.keys.lastSentAt(instId), String(now));
           if (cur15mState) {
@@ -450,16 +484,13 @@ export default async function handler(req, res) {
         }
       }
 
-      // ✅ IMPORTANT: advance lastState15m even when NOT triggered (for setup-flip), but ONLY if not dry
       if (!dry && triggers.length === 0 && cur15mState) {
         await redis.set(CFG.keys.last15mState(instId), cur15mState);
       }
     }
 
-    // Nothing triggered (and not force) => no DM
     if (!force && triggered.length === 0) {
       const reason = cooldownBlockedCount > 0 ? "cooldown" : "no triggers";
-
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
         ok: true,
@@ -476,15 +507,16 @@ export default async function handler(req, res) {
       });
     }
 
-    // Build Telegram message (or "would send" payload)
-    const lines = [];
-    lines.push(`⚡️ OKX perps alert (${driver_tf})${force ? " [FORCE]" : ""}${dry ? " [DRY]" : ""}`);
-    lines.push(new Date(j.ts || now).toISOString());
+    // ---- Build atomic ticker blocks ----
+    const headerLines = [];
+    headerLines.push(`⚡️ OKX perps alert (${driver_tf})${force ? " [FORCE]" : ""}${dry ? " [DRY]" : ""}`);
+    headerLines.push(new Date(j.ts || now).toISOString());
     if (debug) {
       const d = getDeployInfo();
-      lines.push(`deploy: ${d.sha || "no-sha"} ${d.env || ""} ${d.ref || ""}`.trim());
+      headerLines.push(`deploy: ${d.sha || "no-sha"} ${d.env || ""} ${d.ref || ""}`.trim());
     }
-    lines.push("");
+
+    const footerLines = [multiUrl];
 
     const listToSend = force
       ? await Promise.all(
@@ -506,63 +538,25 @@ export default async function handler(req, res) {
               };
             })
         )
-      : triggered.map((t) => {
-          const orig = (j.results || []).find((x) => x?.ok && x.symbol === t.symbol);
-          return {
-            symbol: t.symbol,
-            price: t.price,
-            bias: t.bias,
-            d5: orig?.deltas?.["5m"],
-            d15: orig?.deltas?.["15m"],
-            levels: t.levels,
-            watch: t.watch,
-            triggers: t.triggers,
-          };
-        });
+      : triggered;
 
-    for (const t of listToSend) {
-      const d5 = t.d5;
-      const d15 = t.d15;
-
-      const reason = (t.triggers || []).map((x) => x.code).join(",");
-
-      const l1h = t.levels?.["1h"];
-      const l4h = t.levels?.["4h"];
-      const lvlParts = [];
-
-      if (l1h && !l1h.warmup) {
-        lvlParts.push(`1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)} mid=${fmtPrice(l1h.mid)}`);
-      } else {
-        lvlParts.push(`1h levels: warmup`);
+    // Make blocks, with “short” fallback if one block is too large
+    const blocks = listToSend.map((t) => {
+      const full = formatTickerBlock(t);
+      if (headerLines.join("\n").length + 2 + full.length + ("\n" + footerLines.join("\n")).length <= CFG.telegramMaxChars) {
+        return full;
       }
+      return formatTickerBlockShort(t);
+    });
 
-      if (l4h && !l4h.warmup) {
-        lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
-      } else {
-        lvlParts.push(`4h levels: warmup`);
-      }
+    const messages = chunkTelegramByBlocks({
+      headerLines,
+      blocks,
+      footerLines,
+      maxChars: CFG.telegramMaxChars,
+    });
 
-      lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`);
-      lines.push(
-        `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(
-          d15?.oi_change_pct
-        )}`
-      );
-      lines.push(
-        `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(
-          d5?.oi_change_pct
-        )}`
-      );
-      lines.push(`Levels: ${lvlParts.join(" | ")}`);
-      lines.push(t.watch);
-      lines.push("");
-    }
-
-    lines.push(multiUrl);
-
-    const text = lines.join("\n");
-
-    // ✅ DRY-RUN: never send Telegram and never write (writes are already gated above)
+    // DRY mode: return preview of first message + count
     if (dry) {
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
@@ -575,24 +569,27 @@ export default async function handler(req, res) {
         symbols,
         multiUrl,
         triggered_count: triggered.length,
-        preview: text,
+        message_count: messages.length,
+        preview: messages[0] || "",
         ...(debug ? { deploy: getDeployInfo(), triggered, skipped } : {}),
       });
     }
 
-    // Real send (now chunk-safe)
-    const tg = await sendTelegram(text);
-    if (!tg.ok) {
-      return res.status(500).json({
-        ok: false,
-        error: tg.error,
-        detail: tg.detail || null,
-        multiUrl,
-        symbols,
-        driver_tf,
-        dry,
-        ...(debug ? { deploy: getDeployInfo() } : {}),
-      });
+    // Send all chunks in order
+    for (const msg of messages) {
+      const tg = await sendTelegram(msg);
+      if (!tg.ok) {
+        return res.status(500).json({
+          ok: false,
+          error: tg.error,
+          detail: tg.detail || null,
+          multiUrl,
+          symbols,
+          driver_tf,
+          dry,
+          ...(debug ? { deploy: getDeployInfo() } : {}),
+        });
+      }
     }
 
     res.setHeader("Cache-Control", "no-store");
@@ -605,6 +602,7 @@ export default async function handler(req, res) {
       symbols,
       multiUrl,
       triggered_count: triggered.length,
+      message_count: messages.length,
       ...(debug ? { deploy: getDeployInfo(), triggered, skipped } : {}),
     });
   } catch (err) {
