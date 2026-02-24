@@ -1,8 +1,1 @@
-{
-  "crons": [
-    {
-      "path": "/api/alert?driver_tf=5m",
-      "schedule": "*/5 * * * *"
-    }
-  ]
-}
+{}
