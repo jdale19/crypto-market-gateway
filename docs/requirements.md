@@ -1,8 +1,3 @@
-Here’s the latest, updated requirements doc that reflects all of the clarifications and locks we just made (including dry=1 read-only behavior, endpoint authority, and acceptance criteria). You can paste this into docs/requirements.md to replace what’s currently there.
-
-⸻
-
-
 # Crypto Market Gateway — Requirements (v1)
 
 Last updated: 2026-02-23  
@@ -240,10 +235,3 @@ System is correct when:
 - Drilldown raw data:  
 
 /api/multi?symbols=BTCUSDT&driver_tf=5m
-
-
-
-
-⸻
-
-If you’d like, I can also generate the next doc — architecture.md — describing internal flows, Upstash schema, keys, sequence diagrams, and integration points in detail.
