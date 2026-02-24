@@ -71,6 +71,9 @@ const CFG = {
     "4h": 48, // 48 * 5m
   },
 
+  // Telegram message limits (Telegram hard limit is 4096 chars)
+  telegramMaxChars: 3900, // keep a safety buffer
+
   // Redis keys
   keys: {
     last15mState: (instId) => `alert:lastState15m:${instId}`,
@@ -123,14 +126,40 @@ function safeJsonParse(v) {
   }
 }
 
-async function sendTelegram(text) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
+// Split long Telegram messages safely.
+// Prefer splitting on newlines; fall back to hard splits.
+function chunkText(text, maxLen) {
+  const s = String(text || "");
+  if (s.length <= maxLen) return [s];
 
-  if (!token || !chatId) {
-    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
+  const chunks = [];
+  let i = 0;
+
+  while (i < s.length) {
+    const remaining = s.length - i;
+    if (remaining <= maxLen) {
+      chunks.push(s.slice(i));
+      break;
+    }
+
+    // Try to split at last newline before the limit.
+    const window = s.slice(i, i + maxLen);
+    const cutAt = window.lastIndexOf("\n");
+
+    if (cutAt > Math.floor(maxLen * 0.5)) {
+      chunks.push(s.slice(i, i + cutAt));
+      i = i + cutAt + 1; // skip the newline
+    } else {
+      // Hard split if no good newline found
+      chunks.push(s.slice(i, i + maxLen));
+      i = i + maxLen;
+    }
   }
 
+  return chunks.filter((c) => c && c.trim().length > 0);
+}
+
+async function sendTelegramMessage(token, chatId, text) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const r = await fetch(url, {
     method: "POST",
@@ -146,6 +175,47 @@ async function sendTelegram(text) {
   if (!r.ok || !j?.ok) {
     return { ok: false, error: "Telegram send failed", detail: j || null };
   }
+  return { ok: true };
+}
+
+// ✅ UPDATED: chunk long messages so Telegram never rejects "message is too long"
+async function sendTelegram(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
+  }
+
+  const parts = chunkText(text, CFG.telegramMaxChars);
+
+  // Single message (fast path)
+  if (parts.length === 1) {
+    return await sendTelegramMessage(token, chatId, parts[0]);
+  }
+
+  // Multi-part: add a small header so you can tell ordering
+  const total = parts.length;
+  for (let idx = 0; idx < total; idx++) {
+    const header = `(${idx + 1}/${total}) `;
+    let body = parts[idx];
+
+    // Ensure header+body still within limit
+    if (header.length + body.length > CFG.telegramMaxChars) {
+      body = body.slice(0, Math.max(0, CFG.telegramMaxChars - header.length));
+    }
+
+    const msg = header + body;
+    const r = await sendTelegramMessage(token, chatId, msg);
+    if (!r.ok) {
+      return {
+        ok: false,
+        error: "Telegram send failed",
+        detail: { part: idx + 1, total, response: r.detail || null },
+      };
+    }
+  }
+
   return { ok: true };
 }
 
@@ -304,9 +374,9 @@ export default async function handler(req, res) {
     const triggered = [];
     const skipped = [];
 
-    // ✅ NEW: counters so top-level reason is correct
-    let criteriaHitCount = 0;      // triggers existed (even if blocked)
-    let cooldownBlockedCount = 0;  // triggers existed but blocked by cooldown
+    // ✅ counters so top-level reason is correct
+    let criteriaHitCount = 0; // triggers existed (even if blocked)
+    let cooldownBlockedCount = 0; // triggers existed but blocked by cooldown
 
     // Evaluate each symbol
     for (const item of j.results || []) {
@@ -342,7 +412,6 @@ export default async function handler(req, res) {
           ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
       } else if (inCooldown) {
-        // ✅ NEW: record that criteria DID hit, but cooldown blocked it
         criteriaHitCount += 1;
         cooldownBlockedCount += 1;
 
@@ -353,7 +422,6 @@ export default async function handler(req, res) {
           ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
       } else {
-        // ✅ NEW: record that criteria DID hit and was allowed
         criteriaHitCount += 1;
 
         const levels = await computeLevelsFromSeries(instId);
@@ -402,7 +470,6 @@ export default async function handler(req, res) {
         symbols,
         multiUrl,
         triggered_count: 0,
-        // ✅ NEW: makes it obvious this wasn't “no triggers”
         criteria_hit_count: criteriaHitCount,
         cooldown_blocked_count: cooldownBlockedCount,
         ...(debug ? { deploy: getDeployInfo(), skipped } : {}),
@@ -513,7 +580,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Real send
+    // Real send (now chunk-safe)
     const tg = await sendTelegram(text);
     if (!tg.ok) {
       return res.status(500).json({
