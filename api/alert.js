@@ -2,7 +2,7 @@
 // V1 Alerts: pulls /api/multi, evaluates trigger criteria, applies cooldown, sends Telegram DM.
 // Adds "levels" (1h/4h hi/lo/mid) computed from stored 5m series in Upstash.
 //
-// Env vars required:
+// Env vars required :
 // - TELEGRAM_BOT_TOKEN
 // - TELEGRAM_CHAT_ID
 // - UPSTASH_REDIS_REST_URL
