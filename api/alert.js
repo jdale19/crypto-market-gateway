@@ -253,7 +253,12 @@ function evaluateCriteria(item, last15mState) {
 
 // ---- main handler ----
 export default async function handler(req, res) {
-  try {
+  try {    const key = String(req.query.key || "");
+    const secret = process.env.ALERT_SECRET || "";
+
+    if (!secret || key !== secret) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
     const debug = String(req.query.debug || "") === "1";
     const force = String(req.query.force || "") === "1";
     const dry = String(req.query.dry || "") === "1";
