@@ -1,7 +1,7 @@
 # Crypto Market Gateway — Requirements (v1)
 
 Last updated: 2026-02-23  
-Owner: JD
+Owner: jdale19
 Goal: **Get low-noise Telegram DMs** that tell you *when it’s worth looking*, plus a **lightweight recommendation + key levels** so you can decide fast.
 
 ---
