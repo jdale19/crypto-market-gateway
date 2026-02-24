@@ -14,9 +14,9 @@
 // Query params:
 // - symbols=BTCUSDT,ETHUSDT   (optional; falls back to env; then fallback list)
 // - driver_tf=5m|15m|30m|1h|4h (optional; default 5m)
-// - debug=1 (optional; adds debug fields to response JSON)
+// - debug=1 (optional; adds debug fields to response JSON ONLY)
 // - force=1 (optional; bypass criteria + cooldown; sends snapshot for all symbols)
-// - dry=1 (optional; NEVER sends Telegram, returns would-send payload)
+// - dry=1 (optional; NEVER sends Telegram, NEVER writes to Upstash, returns would-send payload)
 //
 // Criteria v1 (per symbol):
 // 1) Setup flip: 15m state changed since last check
@@ -36,9 +36,9 @@ const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
 
   // Criteria thresholds
-  momentumAbs5mPricePct: 0.10, // %
-  shockOi15mPct: 0.50, // %
-  shockAbs15mPricePct: 0.20, // %
+  momentumAbs5mPricePct: 0.1, // %
+  shockOi15mPct: 0.5, // %
+  shockAbs15mPricePct: 0.2, // %
 
   // Levels computed from stored 5m points
   levelWindows: {
@@ -239,11 +239,7 @@ export default async function handler(req, res) {
     const querySymbols = normalizeSymbols(req.query.symbols);
     const envSymbols = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
     const symbols =
-      querySymbols.length > 0
-        ? querySymbols
-        : envSymbols.length > 0
-          ? envSymbols
-          : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
+      querySymbols.length > 0 ? querySymbols : envSymbols.length > 0 ? envSymbols : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
 
     // Build absolute URL to /api/multi on same host
     const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -285,6 +281,7 @@ export default async function handler(req, res) {
       const instId = String(item.instId || "");
       const symbol = String(item.symbol || "?");
 
+      // NOTE: in dry mode we still read state from Upstash (read-only), but we DO NOT write anything.
       const [lastState15mRaw, lastSentRaw] = await Promise.all([
         redis.get(CFG.keys.last15mState(instId)),
         redis.get(CFG.keys.lastSentAt(instId)),
@@ -324,16 +321,22 @@ export default async function handler(req, res) {
           triggers,
           levels,
           watch,
+          // useful for dry-mode debugging without writing:
+          nextState15m: cur15mState,
         });
 
-        // Only persist "sent" time if we are NOT in dry-run
+        // ✅ Writes only when NOT dry-run
         if (!dry) {
           await redis.set(CFG.keys.lastSentAt(instId), String(now));
+          if (cur15mState) {
+            await redis.set(CFG.keys.last15mState(instId), cur15mState);
+          }
         }
       }
 
-      // Always store current 15m state (even in dry-run)
-      if (cur15mState) {
+      // ✅ IMPORTANT: If NOT triggered, we still want to advance lastState15m for setup-flip detection
+      // BUT only in non-dry mode (dry must be read-only).
+      if (!dry && triggers.length === 0 && cur15mState) {
         await redis.set(CFG.keys.last15mState(instId), cur15mState);
       }
     }
@@ -412,6 +415,9 @@ export default async function handler(req, res) {
 
       if (l4h && !l4h.warmup) {
         lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
+      } else {
+        // keep it explicit if 4h isn't ready
+        lvlParts.push(`4h levels: warmup`);
       }
 
       lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`);
@@ -434,7 +440,7 @@ export default async function handler(req, res) {
 
     const text = lines.join("\n");
 
-    // ✅ DRY-RUN: never send Telegram
+    // ✅ DRY-RUN: never send Telegram and never write (writes are already gated above)
     if (dry) {
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
