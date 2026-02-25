@@ -12,12 +12,16 @@
 // - ALERT_COOLDOWN_MINUTES (default 20)
 //
 // Query params:
-// - key=... (required) must match ALERT_SECRET
+// - key=... (optional now; fallback for manual testing) must match ALERT_SECRET
 // - symbols=BTCUSDT,ETHUSDT   (optional; falls back to env; then fallback list)
 // - driver_tf=5m|15m|30m|1h|4h (optional; default 5m)
 // - debug=1 (optional; adds debug fields to response JSON ONLY)
 // - force=1 (optional; bypass criteria + cooldown; sends snapshot for all symbols)
 // - dry=1 (optional; NEVER sends Telegram, NEVER writes to Upstash, returns would-send payload)
+//
+// Auth:
+// - Preferred: Authorization: Bearer <ALERT_SECRET>
+// - Fallback:  ?key=<ALERT_SECRET>
 //
 // Criteria v1 (per symbol):
 // 1) Setup flip: 15m state changed since last check
@@ -182,7 +186,9 @@ async function computeLevelsFromSeries(instId) {
     }
     const slice = points.slice(points.length - n);
     const lv = windowLevels(slice);
-    out[label] = lv ? { warmup: false, ...lv } : { warmup: true, hi: null, lo: null, mid: null };
+    out[label] = lv
+      ? { warmup: false, ...lv }
+      : { warmup: true, hi: null, lo: null, mid: null };
   }
 
   return out;
@@ -190,7 +196,13 @@ async function computeLevelsFromSeries(instId) {
 
 function playbookLine(bias, levels) {
   const l1h = levels?.["1h"];
-  if (!l1h || l1h.warmup || !Number.isFinite(l1h.hi) || !Number.isFinite(l1h.lo) || !Number.isFinite(l1h.mid)) {
+  if (
+    !l1h ||
+    l1h.warmup ||
+    !Number.isFinite(l1h.hi) ||
+    !Number.isFinite(l1h.lo) ||
+    !Number.isFinite(l1h.mid)
+  ) {
     if (bias === "short") return "Watch: continuation lower if weakness persists; wait for 15m confirmation.";
     if (bias === "long") return "Watch: continuation higher if strength persists; wait for 15m confirmation.";
     return "Watch: wait for 15m alignment; avoid noise.";
@@ -280,10 +292,14 @@ function formatTickerBlock(t) {
   const lines = [];
   lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`);
   lines.push(
-    `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(d15?.oi_change_pct)}`
+    `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(
+      d15?.oi_change_pct
+    )}`
   );
   lines.push(
-    `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(d5?.oi_change_pct)}`
+    `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(
+      d5?.oi_change_pct
+    )}`
   );
   lines.push(`Levels: ${lvlParts.join(" | ")}`);
   lines.push(t.watch);
@@ -294,10 +310,7 @@ function formatTickerBlock(t) {
 // If a block is too big (rare), produce a shorter version (still atomic).
 function formatTickerBlockShort(t) {
   const reason = (t.triggers || []).map((x) => x.code).join(",");
-  return [
-    `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`,
-    t.watch,
-  ].join("\n");
+  return [`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`, t.watch].join("\n");
 }
 
 // ---- NEW: chunk by blocks, not by raw text ----
@@ -362,10 +375,18 @@ function chunkTelegramByBlocks({ headerLines, blocks, footerLines, maxChars }) {
 // ---- main handler ----
 export default async function handler(req, res) {
   try {
-    const key = String(req.query.key || "");
+    // ✅ AUTH: Bearer header preferred (for QStash), ?key= fallback for manual testing
     const secret = process.env.ALERT_SECRET || "";
 
-    if (!secret || key !== secret) {
+    const authHeader = String(req.headers["authorization"] || "");
+    const bearer = authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice(7).trim()
+      : "";
+
+    const key = String(req.query.key || "");
+    const provided = bearer || key;
+
+    if (!secret || !provided || provided !== secret) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
@@ -437,8 +458,7 @@ export default async function handler(req, res) {
 
       const triggers = force ? [{ code: "force", msg: "force=1" }] : evalRes.triggers;
 
-      const inCooldown =
-        !force && Number.isFinite(lastSentAt) && lastSentAt != null && now - lastSentAt < cooldownMs;
+      const inCooldown = !force && Number.isFinite(lastSentAt) && lastSentAt != null && now - lastSentAt < cooldownMs;
 
       if (triggers.length === 0) {
         skipped.push({
@@ -543,7 +563,13 @@ export default async function handler(req, res) {
     // Make blocks, with “short” fallback if one block is too large
     const blocks = listToSend.map((t) => {
       const full = formatTickerBlock(t);
-      if (headerLines.join("\n").length + 2 + full.length + ("\n" + footerLines.join("\n")).length <= CFG.telegramMaxChars) {
+      if (
+        headerLines.join("\n").length +
+          2 +
+          full.length +
+          ("\n" + footerLines.join("\n")).length <=
+        CFG.telegramMaxChars
+      ) {
         return full;
       }
       return formatTickerBlockShort(t);
