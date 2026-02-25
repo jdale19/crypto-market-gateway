@@ -8,6 +8,9 @@
 // - FIX: safeJsonParse handles string OR already-parsed object (matches multi.js)
 // - debug=1 returns skip reasons (no Telegram behavior change)
 // - NEW MACRO GATE: if BTC is in 4h bull expansion, block SHORT-bias alerts on ALTS (non-force)
+// - NEW REGIME ADJUST (expansion + contraction):
+//   - If 4h expansion in one direction, downgrade fade signals (strong->weak)
+//   - If extreme contraction, optionally upgrade near-edge signals (weak->strong) via wider edge
 
 import { Redis } from "@upstash/redis";
 
@@ -60,6 +63,23 @@ const CFG = {
     blockShortsOnAltsWhenBtcBull: String(process.env.ALERT_MACRO_BLOCK_SHORTS_ON_ALTS || "1") === "1",
   },
 
+  // ---- REGIME ADJUST (per-symbol 4h) ----
+  regime: {
+    enabled: String(process.env.ALERT_REGIME_ENABLED || "1") === "1",
+
+    // Expansion: directional trend + participation
+    expansionPricePctMin: Number(process.env.ALERT_REGIME_EXPANSION_4H_PRICE_PCT_MIN || 3.0),
+    expansionOiPctMin: Number(process.env.ALERT_REGIME_EXPANSION_4H_OI_PCT_MIN || 1.0),
+
+    // Contraction: low movement + OI bleed
+    contractionAbsPricePctMax: Number(process.env.ALERT_REGIME_CONTRACTION_4H_ABS_PRICE_PCT_MAX || 1.0),
+    contractionOiPctMax: Number(process.env.ALERT_REGIME_CONTRACTION_4H_OI_PCT_MAX || -1.0),
+
+    // Upgrade weak->strong only in contraction if price is within a wider edge band
+    contractionUpgradeEnabled: String(process.env.ALERT_REGIME_CONTRACTION_UPGRADE_ENABLED || "1") === "1",
+    contractionUpgradeEdgeMult: Number(process.env.ALERT_REGIME_CONTRACTION_UPGRADE_EDGE_MULT || 1.5),
+  },
+
   keys: {
     last15mState: (id) => `alert:lastState15m:${id}`,
     lastSentAt: (id) => `alert:lastSentAt:${id}`,
@@ -81,7 +101,6 @@ function normalizeDriverTf(raw) {
 
 const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
 const abs = (x) => (x == null ? null : Math.abs(Number(x)));
-const fmtPct = (x) => (x == null || !Number.isFinite(x) ? "n/a" : `${x.toFixed(3)}%`);
 const fmtPrice = (x) => {
   if (x == null || !Number.isFinite(x)) return "n/a";
   if (x < 1) return x.toFixed(6);
@@ -137,7 +156,6 @@ async function computeLevelsFromSeries(instId) {
       continue;
     }
 
-    // ✅ FIX: do not drop 0 with filter(Boolean)
     const slice = pts
       .slice(-n)
       .map((p) => asNum(p?.p))
@@ -166,7 +184,8 @@ function biasFromItem(item) {
   return String(lean).toLowerCase();
 }
 
-function strongRecoB1({ bias, levels, price }) {
+// ---- edge check helper (used for base + contraction upgrade) ----
+function edgeRecoCheck({ bias, levels, price, edgePct }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { strong: false, reason: "1h_warmup" };
 
@@ -178,13 +197,22 @@ function strongRecoB1({ bias, levels, price }) {
   const range = hi - lo;
   if (!(range > 0)) return { strong: false, reason: "bad_range" };
 
-  const edge = CFG.strongEdgePct1h * range;
+  const edge = edgePct * range;
 
-  if (bias === "long")
-    return { strong: p <= lo + edge, reason: p <= lo + edge ? "long_near_low" : "long_not_near_low" };
-  if (bias === "short")
-    return { strong: p >= hi - edge, reason: p >= hi - edge ? "short_near_high" : "short_not_near_high" };
+  if (bias === "long") {
+    const ok = p <= lo + edge;
+    return { strong: ok, reason: ok ? "long_near_low" : "long_not_near_low" };
+  }
+  if (bias === "short") {
+    const ok = p >= hi - edge;
+    return { strong: ok, reason: ok ? "short_near_high" : "short_not_near_high" };
+  }
   return { strong: false, reason: "neutral_bias" };
+}
+
+// ---- base B1 reco ----
+function strongRecoB1({ bias, levels, price }) {
+  return edgeRecoCheck({ bias, levels, price, edgePct: CFG.strongEdgePct1h });
 }
 
 function evaluateCriteria(item, lastState) {
@@ -207,7 +235,7 @@ function evaluateCriteria(item, lastState) {
   return { triggers, curState };
 }
 
-// ---- NEW: derive BTC macro regime from /api/multi results ----
+// ---- derive BTC macro regime from /api/multi results ----
 function computeBtcMacro(results) {
   if (!CFG.macro.enabled) return { ok: false, reason: "macro_disabled", btcBullExpansion4h: false };
 
@@ -238,6 +266,67 @@ function computeBtcMacro(results) {
       oiPct4h: Number.isFinite(oiPct) ? oiPct : null,
     },
   };
+}
+
+// ---- NEW: per-symbol 4h regime ----
+function computeSymbolRegime(item) {
+  if (!CFG.regime.enabled) return { ok: false, type: "off" };
+
+  const d4 = item?.deltas?.["4h"];
+  const lean4h = String(d4?.lean || "").toLowerCase();
+  const p4 = asNum(d4?.price_change_pct);
+  const oi4 = asNum(d4?.oi_change_pct);
+
+  if (!Number.isFinite(p4) || !Number.isFinite(oi4)) return { ok: false, type: "unknown", lean4h: lean4h || null, p4, oi4 };
+
+  const bullExpansion =
+    lean4h === "long" && p4 >= CFG.regime.expansionPricePctMin && oi4 >= CFG.regime.expansionOiPctMin;
+
+  const bearExpansion =
+    lean4h === "short" && p4 <= -CFG.regime.expansionPricePctMin && oi4 >= CFG.regime.expansionOiPctMin;
+
+  const contraction =
+    Math.abs(p4) <= CFG.regime.contractionAbsPricePctMax && oi4 <= CFG.regime.contractionOiPctMax;
+
+  if (bullExpansion) return { ok: true, type: "bull_expansion", lean4h, p4, oi4 };
+  if (bearExpansion) return { ok: true, type: "bear_expansion", lean4h, p4, oi4 };
+  if (contraction) return { ok: true, type: "contraction", lean4h, p4, oi4 };
+
+  return { ok: true, type: "neutral", lean4h, p4, oi4 };
+}
+
+// ---- NEW: adjust reco using regime (expansion downgrade + contraction upgrade) ----
+function adjustRecoForRegime({ item, bias, levels, price, baseReco }) {
+  if (!CFG.regime.enabled) return { ...baseReco, adj: { type: "none" } };
+
+  const reg = computeSymbolRegime(item);
+
+  // Expansion: downgrade fade setups (strong->weak)
+  if (reg?.ok && baseReco?.strong) {
+    if (reg.type === "bull_expansion" && bias === "short") {
+      return { strong: false, reason: "regime_downgrade_bull_expansion_fade", adj: { type: reg.type, ...reg } };
+    }
+    if (reg.type === "bear_expansion" && bias === "long") {
+      return { strong: false, reason: "regime_downgrade_bear_expansion_fade", adj: { type: reg.type, ...reg } };
+    }
+  }
+
+  // Contraction: optional upgrade weak->strong if within wider edge band
+  if (
+    reg?.ok &&
+    reg.type === "contraction" &&
+    CFG.regime.contractionUpgradeEnabled &&
+    !baseReco?.strong
+  ) {
+    const widened = CFG.strongEdgePct1h * Math.max(1, CFG.regime.contractionUpgradeEdgeMult);
+    const up = edgeRecoCheck({ bias, levels, price, edgePct: widened });
+
+    if (up.strong) {
+      return { strong: true, reason: "regime_upgrade_contraction", adj: { type: reg.type, widenedEdgePct: widened, ...reg } };
+    }
+  }
+
+  return { ...baseReco, adj: { type: reg?.type || "unknown", ...reg } };
 }
 
 export default async function handler(req, res) {
@@ -317,7 +406,7 @@ export default async function handler(req, res) {
 
       const bias = biasFromItem(item);
 
-      // ---- NEW: MACRO GATE (block shorts on ALTs during BTC bull expansion) ----
+      // ---- MACRO GATE (block shorts on ALTs during BTC bull expansion) ----
       if (
         !force &&
         CFG.macro.enabled &&
@@ -334,7 +423,6 @@ export default async function handler(req, res) {
             btc4h: macro?.btc || null,
           });
         }
-        // still update lastState so flips can be detected later
         if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
         continue;
       }
@@ -344,16 +432,16 @@ export default async function handler(req, res) {
       // HARD WARMUP GATE
       if (!force && levels?.["1h"]?.warmup) {
         if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
-        // still update lastState so flips can be detected later
         if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
         continue;
       }
 
-      const reco = strongRecoB1({ bias, levels, price: item.price });
+      // Base reco then regime-adjusted reco
+      const baseReco = strongRecoB1({ bias, levels, price: item.price });
+      const reco = adjustRecoForRegime({ item, bias, levels, price: item.price, baseReco });
 
       if (!force && !reco.strong) {
         if (debug) skipped.push({ symbol, reason: `weak_reco:${reco.reason}` });
-        // still update lastState so flips can be detected later
         if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
         continue;
       }
