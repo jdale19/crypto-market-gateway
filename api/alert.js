@@ -28,6 +28,12 @@
 // 2) Momentum confirmation: 5m AND 15m lean match AND abs(5m price change) >= 0.10%
 // 3) Positioning shock: 15m oi_change_pct >= +0.50% AND abs(15m price_change_pct) >= 0.20%
 // Anti-spam: cooldown per symbol (default 20m) unless force=1
+//
+// NEW (B1 gate):
+// - Only send alerts (non-force) when recommendation is "strong":
+//   bias=long  => price is within outer X% of 1h range near the LOW
+//   bias=short => price is within outer X% of 1h range near the HIGH
+// - This reduces noise for non-real-time viewing.
 
 import { Redis } from "@upstash/redis";
 
@@ -74,6 +80,9 @@ const CFG = {
     "1h": 12, // 12 * 5m
     "4h": 48, // 48 * 5m
   },
+
+  // B1 gate: must be in the outer X% of the 1h range (near the edge for the bias)
+  strongEdgePct1h: Number(process.env.ALERT_STRONG_EDGE_PCT_1H || 0.15),
 
   // Telegram hard limit is 4096 chars; keep a buffer
   telegramMaxChars: 3900,
@@ -186,9 +195,7 @@ async function computeLevelsFromSeries(instId) {
     }
     const slice = points.slice(points.length - n);
     const lv = windowLevels(slice);
-    out[label] = lv
-      ? { warmup: false, ...lv }
-      : { warmup: true, hi: null, lo: null, mid: null };
+    out[label] = lv ? { warmup: false, ...lv } : { warmup: true, hi: null, lo: null, mid: null };
   }
 
   return out;
@@ -196,13 +203,7 @@ async function computeLevelsFromSeries(instId) {
 
 function playbookLine(bias, levels) {
   const l1h = levels?.["1h"];
-  if (
-    !l1h ||
-    l1h.warmup ||
-    !Number.isFinite(l1h.hi) ||
-    !Number.isFinite(l1h.lo) ||
-    !Number.isFinite(l1h.mid)
-  ) {
+  if (!l1h || l1h.warmup || !Number.isFinite(l1h.hi) || !Number.isFinite(l1h.lo) || !Number.isFinite(l1h.mid)) {
     if (bias === "short") return "Watch: continuation lower if weakness persists; wait for 15m confirmation.";
     if (bias === "long") return "Watch: continuation higher if strength persists; wait for 15m confirmation.";
     return "Watch: wait for 15m alignment; avoid noise.";
@@ -228,6 +229,37 @@ function biasFromItem(item) {
   if (lean === "long") return "long";
   if (lean === "short") return "short";
   return "neutral";
+}
+
+// ---- NEW: B1 "strong recommendation" gate ----
+function strongRecoB1({ bias, levels, price }) {
+  const l1h = levels?.["1h"];
+  if (!l1h || l1h.warmup) return { strong: false, reason: "1h_warmup" };
+
+  const hi = asNum(l1h.hi);
+  const lo = asNum(l1h.lo);
+  const p = asNum(price);
+
+  if (hi == null || lo == null || p == null) return { strong: false, reason: "missing_levels" };
+
+  const range = hi - lo;
+  if (!(range > 0)) return { strong: false, reason: "bad_range" };
+
+  const edge = CFG.strongEdgePct1h * range;
+
+  // long: alert when near 1h LOW edge (early)
+  if (bias === "long") {
+    const ok = p <= lo + edge;
+    return { strong: ok, reason: ok ? "long_near_low" : "long_not_near_low" };
+  }
+
+  // short: alert when near 1h HIGH edge (early)
+  if (bias === "short") {
+    const ok = p >= hi - edge;
+    return { strong: ok, reason: ok ? "short_near_high" : "short_not_near_high" };
+  }
+
+  return { strong: false, reason: "neutral_bias" };
 }
 
 // ---- Criteria evaluation ----
@@ -267,7 +299,7 @@ function evaluateCriteria(item, last15mState) {
   return { triggers, cur15mState };
 }
 
-// ---- NEW: format one ticker as an atomic “block” ----
+// ---- format one ticker as an atomic “block” ----
 function formatTickerBlock(t) {
   const d5 = t.d5;
   const d15 = t.d15;
@@ -290,7 +322,9 @@ function formatTickerBlock(t) {
   }
 
   const lines = [];
-  lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`);
+  lines.push(
+    `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | reco=${t.confidence || "?"} | hit=${reason}`
+  );
   lines.push(
     `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(
       d15?.oi_change_pct
@@ -310,10 +344,13 @@ function formatTickerBlock(t) {
 // If a block is too big (rare), produce a shorter version (still atomic).
 function formatTickerBlockShort(t) {
   const reason = (t.triggers || []).map((x) => x.code).join(",");
-  return [`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | hit=${reason}`, t.watch].join("\n");
+  return [
+    `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | reco=${t.confidence || "?"} | hit=${reason}`,
+    t.watch,
+  ].join("\n");
 }
 
-// ---- NEW: chunk by blocks, not by raw text ----
+// ---- chunk by blocks, not by raw text ----
 function chunkTelegramByBlocks({ headerLines, blocks, footerLines, maxChars }) {
   const header = headerLines.join("\n");
   const footer = footerLines.length ? "\n" + footerLines.join("\n") : "";
@@ -340,13 +377,9 @@ function chunkTelegramByBlocks({ headerLines, blocks, footerLines, maxChars }) {
       continue;
     }
 
-    // doesn't fit -> flush current and start new
     flush();
 
-    // If block alone still doesn't fit, shorten it (still atomic)
     if (baseOverhead + b.length + footer.length > maxChars) {
-      // caller should have already provided short version if needed,
-      // but keep this as a safety net: hard truncate.
       const allowed = Math.max(200, maxChars - baseOverhead - footer.length - 10);
       const truncated = b.slice(0, allowed) + "\n…";
       curBlocks.push(truncated);
@@ -360,12 +393,10 @@ function chunkTelegramByBlocks({ headerLines, blocks, footerLines, maxChars }) {
 
   flush();
 
-  // Put footer only on the last message (keeps earlier chunks smaller/cleaner)
   if (out.length && footer) {
     out[out.length - 1] = out[out.length - 1] + footer;
   }
 
-  // Add (i/N) prefix to header line
   if (out.length > 1) {
     return out.map((txt, i) => txt.replace(headerLines[0], `(${i + 1}/${out.length}) ${headerLines[0]}`));
   }
@@ -379,9 +410,7 @@ export default async function handler(req, res) {
     const secret = process.env.ALERT_SECRET || "";
 
     const authHeader = String(req.headers["authorization"] || "");
-    const bearer = authHeader.toLowerCase().startsWith("bearer ")
-      ? authHeader.slice(7).trim()
-      : "";
+    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
 
     const key = String(req.query.key || "");
     const provided = bearer || key;
@@ -483,6 +512,22 @@ export default async function handler(req, res) {
         const bias = biasFromItem(item);
         const watch = playbookLine(bias, levels);
 
+        // ✅ NEW: strong recommendation gate (B1). Force bypasses.
+        const reco = strongRecoB1({ bias, levels, price: item.price });
+        const confidence = reco.strong ? "strong" : "weak";
+
+        if (!force && confidence !== "strong") {
+          skipped.push({
+            symbol,
+            reason: `weak_reco (${reco.reason})`,
+            triggers,
+            ...(debug ? { confidence, reco_reason: reco.reason, cur15mState, lastState15m, lastSentAt } : {}),
+          });
+
+          // IMPORTANT: do not write lastSentAt/lastState15m on weak reco
+          continue;
+        }
+
         triggered.push({
           symbol,
           instId,
@@ -493,6 +538,8 @@ export default async function handler(req, res) {
           triggers,
           levels,
           watch,
+          confidence,
+          reco_reason: reco.reason,
           ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
         });
 
@@ -510,6 +557,8 @@ export default async function handler(req, res) {
     }
 
     if (!force && triggered.length === 0) {
+      // NOTE: you may have had criteria hits that were blocked by weak reco;
+      // that will show up in debug `skipped`.
       const reason = cooldownBlockedCount > 0 ? "cooldown" : "no triggers";
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
@@ -546,6 +595,8 @@ export default async function handler(req, res) {
               const lv = await computeLevelsFromSeries(String(it.instId || ""));
               const bias = biasFromItem(it);
               const watch = playbookLine(bias, lv);
+              const reco = strongRecoB1({ bias, levels: lv, price: it.price });
+              const confidence = reco.strong ? "strong" : "weak";
               return {
                 symbol: String(it.symbol),
                 price: it.price,
@@ -554,6 +605,8 @@ export default async function handler(req, res) {
                 d15: it.deltas?.["15m"],
                 levels: lv,
                 watch,
+                confidence,
+                reco_reason: reco.reason,
                 triggers: [{ code: "force", msg: "force=1" }],
               };
             })
@@ -563,13 +616,7 @@ export default async function handler(req, res) {
     // Make blocks, with “short” fallback if one block is too large
     const blocks = listToSend.map((t) => {
       const full = formatTickerBlock(t);
-      if (
-        headerLines.join("\n").length +
-          2 +
-          full.length +
-          ("\n" + footerLines.join("\n")).length <=
-        CFG.telegramMaxChars
-      ) {
+      if (headerLines.join("\n").length + 2 + full.length + ("\n" + footerLines.join("\n")).length <= CFG.telegramMaxChars) {
         return full;
       }
       return formatTickerBlockShort(t);
