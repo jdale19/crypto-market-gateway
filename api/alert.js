@@ -2,38 +2,9 @@
 // V1 Alerts: pulls /api/multi, evaluates trigger criteria, applies cooldown, sends Telegram DM.
 // Adds "levels" (1h/4h hi/lo/mid) computed from stored 5m series in Upstash.
 //
-// Env vars required:
-// - TELEGRAM_BOT_TOKEN
-// - TELEGRAM_CHAT_ID
-// - UPSTASH_REDIS_REST_URL
-// - UPSTASH_REDIS_REST_TOKEN
-// Optional:
-// - DEFAULT_SYMBOLS (comma list like "BTCUSDT,ETHUSDT,LDOUSDT")
-// - ALERT_COOLDOWN_MINUTES (default 20)
-//
-// Query params:
-// - key=... (optional now; fallback for manual testing) must match ALERT_SECRET
-// - symbols=BTCUSDT,ETHUSDT   (optional; falls back to env; then fallback list)
-// - driver_tf=5m|15m|30m|1h|4h (optional; default 5m)
-// - debug=1 (optional; adds debug fields to response JSON ONLY)
-// - force=1 (optional; bypass criteria + cooldown; sends snapshot for all symbols)
-// - dry=1 (optional; NEVER sends Telegram, NEVER writes to Upstash, returns would-send payload)
-//
-// Auth:
-// - Preferred: Authorization: Bearer <ALERT_SECRET>
-// - Fallback:  ?key=<ALERT_SECRET>
-//
-// Criteria v1 (per symbol):
-// 1) Setup flip: 15m state changed since last check
-// 2) Momentum confirmation: 5m AND 15m lean match AND abs(5m price change) >= 0.10%
-// 3) Positioning shock: 15m oi_change_pct >= +0.50% AND abs(15m price_change_pct) >= 0.20%
-// Anti-spam: cooldown per symbol (default 20m) unless force=1
-//
-// NEW (B1 gate):
-// - Only send alerts (non-force) when recommendation is "strong":
-//   bias=long  => price is within outer X% of 1h range near the LOW
-//   bias=short => price is within outer X% of 1h range near the HIGH
-// - This reduces noise for non-real-time viewing.
+// NEW:
+// - Hard warmup gate: non-force alerts require 1h levels ready
+// - B1 strong recommendation gate retained
 
 import { Redis } from "@upstash/redis";
 
@@ -42,61 +13,46 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// ---- Deploy stamp (to verify what's actually deployed) ----
 function getDeployInfo() {
-  const sha =
-    process.env.VERCEL_GIT_COMMIT_SHA ||
-    process.env.VERCEL_GITHUB_COMMIT_SHA ||
-    process.env.GITHUB_SHA ||
-    null;
-
-  const ref =
-    process.env.VERCEL_GIT_COMMIT_REF ||
-    process.env.VERCEL_GITHUB_COMMIT_REF ||
-    process.env.GITHUB_REF_NAME ||
-    null;
-
   return {
-    vercel: process.env.VERCEL ? true : false,
+    vercel: !!process.env.VERCEL,
     env: process.env.VERCEL_ENV || process.env.NODE_ENV || null,
-    sha,
-    ref,
-    deploymentId: process.env.VERCEL_DEPLOYMENT_ID || null,
-    buildId: process.env.VERCEL_BUILD_ID || null,
+    sha:
+      process.env.VERCEL_GIT_COMMIT_SHA ||
+      process.env.VERCEL_GITHUB_COMMIT_SHA ||
+      process.env.GITHUB_SHA ||
+      null,
+    ref:
+      process.env.VERCEL_GIT_COMMIT_REF ||
+      process.env.VERCEL_GITHUB_COMMIT_REF ||
+      process.env.GITHUB_REF_NAME ||
+      null,
   };
 }
 
-// ---- Config (easy to modify later) ----
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
 
-  // Criteria thresholds
-  momentumAbs5mPricePct: 0.1, // %
-  shockOi15mPct: 0.5, // %
-  shockAbs15mPricePct: 0.2, // %
+  momentumAbs5mPricePct: 0.1,
+  shockOi15mPct: 0.5,
+  shockAbs15mPricePct: 0.2,
 
-  // Levels computed from stored 5m points
   levelWindows: {
-    "1h": 12, // 12 * 5m
-    "4h": 48, // 48 * 5m
+    "1h": 12,
+    "4h": 48,
   },
 
-  // B1 gate: must be in the outer X% of the 1h range (near the edge for the bias)
   strongEdgePct1h: Number(process.env.ALERT_STRONG_EDGE_PCT_1H || 0.15),
 
-  // Telegram hard limit is 4096 chars; keep a buffer
   telegramMaxChars: 3900,
 
-  // Redis keys
   keys: {
-    last15mState: (instId) => `alert:lastState15m:${instId}`,
-    lastSentAt: (instId) => `alert:lastSentAt:${instId}`, // epoch ms
-    // series is written by /api/multi.js
-    series5m: (instId) => `series5m:${instId}`,
+    last15mState: (id) => `alert:lastState15m:${id}`,
+    lastSentAt: (id) => `alert:lastSentAt:${id}`,
+    series5m: (id) => `series5m:${id}`,
   },
 };
 
-// ---- helpers ----
 function normalizeSymbols(raw) {
   return String(raw || "")
     .split(",")
@@ -106,30 +62,20 @@ function normalizeSymbols(raw) {
 
 function normalizeDriverTf(raw) {
   const tf = String(raw || "5m").toLowerCase();
-  const allowed = new Set(["5m", "15m", "30m", "1h", "4h"]);
-  return allowed.has(tf) ? tf : "5m";
+  return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
 }
 
-function asNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
-function abs(x) {
-  return x == null ? null : Math.abs(x);
-}
-
-function fmtPct(x) {
-  if (x == null || !Number.isFinite(x)) return "n/a";
-  return `${x.toFixed(3)}%`;
-}
-
-function fmtPrice(x) {
-  if (x == null || !Number.isFinite(x)) return "n/a";
-  if (x < 1) return x.toFixed(6);
-  if (x < 100) return x.toFixed(4);
-  return x.toFixed(2);
-}
+const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
+const abs = (x) => (x == null ? null : Math.abs(x));
+const fmtPct = (x) => (x == null ? "n/a" : `${x.toFixed(3)}%`);
+const fmtPrice = (x) =>
+  x == null
+    ? "n/a"
+    : x < 1
+    ? x.toFixed(6)
+    : x < 100
+    ? x.toFixed(4)
+    : x.toFixed(2);
 
 function safeJsonParse(v) {
   try {
@@ -143,12 +89,7 @@ async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  if (!token || !chatId) {
-    return { ok: false, error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
-  }
-
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const r = await fetch(url, {
+  const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -159,79 +100,47 @@ async function sendTelegram(text) {
   });
 
   const j = await r.json().catch(() => null);
-  if (!r.ok || !j?.ok) {
-    return { ok: false, error: "Telegram send failed", detail: j || null };
-  }
+  if (!r.ok || !j?.ok) return { ok: false, detail: j };
   return { ok: true };
 }
 
-// Pull last N points from the stored series and compute hi/lo/mid.
-// Points are objects like { b, ts, p, fr, oi } written by /api/multi.js
 async function computeLevelsFromSeries(instId) {
-  const seriesKey = CFG.keys.series5m(instId);
+  const raw = await redis.lrange(
+    CFG.keys.series5m(instId),
+    -Math.max(...Object.values(CFG.levelWindows)),
+    -1
+  );
+
+  const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const out = {};
 
-  const maxNeeded = Math.max(...Object.values(CFG.levelWindows));
-  const raw = await redis.lrange(seriesKey, -maxNeeded, -1);
-  const points = (raw || []).map(safeJsonParse).filter(Boolean);
-
-  function windowLevels(windowPoints) {
-    const ps = windowPoints.map((pt) => asNum(pt?.p)).filter((x) => x != null);
-    if (ps.length === 0) return null;
-    let hi = ps[0];
-    let lo = ps[0];
-    for (const v of ps) {
-      if (v > hi) hi = v;
-      if (v < lo) lo = v;
-    }
-    const mid = (hi + lo) / 2;
-    return { hi, lo, mid };
-  }
-
   for (const [label, n] of Object.entries(CFG.levelWindows)) {
-    if (points.length < n) {
-      out[label] = { warmup: true, hi: null, lo: null, mid: null };
+    if (pts.length < n) {
+      out[label] = { warmup: true };
       continue;
     }
-    const slice = points.slice(points.length - n);
-    const lv = windowLevels(slice);
-    out[label] = lv ? { warmup: false, ...lv } : { warmup: true, hi: null, lo: null, mid: null };
+    const slice = pts.slice(-n).map((p) => asNum(p?.p)).filter(Boolean);
+    const hi = Math.max(...slice);
+    const lo = Math.min(...slice);
+    out[label] = {
+      warmup: false,
+      hi,
+      lo,
+      mid: (hi + lo) / 2,
+    };
   }
 
   return out;
 }
 
-function playbookLine(bias, levels) {
-  const l1h = levels?.["1h"];
-  if (!l1h || l1h.warmup || !Number.isFinite(l1h.hi) || !Number.isFinite(l1h.lo) || !Number.isFinite(l1h.mid)) {
-    if (bias === "short") return "Watch: continuation lower if weakness persists; wait for 15m confirmation.";
-    if (bias === "long") return "Watch: continuation higher if strength persists; wait for 15m confirmation.";
-    return "Watch: wait for 15m alignment; avoid noise.";
-  }
-
-  const hi = fmtPrice(l1h.hi);
-  const lo = fmtPrice(l1h.lo);
-  const mid = fmtPrice(l1h.mid);
-
-  if (bias === "short") {
-    return `Watch: breakdown < 1h low (${lo}) = continuation; reclaim > 1h mid (${mid}) = fade risk. (1h hi ${hi})`;
-  }
-  if (bias === "long") {
-    return `Watch: breakout > 1h high (${hi}) = continuation; lose < 1h mid (${mid}) = fade risk. (1h low ${lo})`;
-  }
-  return `Watch: range until break of 1h hi/lo (${hi}/${lo}). Mid=${mid}.`;
-}
-
 function biasFromItem(item) {
-  const lean15 = item?.deltas?.["15m"]?.lean;
-  const leanDriver = item?.lean;
-  const lean = (lean15 || leanDriver || "neutral").toLowerCase();
-  if (lean === "long") return "long";
-  if (lean === "short") return "short";
-  return "neutral";
+  const lean =
+    item?.deltas?.["15m"]?.lean ||
+    item?.lean ||
+    "neutral";
+  return lean.toLowerCase();
 }
 
-// ---- NEW: B1 "strong recommendation" gate ----
 function strongRecoB1({ bias, levels, price }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { strong: false, reason: "1h_warmup" };
@@ -239,451 +148,150 @@ function strongRecoB1({ bias, levels, price }) {
   const hi = asNum(l1h.hi);
   const lo = asNum(l1h.lo);
   const p = asNum(price);
+  if (hi == null || lo == null || p == null) return { strong: false };
 
-  if (hi == null || lo == null || p == null) return { strong: false, reason: "missing_levels" };
+  const edge = CFG.strongEdgePct1h * (hi - lo);
 
-  const range = hi - lo;
-  if (!(range > 0)) return { strong: false, reason: "bad_range" };
-
-  const edge = CFG.strongEdgePct1h * range;
-
-  // long: alert when near 1h LOW edge (early)
-  if (bias === "long") {
-    const ok = p <= lo + edge;
-    return { strong: ok, reason: ok ? "long_near_low" : "long_not_near_low" };
-  }
-
-  // short: alert when near 1h HIGH edge (early)
-  if (bias === "short") {
-    const ok = p >= hi - edge;
-    return { strong: ok, reason: ok ? "short_near_high" : "short_not_near_high" };
-  }
-
-  return { strong: false, reason: "neutral_bias" };
+  if (bias === "long") return { strong: p <= lo + edge };
+  if (bias === "short") return { strong: p >= hi - edge };
+  return { strong: false };
 }
 
-// ---- Criteria evaluation ----
-function evaluateCriteria(item, last15mState) {
+function evaluateCriteria(item, lastState) {
   const d5 = item?.deltas?.["5m"];
   const d15 = item?.deltas?.["15m"];
-
   const triggers = [];
+  const curState = String(d15?.state || "unknown");
 
-  // 1) Setup flip (15m state changed)
-  const cur15mState = String(d15?.state || "unknown");
-  if (last15mState && cur15mState && last15mState !== cur15mState) {
-    triggers.push({ code: "setup_flip", msg: `15m state flip: ${last15mState} → ${cur15mState}` });
-  }
+  if (lastState && curState !== lastState)
+    triggers.push({ code: "setup_flip" });
 
-  // 2) Momentum confirmation
-  const lean5 = String(d5?.lean || "neutral");
-  const lean15 = String(d15?.lean || "neutral");
-  const absP5 = abs(d5?.price_change_pct);
-  if (lean5 === lean15 && (absP5 ?? 0) >= CFG.momentumAbs5mPricePct) {
-    triggers.push({
-      code: "momentum_confirm",
-      msg: `Momentum: 5m+15m both ${lean15}, |5m p|=${fmtPct(absP5)}≥${CFG.momentumAbs5mPricePct.toFixed(2)}%`,
-    });
-  }
+  if (
+    d5?.lean === d15?.lean &&
+    abs(d5?.price_change_pct) >= CFG.momentumAbs5mPricePct
+  )
+    triggers.push({ code: "momentum_confirm" });
 
-  // 3) Positioning shock
-  const oi15 = d15?.oi_change_pct;
-  const absP15 = abs(d15?.price_change_pct);
-  if ((oi15 ?? -Infinity) >= CFG.shockOi15mPct && (absP15 ?? 0) >= CFG.shockAbs15mPricePct) {
-    triggers.push({
-      code: "positioning_shock",
-      msg: `Positioning shock: 15m OI=${fmtPct(oi15)} & |15m p|=${fmtPct(absP15)}`,
-    });
-  }
+  if (
+    d15?.oi_change_pct >= CFG.shockOi15mPct &&
+    abs(d15?.price_change_pct) >= CFG.shockAbs15mPricePct
+  )
+    triggers.push({ code: "positioning_shock" });
 
-  return { triggers, cur15mState };
+  return { triggers, curState };
 }
 
-// ---- format one ticker as an atomic “block” ----
-function formatTickerBlock(t) {
-  const d5 = t.d5;
-  const d15 = t.d15;
-  const reason = (t.triggers || []).map((x) => x.code).join(",");
-
-  const l1h = t.levels?.["1h"];
-  const l4h = t.levels?.["4h"];
-  const lvlParts = [];
-
-  if (l1h && !l1h.warmup) {
-    lvlParts.push(`1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)} mid=${fmtPrice(l1h.mid)}`);
-  } else {
-    lvlParts.push(`1h levels: warmup`);
-  }
-
-  if (l4h && !l4h.warmup) {
-    lvlParts.push(`4h H/L=${fmtPrice(l4h.hi)}/${fmtPrice(l4h.lo)} mid=${fmtPrice(l4h.mid)}`);
-  } else {
-    lvlParts.push(`4h levels: warmup`);
-  }
-
-  const lines = [];
-  lines.push(
-    `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | reco=${t.confidence || "?"} | hit=${reason}`
-  );
-  lines.push(
-    `15m ${d15?.state || "?"}/${d15?.lean || "?"} p=${fmtPct(d15?.price_change_pct)} oi=${fmtPct(
-      d15?.oi_change_pct
-    )}`
-  );
-  lines.push(
-    `5m  ${d5?.state || "?"}/${d5?.lean || "?"} p=${fmtPct(d5?.price_change_pct)} oi=${fmtPct(
-      d5?.oi_change_pct
-    )}`
-  );
-  lines.push(`Levels: ${lvlParts.join(" | ")}`);
-  lines.push(t.watch);
-
-  return lines.join("\n");
-}
-
-// If a block is too big (rare), produce a shorter version (still atomic).
-function formatTickerBlockShort(t) {
-  const reason = (t.triggers || []).map((x) => x.code).join(",");
-  return [
-    `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | reco=${t.confidence || "?"} | hit=${reason}`,
-    t.watch,
-  ].join("\n");
-}
-
-// ---- chunk by blocks, not by raw text ----
-function chunkTelegramByBlocks({ headerLines, blocks, footerLines, maxChars }) {
-  const header = headerLines.join("\n");
-  const footer = footerLines.length ? "\n" + footerLines.join("\n") : "";
-
-  const baseOverhead = header.length + 2; // header + blank line
-  const out = [];
-
-  let curBlocks = [];
-  let curLen = baseOverhead;
-
-  const flush = () => {
-    if (!curBlocks.length) return;
-    out.push([header, "", ...curBlocks].join("\n"));
-    curBlocks = [];
-    curLen = baseOverhead;
-  };
-
-  for (const b of blocks) {
-    const addLen = (curBlocks.length ? 2 : 0) + b.length; // 2 for "\n\n" between blocks
-    if (curLen + addLen + footer.length <= maxChars) {
-      if (curBlocks.length) curBlocks.push(""); // blank line between blocks
-      curBlocks.push(b);
-      curLen += addLen;
-      continue;
-    }
-
-    flush();
-
-    if (baseOverhead + b.length + footer.length > maxChars) {
-      const allowed = Math.max(200, maxChars - baseOverhead - footer.length - 10);
-      const truncated = b.slice(0, allowed) + "\n…";
-      curBlocks.push(truncated);
-      flush();
-      continue;
-    }
-
-    curBlocks.push(b);
-    curLen = baseOverhead + b.length;
-  }
-
-  flush();
-
-  if (out.length && footer) {
-    out[out.length - 1] = out[out.length - 1] + footer;
-  }
-
-  if (out.length > 1) {
-    return out.map((txt, i) => txt.replace(headerLines[0], `(${i + 1}/${out.length}) ${headerLines[0]}`));
-  }
-  return out;
-}
-
-// ---- main handler ----
 export default async function handler(req, res) {
   try {
-    // ✅ AUTH: Bearer header preferred (for QStash), ?key= fallback for manual testing
     const secret = process.env.ALERT_SECRET || "";
+    const bearer = String(req.headers.authorization || "")
+      .toLowerCase()
+      .startsWith("bearer ")
+      ? req.headers.authorization.slice(7).trim()
+      : "";
 
-    const authHeader = String(req.headers["authorization"] || "");
-    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
-
-    const key = String(req.query.key || "");
-    const provided = bearer || key;
-
-    if (!secret || !provided || provided !== secret) {
+    const key = req.query.key;
+    if ((bearer || key) !== secret)
       return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
 
-    const debug = String(req.query.debug || "") === "1";
-    const force = String(req.query.force || "") === "1";
-    const dry = String(req.query.dry || "") === "1";
+    const force = req.query.force === "1";
+    const dry = req.query.dry === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
-    // symbols: query -> env -> fallback
-    const querySymbols = normalizeSymbols(req.query.symbols);
-    const envSymbols = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
     const symbols =
-      querySymbols.length > 0 ? querySymbols : envSymbols.length > 0 ? envSymbols : ["BTCUSDT", "ETHUSDT", "LDOUSDT"];
+      normalizeSymbols(req.query.symbols).length
+        ? normalizeSymbols(req.query.symbols)
+        : ["BTCUSDT"];
 
-    // Build absolute URL to /api/multi on same host
     const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+    const proto =
+      (req.headers["x-forwarded-proto"] || "https").split(",")[0];
+    const multiUrl = `${proto}://${host}/api/multi?symbols=${symbols.join(
+      ","
+    )}&driver_tf=${driver_tf}`;
 
-    const qs = new URLSearchParams();
-    qs.set("symbols", symbols.join(","));
-    qs.set("driver_tf", driver_tf);
-    const multiUrl = `${proto}://${host}/api/multi?${qs.toString()}`;
-
-    const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
-    const j = await r.json().catch(() => null);
-
-    if (!r.ok || !j?.ok) {
-      return res.status(500).json({
-        ok: false,
-        error: "multi fetch failed",
-        detail: j || null,
-        multiUrl,
-        symbols,
-        driver_tf,
-        dry,
-        ...(debug ? { deploy: getDeployInfo() } : {}),
-      });
-    }
+    const r = await fetch(multiUrl);
+    const j = await r.json();
+    if (!j?.ok) return res.status(500).json({ ok: false });
 
     const now = Date.now();
-    const cooldownMs = CFG.cooldownMinutes * 60 * 1000;
-
+    const cooldownMs = CFG.cooldownMinutes * 60000;
     const triggered = [];
-    const skipped = [];
 
-    let criteriaHitCount = 0;
-    let cooldownBlockedCount = 0;
-
-    // Evaluate each symbol
     for (const item of j.results || []) {
-      if (!item?.ok) {
-        skipped.push({ symbol: item?.symbol || "?", reason: `error: ${item?.error || "unknown"}` });
+      if (!item?.ok) continue;
+
+      const instId = item.instId;
+      const lastState = await redis.get(CFG.keys.last15mState(instId));
+      const lastSent = Number(await redis.get(CFG.keys.lastSentAt(instId)));
+
+      const { triggers, curState } = evaluateCriteria(item, lastState);
+      if (!force && !triggers.length) continue;
+      if (
+        !force &&
+        lastSent &&
+        now - lastSent < cooldownMs
+      )
         continue;
-      }
 
-      const instId = String(item.instId || "");
-      const symbol = String(item.symbol || "?");
+      const levels = await computeLevelsFromSeries(instId);
 
-      const [lastState15mRaw, lastSentRaw] = await Promise.all([
-        redis.get(CFG.keys.last15mState(instId)),
-        redis.get(CFG.keys.lastSentAt(instId)),
-      ]);
+      // HARD WARMUP GATE
+      if (!force && levels?.["1h"]?.warmup) continue;
 
-      const lastState15m = lastState15mRaw ? String(lastState15mRaw) : null;
-      const lastSentAt = lastSentRaw ? Number(lastSentRaw) : null;
-
-      const evalRes = evaluateCriteria(item, lastState15m);
-      const cur15mState = evalRes.cur15mState;
-
-      const triggers = force ? [{ code: "force", msg: "force=1" }] : evalRes.triggers;
-
-      const inCooldown = !force && Number.isFinite(lastSentAt) && lastSentAt != null && now - lastSentAt < cooldownMs;
-
-      if (triggers.length === 0) {
-        skipped.push({
-          symbol,
-          reason: "no criteria hit",
-          ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
-        });
-      } else if (inCooldown) {
-        criteriaHitCount += 1;
-        cooldownBlockedCount += 1;
-
-        skipped.push({
-          symbol,
-          reason: `cooldown (${Math.ceil((cooldownMs - (now - lastSentAt)) / 60000)}m remaining)`,
-          triggers,
-          ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
-        });
-      } else {
-        criteriaHitCount += 1;
-
-        const levels = await computeLevelsFromSeries(instId);
-        const bias = biasFromItem(item);
-        const watch = playbookLine(bias, levels);
-
-        // ✅ NEW: strong recommendation gate (B1). Force bypasses.
-        const reco = strongRecoB1({ bias, levels, price: item.price });
-        const confidence = reco.strong ? "strong" : "weak";
-
-        if (!force && confidence !== "strong") {
-          skipped.push({
-            symbol,
-            reason: `weak_reco (${reco.reason})`,
-            triggers,
-            ...(debug ? { confidence, reco_reason: reco.reason, cur15mState, lastState15m, lastSentAt } : {}),
-          });
-
-          // IMPORTANT: do not write lastSentAt/lastState15m on weak reco
-          continue;
-        }
-
-        triggered.push({
-          symbol,
-          instId,
-          price: item.price,
-          bias,
-          d5: item.deltas?.["5m"],
-          d15: item.deltas?.["15m"],
-          triggers,
-          levels,
-          watch,
-          confidence,
-          reco_reason: reco.reason,
-          ...(debug ? { cur15mState, lastState15m, lastSentAt } : {}),
-        });
-
-        if (!dry) {
-          await redis.set(CFG.keys.lastSentAt(instId), String(now));
-          if (cur15mState) {
-            await redis.set(CFG.keys.last15mState(instId), cur15mState);
-          }
-        }
-      }
-
-      if (!dry && triggers.length === 0 && cur15mState) {
-        await redis.set(CFG.keys.last15mState(instId), cur15mState);
-      }
-    }
-
-    if (!force && triggered.length === 0) {
-      // NOTE: you may have had criteria hits that were blocked by weak reco;
-      // that will show up in debug `skipped`.
-      const reason = cooldownBlockedCount > 0 ? "cooldown" : "no triggers";
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        dry,
-        sent: false,
-        reason,
-        driver_tf,
-        symbols,
-        multiUrl,
-        triggered_count: 0,
-        criteria_hit_count: criteriaHitCount,
-        cooldown_blocked_count: cooldownBlockedCount,
-        ...(debug ? { deploy: getDeployInfo(), skipped } : {}),
+      const bias = biasFromItem(item);
+      const reco = strongRecoB1({
+        bias,
+        levels,
+        price: item.price,
       });
-    }
 
-    // ---- Build atomic ticker blocks ----
-    const headerLines = [];
-    headerLines.push(`⚡️ OKX perps alert (${driver_tf})${force ? " [FORCE]" : ""}${dry ? " [DRY]" : ""}`);
-    headerLines.push(new Date(j.ts || now).toISOString());
-    if (debug) {
-      const d = getDeployInfo();
-      headerLines.push(`deploy: ${d.sha || "no-sha"} ${d.env || ""} ${d.ref || ""}`.trim());
-    }
+      if (!force && !reco.strong) continue;
 
-    const footerLines = [multiUrl];
-
-    const listToSend = force
-      ? await Promise.all(
-          (j.results || [])
-            .filter((it) => it?.ok)
-            .map(async (it) => {
-              const lv = await computeLevelsFromSeries(String(it.instId || ""));
-              const bias = biasFromItem(it);
-              const watch = playbookLine(bias, lv);
-              const reco = strongRecoB1({ bias, levels: lv, price: it.price });
-              const confidence = reco.strong ? "strong" : "weak";
-              return {
-                symbol: String(it.symbol),
-                price: it.price,
-                bias,
-                d5: it.deltas?.["5m"],
-                d15: it.deltas?.["15m"],
-                levels: lv,
-                watch,
-                confidence,
-                reco_reason: reco.reason,
-                triggers: [{ code: "force", msg: "force=1" }],
-              };
-            })
-        )
-      : triggered;
-
-    // Make blocks, with “short” fallback if one block is too large
-    const blocks = listToSend.map((t) => {
-      const full = formatTickerBlock(t);
-      if (headerLines.join("\n").length + 2 + full.length + ("\n" + footerLines.join("\n")).length <= CFG.telegramMaxChars) {
-        return full;
-      }
-      return formatTickerBlockShort(t);
-    });
-
-    const messages = chunkTelegramByBlocks({
-      headerLines,
-      blocks,
-      footerLines,
-      maxChars: CFG.telegramMaxChars,
-    });
-
-    // DRY mode: return preview of first message + count
-    if (dry) {
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        dry: true,
-        sent: false,
-        would_send: true,
-        driver_tf,
-        force,
-        symbols,
-        multiUrl,
-        triggered_count: triggered.length,
-        message_count: messages.length,
-        preview: messages[0] || "",
-        ...(debug ? { deploy: getDeployInfo(), triggered, skipped } : {}),
+      triggered.push({
+        symbol: item.symbol,
+        price: item.price,
+        bias,
+        levels,
       });
-    }
 
-    // Send all chunks in order
-    for (const msg of messages) {
-      const tg = await sendTelegram(msg);
-      if (!tg.ok) {
-        return res.status(500).json({
-          ok: false,
-          error: tg.error,
-          detail: tg.detail || null,
-          multiUrl,
-          symbols,
-          driver_tf,
-          dry,
-          ...(debug ? { deploy: getDeployInfo() } : {}),
-        });
+      if (!dry) {
+        await redis.set(CFG.keys.lastSentAt(instId), now);
+        await redis.set(CFG.keys.last15mState(instId), curState);
       }
     }
 
-    res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json({
+    if (!force && !triggered.length)
+      return res.json({ ok: true, sent: false });
+
+    const lines = [];
+    lines.push(
+      `⚡️ OKX perps alert (${driver_tf})${
+        force ? " [FORCE]" : ""
+      }`
+    );
+    lines.push(new Date().toISOString());
+    lines.push("");
+
+    for (const t of triggered) {
+      lines.push(
+        `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias}`
+      );
+      lines.push("");
+    }
+
+    lines.push(multiUrl);
+
+    const message = lines.join("\n");
+
+    if (!dry) await sendTelegram(message);
+
+    return res.json({
       ok: true,
-      dry: false,
-      sent: true,
-      force,
-      driver_tf,
-      symbols,
-      multiUrl,
+      sent: !dry,
       triggered_count: triggered.length,
-      message_count: messages.length,
-      ...(debug ? { deploy: getDeployInfo(), triggered, skipped } : {}),
     });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: "server error",
-      detail: String(err?.message || err),
-      ...(String(req?.query?.debug || "") === "1" ? { deploy: getDeployInfo() } : {}),
-    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
   }
 }
