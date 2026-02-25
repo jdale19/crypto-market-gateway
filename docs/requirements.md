@@ -319,6 +319,7 @@ System is correct when:
 	3. /api/alert sends DM only when:
 		• criteria met
 		• 1h warm
+  • macro regime gate passed
 		• reco=strong
 		• not in cooldown
 		or
