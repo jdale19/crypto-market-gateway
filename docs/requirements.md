@@ -147,6 +147,27 @@ Non-force alerts must NOT send unless levels are ready:
 
 Purpose: if levels are not warm, signals are not actionable and should not notify.
 
+5.1 Macro Regime Gate (BTC 4h)
+
+Non-force alerts must also pass macro regime filter.
+
+Definition:
+
+BTC_BULL_EXPANSION_4H =
+	•	BTC 4h lean == “long”
+	•	AND BTC 4h price_change_pct ≥ ALERT_MACRO_BTC_4H_PRICE_PCT_MIN (default 2.0)
+	•	AND BTC 4h oi_change_pct ≥ ALERT_MACRO_BTC_4H_OI_PCT_MIN (default 0.5)
+
+If BTC_BULL_EXPANSION_4H = true:
+	•	Block SHORT bias alerts on non-BTC symbols.
+
+Force=1 bypasses macro gate.
+
+Config:
+	•	ALERT_MACRO_GATE_ENABLED (default 1)
+	•	ALERT_MACRO_BTC_4H_PRICE_PCT_MIN (default 2.0)
+	•	ALERT_MACRO_BTC_4H_OI_PCT_MIN (default 0.5)
+
 ⸻
 
 6) Strong recommendation gate (B1)
