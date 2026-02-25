@@ -288,8 +288,7 @@ System is correct when:
 12) Quick links
 
 Replace {SECRET} with your ALERT_SECRET.
-
-	•	Manual forced snapshot (send DM):
+	• Manual forced snapshot (send DM):
 /api/alert?key={SECRET}&symbols=BTCUSDT&force=1
 	•	Safe test mode (no send, no writes):
 /api/alert?key={SECRET}&symbols=BTCUSDT&debug=1&dry=1
