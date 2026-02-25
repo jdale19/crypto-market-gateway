@@ -5,6 +5,8 @@
 // NEW:
 // - Hard warmup gate: non-force alerts require 1h levels ready
 // - B1 strong recommendation gate retained
+// - FIX: safeJsonParse handles string OR already-parsed object (matches multi.js)
+// - debug=1 returns skip reasons (no Telegram behavior change)
 
 import { Redis } from "@upstash/redis";
 
@@ -66,28 +68,34 @@ function normalizeDriverTf(raw) {
 }
 
 const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
-const abs = (x) => (x == null ? null : Math.abs(x));
-const fmtPct = (x) => (x == null ? "n/a" : `${x.toFixed(3)}%`);
-const fmtPrice = (x) =>
-  x == null
-    ? "n/a"
-    : x < 1
-    ? x.toFixed(6)
-    : x < 100
-    ? x.toFixed(4)
-    : x.toFixed(2);
+const abs = (x) => (x == null ? null : Math.abs(Number(x)));
+const fmtPct = (x) => (x == null || !Number.isFinite(x) ? "n/a" : `${x.toFixed(3)}%`);
+const fmtPrice = (x) => {
+  if (x == null || !Number.isFinite(x)) return "n/a";
+  if (x < 1) return x.toFixed(6);
+  if (x < 100) return x.toFixed(4);
+  return x.toFixed(2);
+};
 
+// ✅ FIX: handle string OR already-parsed object (same as multi.js)
 function safeJsonParse(v) {
-  try {
-    return JSON.parse(v);
-  } catch {
-    return null;
+  if (v == null) return null;
+  if (typeof v === "object") return v;
+  if (typeof v === "string") {
+    try {
+      return JSON.parse(v);
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) return { ok: false, detail: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
 
   const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -105,11 +113,8 @@ async function sendTelegram(text) {
 }
 
 async function computeLevelsFromSeries(instId) {
-  const raw = await redis.lrange(
-    CFG.keys.series5m(instId),
-    -Math.max(...Object.values(CFG.levelWindows)),
-    -1
-  );
+  const need = Math.max(...Object.values(CFG.levelWindows));
+  const raw = await redis.lrange(CFG.keys.series5m(instId), -need, -1);
 
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const out = {};
@@ -119,7 +124,18 @@ async function computeLevelsFromSeries(instId) {
       out[label] = { warmup: true };
       continue;
     }
-    const slice = pts.slice(-n).map((p) => asNum(p?.p)).filter(Boolean);
+
+    // ✅ FIX: do not drop 0 with filter(Boolean)
+    const slice = pts
+      .slice(-n)
+      .map((p) => asNum(p?.p))
+      .filter((x) => x != null);
+
+    if (!slice.length) {
+      out[label] = { warmup: true };
+      continue;
+    }
+
     const hi = Math.max(...slice);
     const lo = Math.min(...slice);
     out[label] = {
@@ -134,11 +150,8 @@ async function computeLevelsFromSeries(instId) {
 }
 
 function biasFromItem(item) {
-  const lean =
-    item?.deltas?.["15m"]?.lean ||
-    item?.lean ||
-    "neutral";
-  return lean.toLowerCase();
+  const lean = item?.deltas?.["15m"]?.lean || item?.lean || "neutral";
+  return String(lean).toLowerCase();
 }
 
 function strongRecoB1({ bias, levels, price }) {
@@ -148,13 +161,16 @@ function strongRecoB1({ bias, levels, price }) {
   const hi = asNum(l1h.hi);
   const lo = asNum(l1h.lo);
   const p = asNum(price);
-  if (hi == null || lo == null || p == null) return { strong: false };
+  if (hi == null || lo == null || p == null) return { strong: false, reason: "missing_levels" };
 
-  const edge = CFG.strongEdgePct1h * (hi - lo);
+  const range = hi - lo;
+  if (!(range > 0)) return { strong: false, reason: "bad_range" };
 
-  if (bias === "long") return { strong: p <= lo + edge };
-  if (bias === "short") return { strong: p >= hi - edge };
-  return { strong: false };
+  const edge = CFG.strongEdgePct1h * range;
+
+  if (bias === "long") return { strong: p <= lo + edge, reason: p <= lo + edge ? "long_near_low" : "long_not_near_low" };
+  if (bias === "short") return { strong: p >= hi - edge, reason: p >= hi - edge ? "short_near_high" : "short_not_near_high" };
+  return { strong: false, reason: "neutral_bias" };
 }
 
 function evaluateCriteria(item, lastState) {
@@ -163,19 +179,12 @@ function evaluateCriteria(item, lastState) {
   const triggers = [];
   const curState = String(d15?.state || "unknown");
 
-  if (lastState && curState !== lastState)
-    triggers.push({ code: "setup_flip" });
+  if (lastState && curState !== lastState) triggers.push({ code: "setup_flip" });
 
-  if (
-    d5?.lean === d15?.lean &&
-    abs(d5?.price_change_pct) >= CFG.momentumAbs5mPricePct
-  )
+  if (d5?.lean === d15?.lean && (abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct)
     triggers.push({ code: "momentum_confirm" });
 
-  if (
-    d15?.oi_change_pct >= CFG.shockOi15mPct &&
-    abs(d15?.price_change_pct) >= CFG.shockAbs15mPricePct
-  )
+  if ((d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct && (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct)
     triggers.push({ code: "positioning_shock" });
 
   return { triggers, curState };
@@ -184,99 +193,122 @@ function evaluateCriteria(item, lastState) {
 export default async function handler(req, res) {
   try {
     const secret = process.env.ALERT_SECRET || "";
-    const bearer = String(req.headers.authorization || "")
-      .toLowerCase()
-      .startsWith("bearer ")
-      ? req.headers.authorization.slice(7).trim()
+
+    const authHeader = String(req.headers.authorization || "");
+    const bearer = authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice(7).trim()
       : "";
 
-    const key = req.query.key;
-    if ((bearer || key) !== secret)
-      return res.status(401).json({ ok: false, error: "unauthorized" });
+    const key = String(req.query.key || "");
+    const provided = bearer || key;
 
-    const force = req.query.force === "1";
-    const dry = req.query.dry === "1";
+    if (!secret || provided !== secret) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const debug = String(req.query.debug || "") === "1";
+    const force = String(req.query.force || "") === "1";
+    const dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
-    const symbols =
-      normalizeSymbols(req.query.symbols).length
-        ? normalizeSymbols(req.query.symbols)
-        : ["BTCUSDT"];
+    const querySyms = normalizeSymbols(req.query.symbols);
+    const envSyms = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
+    const symbols = querySyms.length ? querySyms : envSyms.length ? envSyms : ["BTCUSDT"];
 
     const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const proto =
-      (req.headers["x-forwarded-proto"] || "https").split(",")[0];
-    const multiUrl = `${proto}://${host}/api/multi?symbols=${symbols.join(
-      ","
-    )}&driver_tf=${driver_tf}`;
+    const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 
-    const r = await fetch(multiUrl);
-    const j = await r.json();
-    if (!j?.ok) return res.status(500).json({ ok: false });
+    const multiUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
+      symbols.join(",")
+    )}&driver_tf=${encodeURIComponent(driver_tf)}`;
+
+    const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j?.ok) {
+      return res.status(500).json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
+    }
 
     const now = Date.now();
     const cooldownMs = CFG.cooldownMinutes * 60000;
+
     const triggered = [];
+    const skipped = [];
 
     for (const item of j.results || []) {
-      if (!item?.ok) continue;
+      if (!item?.ok) {
+        if (debug) skipped.push({ symbol: item?.symbol || "?", reason: "item_not_ok", detail: item?.error || null });
+        continue;
+      }
 
-      const instId = item.instId;
-      const lastState = await redis.get(CFG.keys.last15mState(instId));
-      const lastSent = Number(await redis.get(CFG.keys.lastSentAt(instId)));
+      const instId = String(item.instId || "");
+      const symbol = String(item.symbol || "?");
+
+      const [lastStateRaw, lastSentRaw] = await Promise.all([
+        redis.get(CFG.keys.last15mState(instId)),
+        redis.get(CFG.keys.lastSentAt(instId)),
+      ]);
+
+      const lastState = lastStateRaw ? String(lastStateRaw) : null;
+      const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
 
       const { triggers, curState } = evaluateCriteria(item, lastState);
-      if (!force && !triggers.length) continue;
-      if (
-        !force &&
-        lastSent &&
-        now - lastSent < cooldownMs
-      )
+
+      if (!force && !triggers.length) {
+        if (debug) skipped.push({ symbol, reason: "no_triggers" });
         continue;
+      }
+
+      if (!force && Number.isFinite(lastSent) && lastSent != null && now - lastSent < cooldownMs) {
+        if (debug) skipped.push({ symbol, reason: "cooldown" });
+        continue;
+      }
 
       const levels = await computeLevelsFromSeries(instId);
 
       // HARD WARMUP GATE
-      if (!force && levels?.["1h"]?.warmup) continue;
+      if (!force && levels?.["1h"]?.warmup) {
+        if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
+        // still update lastState so flips can be detected later
+        if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+        continue;
+      }
 
       const bias = biasFromItem(item);
-      const reco = strongRecoB1({
-        bias,
-        levels,
-        price: item.price,
-      });
+      const reco = strongRecoB1({ bias, levels, price: item.price });
 
-      if (!force && !reco.strong) continue;
+      if (!force && !reco.strong) {
+        if (debug) skipped.push({ symbol, reason: `weak_reco:${reco.reason}` });
+        // still update lastState so flips can be detected later
+        if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+        continue;
+      }
 
-      triggered.push({
-        symbol: item.symbol,
-        price: item.price,
-        bias,
-        levels,
-      });
+      triggered.push({ symbol, price: item.price, bias, triggers, levels, reco });
 
       if (!dry) {
-        await redis.set(CFG.keys.lastSentAt(instId), now);
-        await redis.set(CFG.keys.last15mState(instId), curState);
+        await redis.set(CFG.keys.lastSentAt(instId), String(now));
+        if (curState) await redis.set(CFG.keys.last15mState(instId), curState);
       }
     }
 
-    if (!force && !triggered.length)
-      return res.json({ ok: true, sent: false });
+    if (!force && !triggered.length) {
+      return res.json({
+        ok: true,
+        sent: false,
+        ...(debug ? { deploy: getDeployInfo(), multiUrl, skipped } : {}),
+      });
+    }
 
     const lines = [];
-    lines.push(
-      `⚡️ OKX perps alert (${driver_tf})${
-        force ? " [FORCE]" : ""
-      }`
-    );
+    lines.push(`⚡️ OKX perps alert (${driver_tf})${force ? " [FORCE]" : ""}${dry ? " [DRY]" : ""}`);
     lines.push(new Date().toISOString());
     lines.push("");
 
     for (const t of triggered) {
-      lines.push(
-        `${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias}`
-      );
+      const l1h = t.levels?.["1h"];
+      const lvl = l1h && !l1h.warmup ? ` | 1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)}` : "";
+      const recoTxt = t.reco?.strong ? "strong" : "weak";
+      lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | reco=${recoTxt}${lvl}`);
       lines.push("");
     }
 
@@ -284,14 +316,18 @@ export default async function handler(req, res) {
 
     const message = lines.join("\n");
 
-    if (!dry) await sendTelegram(message);
+    if (!dry) {
+      const tg = await sendTelegram(message);
+      if (!tg.ok) return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+    }
 
     return res.json({
       ok: true,
       sent: !dry,
       triggered_count: triggered.length,
+      ...(debug ? { deploy: getDeployInfo(), multiUrl, skipped, triggered } : {}),
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
