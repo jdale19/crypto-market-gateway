@@ -1,7 +1,8 @@
 # Crypto Market Gateway — Requirements (v1)
 
-Last updated: 2026-02-23  
+Last updated: 2026-02-25  
 Owner: jdale19
+
 Goal: **Get low-noise Telegram DMs** that tell you *when it’s worth looking*, plus a **lightweight recommendation + key levels** so you can decide fast.
 
 ---
@@ -41,12 +42,13 @@ It **MUST NOT**:
 
 It is responsible for:
 
+- Authenticating requests via `key` (must match `ALERT_SECRET`)
 - Calling `/api/multi`
 - Evaluating criteria
 - Enforcing per-symbol cooldown
 - Computing recommendation + levels
 - Writing alert state (`lastSentAt`, `lastState15m`)
-- Sending Telegram messages
+- Sending Telegram message(s)
 
 No other route may send Telegram.
 
@@ -56,14 +58,17 @@ No other route may send Telegram.
 
 ### A) Automatic (low-noise)
 
-- Vercel Cron hits `/api/alert` on a cadence (e.g., every 5 minutes).
+- **Upstash QStash** triggers `/api/alert` on a cadence (target: every 5 minutes).
 - **DM is sent only when criteria hit and cooldown allows.**
+- Cadence is **best-effort** (may drift). System must remain correct under delayed/clustered runs due to cooldown + stateless fetch behavior.
+
+> Note: GitHub Actions/Vercel Cron may exist as alternatives, but QStash is the default scheduler in this repo.
 
 ### B) Manual snapshot
 
 - One-click snapshot via:
 
-/api/alert?force=1
+`/api/alert?key={SECRET}&force=1`
 
 - Always sends formatted Telegram DM.
 - Bypasses criteria and cooldown.
@@ -72,7 +77,7 @@ No other route may send Telegram.
 
 - DM includes a link to:
 
-/api/multi?…
+`/api/multi?…`
 
 - This is raw JSON for inspection and debugging.
 
@@ -86,7 +91,7 @@ Every DM section for a symbol must include:
 - Derived from 15m lean (fallback to driver lean).
 - Displayed as:
 
-bias=long|short|neutral
+`bias=long|short|neutral`
 
 ### 3.2 Actionable watch line
 Based on bias and levels. Examples:
@@ -151,9 +156,18 @@ Dry = *pure read-only run*.
 
 ---
 
-## 7) Endpoints (contract)
+## 7) Telegram formatting constraints (REQUIRED)
 
-### 7.1 `/api/multi`
+- Telegram has a hard limit (4096 chars). Keep a safety buffer.
+- If the alert payload is too large, `/api/alert` **must split into multiple Telegram messages**.
+- Splitting must occur **only between tickers** (each ticker is an atomic block; never split a ticker across messages).
+- If multiple messages are sent, they should be labeled `(i/N)`.
+
+---
+
+## 8) Endpoints (contract)
+
+### 8.1 `/api/multi`
 Purpose:
 - Fetch OKX data
 - Compute deltas
@@ -163,8 +177,9 @@ Must not:
 - Send Telegram
 - Write alert state or cooldown
 
-### 7.2 `/api/alert`
+### 8.2 `/api/alert`
 Purpose:
+- Authenticate via `key`
 - Call `/api/multi`
 - Evaluate criteria
 - Enforce cooldown
@@ -172,6 +187,7 @@ Purpose:
 - Send Telegram
 
 Input query params:
+- `key=...` (REQUIRED; must match `ALERT_SECRET`)
 - `symbols=...`
 - `driver_tf=...`
 - `force=1`
@@ -184,6 +200,9 @@ Output JSON includes:
 - `dry: true|false`
 - `multiUrl`
 - `triggered_count`
+- `criteria_hit_count` (criteria hit for symbols, even if blocked)
+- `cooldown_blocked_count`
+- `message_count` (when a DM is sent, or when `dry=1` would-send)
 
 Telegram behavior:
 - With `force=1`: include all symbols
@@ -191,7 +210,7 @@ Telegram behavior:
 
 ---
 
-## 8) Storage (Upstash)
+## 9) Storage (Upstash)
 
 ### Rolling series
 Key: `series5m:{instId}`  
@@ -206,32 +225,33 @@ Only non-dry `/api/alert` may write these.
 
 ---
 
-## 9) Acceptance criteria (definition of done)
+## 10) Acceptance criteria (definition of done)
 
 System is correct when:
 
 1. `/api/multi` never sends Telegram DMs.
 2. `/api/alert` is the only sender.
 3. `/api/alert` sends DM only when:
- - criteria met and not in cooldown, or
- - `force=1`
+   - criteria met and not in cooldown, or
+   - `force=1`
 4. `dry=1` triggers no Telegram and no writes.
 5. `debug=1` does not affect DM behavior.
 6. Recommendation and levels always present in DM.
 7. All thresholds/cooldown configurable via `CFG` + env vars.
+8. Telegram messages never exceed limit and never split within a ticker block.
+9. QStash scheduler triggers `/api/alert` (best effort cadence) and the system remains correct under drift.
 
 ---
 
-## 10) Quick links
+## 11) Quick links
 
-- Manual forced snapshot:  
+> Replace `{SECRET}` with your `ALERT_SECRET`.
 
-/api/alert?symbols=BTCUSDT&force=1
+- Manual forced snapshot (send DM):  
+  `/api/alert?key={SECRET}&symbols=BTCUSDT&force=1`
 
-- Safe test mode:  
+- Safe test mode (no send, no writes):  
+  `/api/alert?key={SECRET}&symbols=BTCUSDT&debug=1&dry=1`
 
-/api/alert?symbols=BTCUSDT&debug=1&dry=1
-
-- Drilldown raw data:  
-
-/api/multi?symbols=BTCUSDT&driver_tf=5m
+- Drilldown raw data (JSON only):  
+  `/api/multi?symbols=BTCUSDT&driver_tf=5m`
