@@ -1,257 +1,297 @@
-# Crypto Market Gateway — Requirements (v1)
+Crypto Market Gateway — Requirements (v1)
 
-Last updated: 2026-02-25  
+Last updated: 2026-02-25
 Owner: jdale19
 
-Goal: **Get low-noise Telegram DMs** that tell you *when it’s worth looking*, plus a **lightweight recommendation + key levels** so you can decide fast.
+Goal: Get low-noise Telegram DMs that tell you when it’s worth looking, plus a lightweight recommendation + key levels so you can decide fast.
 
----
+⸻
 
-## 0) What we are building (one sentence)
+0) What we are building (one sentence)
 
-A Vercel-hosted API that pulls OKX perps data, computes short-horizon deltas (5m/15m/30m/1h/4h), stores minimal state in Upstash, and **sends Telegram DMs only when alert criteria are hit** (or when manually forced).
+A Vercel-hosted API that pulls OKX perps data, computes short-horizon deltas (5m/15m/30m/1h/4h), stores minimal state in Upstash, and sends Telegram DMs only when alert criteria are hit AND the recommendation is strong (or when manually forced).
 
----
+⸻
 
-## 1) Architectural Authority
+1) Architectural Authority
 
-### 1.1 `/api/multi` — Data Only
+1.1 /api/multi — Data Only
 
-`/api/multi`:
+/api/multi:
+	•	Fetches OKX perps snapshot data
+	•	Computes deltas for multiple time horizons
+	•	Maintains the rolling 5m series in Upstash
+	•	Returns structured JSON
 
-- Fetches OKX perps snapshot data
-- Computes deltas for multiple time horizons
-- Maintains the rolling 5m series in Upstash
-- Returns structured JSON
+It MUST NOT:
+	•	Send Telegram messages
+	•	Evaluate alert criteria
+	•	Enforce cooldown
+	•	Write alert state (lastSentAt, lastState15m)
+	•	Make alert decisions
 
-It **MUST NOT**:
+Acceptance test: calling /api/multi under any query parameters must not produce a Telegram DM.
 
-- Send Telegram messages
-- Evaluate alert criteria
-- Enforce cooldown
-- Write alert state (`lastSentAt`, `lastState15m`)
-- Make alert decisions
+⸻
 
-**Acceptance test:** calling `/api/multi` under any query parameters must *not* produce a Telegram DM.
+1.2 /api/alert — Only Alert Sender
 
----
-
-### 1.2 `/api/alert` — Only Alert Sender
-
-`/api/alert` is the **only endpoint allowed to send Telegram DMs** and to evaluate alert logic.
+/api/alert is the only endpoint allowed to send Telegram DMs and to evaluate alert logic.
 
 It is responsible for:
-
-- Authenticating requests via `key` (must match `ALERT_SECRET`)
-- Calling `/api/multi`
-- Evaluating criteria
-- Enforcing per-symbol cooldown
-- Computing recommendation + levels
-- Writing alert state (`lastSentAt`, `lastState15m`)
-- Sending Telegram message(s)
+	•	Authenticating requests via secret
+	•	Calling /api/multi
+	•	Evaluating criteria
+	•	Enforcing per-symbol cooldown
+	•	Computing recommendation + levels
+	•	Applying a “strong recommendation” gate for non-force alerts
+	•	Writing alert state (lastSentAt, lastState15m) only when a DM is actually sent
+	•	Sending Telegram message(s)
 
 No other route may send Telegram.
 
----
+⸻
 
-## 2) Primary user workflow (hybrid)
+2) Primary user workflow (hybrid)
 
-### A) Automatic (low-noise)
-
-- **Upstash QStash** triggers `/api/alert` on a cadence (target: every 5 minutes).
-- **DM is sent only when criteria hit and cooldown allows.**
-- Cadence is **best-effort** (may drift). System must remain correct under delayed or clustered runs due to cooldown + stateless fetch behavior.
+A) Automatic (low-noise)
+	•	Upstash QStash triggers /api/alert on a cadence (target: every 5 minutes).
+	•	DM is sent only when criteria hit, recommendation is strong, and cooldown allows.
+	•	Cadence is best-effort (may drift). System must remain correct under delayed or clustered runs due to cooldown + stateless fetch behavior.
 
 QStash is the canonical scheduler for this system.
 
-### B) Manual snapshot
+B) Manual snapshot
+	•	One-click snapshot via:
 
-- One-click snapshot via:
+/api/alert?key={SECRET}&force=1
+	•	Always sends formatted Telegram DM.
+	•	Bypasses criteria, recommendation gate, and cooldown.
 
-`/api/alert?key={SECRET}&force=1`
+Drilldown
+	•	DM includes a link to:
 
-- Always sends formatted Telegram DM.
-- Bypasses criteria and cooldown.
+/api/multi?…
+	•	This is raw JSON for inspection and debugging.
 
-### Drilldown
+⸻
 
-- DM includes a link to:
-
-`/api/multi?…`
-
-- This is raw JSON for inspection and debugging.
-
----
-
-## 3) Recommendation feature (FIRST-CLASS)
+3) Recommendation feature (FIRST-CLASS)
 
 Every DM section for a symbol must include:
 
-### 3.1 Bias
-- Derived from 15m lean (fallback to driver lean).
-- Displayed as:
+3.1 Bias
+	•	Derived from 15m lean (fallback to driver lean).
+	•	Displayed as:
 
-`bias=long|short|neutral`
+bias=long|short|neutral
 
-### 3.2 Actionable watch line
+3.2 Actionable watch line
+
 Based on bias and levels. Examples:
+	•	If bias=short:
 
-- If bias=short:
-> Breakdown < 1h low = continuation; reclaim > 1h mid = fade risk
-- If bias=long:
-> Breakout > 1h high = continuation; lose < 1h mid = fade risk
+Breakdown < 1h low = continuation; reclaim > 1h mid = fade risk
 
-### 3.3 Key levels
+	•	If bias=long:
+
+Breakout > 1h high = continuation; lose < 1h mid = fade risk
+
+3.3 Key levels
+
 Computed from stored 5m series:
+	•	1h high / low / mid
+	•	4h high / low / mid (if available; otherwise indicated as warmup)
 
-- **1h high / low / mid**
-- **4h high / low / mid** (if available; otherwise indicated as warmup)
+Source: Upstash series5m:{instId}.
 
-Source: Upstash `series5m:{instId}`.
+3.4 Recommendation strength (NEW)
 
----
+Each DM must include:
 
-## 4) Alert Criteria v1
+reco=strong|weak
 
-Trigger a DM for a symbol if **any** of the following:
+⸻
 
-### (1) Setup flip
+4) Alert Criteria v1
+
+Trigger candidates for a symbol if any of the following:
+
+(1) Setup flip
+
 15m state changed vs last stored state.
 
-### (2) Momentum confirmation
-- 5m lean == 15m lean  
-- AND abs(5m price_change_pct) ≥ 0.10%
+(2) Momentum confirmation
+	•	5m lean == 15m lean
+	•	AND abs(5m price_change_pct) ≥ 0.10%
 
-### (3) Positioning shock
-- 15m oi_change_pct ≥ +0.50%  
-- AND abs(15m price_change_pct) ≥ 0.20%
+(3) Positioning shock
+	•	15m oi_change_pct ≥ +0.50%
+	•	AND abs(15m price_change_pct) ≥ 0.20%
 
-### (4) Manual override
-- `force=1` always sends
+(4) Manual override
+	•	force=1 always sends
 
----
+⸻
 
-## 5) Anti-spam
+5) Strong recommendation gate (B1) — NEW
 
-### Cooldown
-- Per symbol: **20 minutes** (configurable via env var `ALERT_COOLDOWN_MINUTES`)
-- Ignored when `force=1`
+Even if criteria hit, /api/alert must only send (when force=0) if the recommendation is strong.
 
-Only `/api/alert` may write:
+B1 definition (edge-of-range gate)
 
-- `alert:lastSentAt:{instId}`
+Using 1h levels derived from the stored series:
+	•	Let:
+	•	hi = 1h high
+	•	lo = 1h low
+	•	range = hi - lo
+	•	edge = ALERT_STRONG_EDGE_PCT_1H * range
 
----
+Then:
+	•	If bias=long: reco=strong only if price <= lo + edge
+	•	If bias=short: reco=strong only if price >= hi - edge
+	•	If bias=neutral or 1h warmup/missing: reco=weak
 
-## 6) Dry Mode (Testing Contract)
+Purpose: reduce noise for non-real-time viewing by alerting only when price is near an actionable edge.
 
-When `dry=1` is present:
+Config
+	•	ALERT_STRONG_EDGE_PCT_1H (default 0.15)
+	•	Example: 0.15 = “outer 15% of the 1h range”
 
-- Evaluate criteria
-- Return JSON normally
-- **Never send Telegram**
-- **Never write any state** (no lastSentAt, no lastState15m)
+⸻
 
-Dry = *pure read-only run*.
+6) Anti-spam
 
----
+Cooldown
+	•	Per symbol: 20 minutes (configurable via env var ALERT_COOLDOWN_MINUTES)
+	•	Ignored when force=1
 
-## 7) Telegram formatting constraints (REQUIRED)
+Only /api/alert may write:
+	•	alert:lastSentAt:{instId}
 
-- Telegram has a hard limit (4096 chars). Keep a safety buffer.
-- If the alert payload is too large, `/api/alert` **must split into multiple Telegram messages**.
-- Splitting must occur **only between tickers** (each ticker is an atomic block; never split a ticker across messages).
-- If multiple messages are sent, they should be labeled `(i/N)`.
+Important: /api/alert must not write lastSentAt for:
+	•	dry=1, or
+	•	“criteria hit but reco=weak” (no DM sent)
 
----
+⸻
 
-## 8) Endpoints (contract)
+7) Dry Mode (Testing Contract)
 
-### 8.1 `/api/multi`
+When dry=1 is present:
+	•	Evaluate criteria
+	•	Compute recommendation strength + levels
+	•	Return JSON normally
+	•	Never send Telegram
+	•	Never write any state (no lastSentAt, no lastState15m)
+
+Dry = pure read-only run.
+
+⸻
+
+8) Telegram formatting constraints (REQUIRED)
+	•	Telegram has a hard limit (4096 chars). Keep a safety buffer.
+	•	If the alert payload is too large, /api/alert must split into multiple Telegram messages.
+	•	Splitting must occur only between tickers (each ticker is an atomic block; never split a ticker across messages).
+	•	If multiple messages are sent, they should be labeled (i/N).
+
+⸻
+
+9) Endpoints (contract)
+
+9.1 /api/multi
+
 Purpose:
-- Fetch OKX data
-- Compute deltas
-- Maintain rolling 5m series
+	•	Fetch OKX data
+	•	Compute deltas
+	•	Maintain rolling 5m series
 
 Must not:
-- Send Telegram
-- Write alert state or cooldown
+	•	Send Telegram
+	•	Write alert state or cooldown
 
-### 8.2 `/api/alert`
+9.2 /api/alert
+
 Purpose:
-- Authenticate via `key`
-- Call `/api/multi`
-- Evaluate criteria
-- Enforce cooldown
-- Compute recommendation + levels
-- Send Telegram
+	•	Authenticate request
+	•	Call /api/multi
+	•	Evaluate criteria
+	•	Enforce cooldown
+	•	Compute recommendation + levels
+	•	Apply strong-recommendation gate (B1)
+	•	Send Telegram
 
-Input query params:
-- `key=...` (REQUIRED; must match `ALERT_SECRET`)
-- `symbols=...`
-- `driver_tf=...`
-- `force=1`
-- `debug=1`
-- `dry=1`
+Auth
+	•	Preferred (QStash): Authorization: Bearer {SECRET}
+	•	Fallback (manual): ?key={SECRET}
 
-Output JSON includes:
-- `ok`
-- `sent: true|false`
-- `dry: true|false`
-- `multiUrl`
-- `triggered_count`
-- `criteria_hit_count`
-- `cooldown_blocked_count`
-- `message_count`
+Input query params
+	•	symbols=...
+	•	driver_tf=...
+	•	force=1
+	•	debug=1
+	•	dry=1
+	•	key=... (optional fallback for manual testing)
+
+Output JSON includes
+	•	ok
+	•	sent: true|false
+	•	dry: true|false
+	•	multiUrl
+	•	triggered_count
+	•	criteria_hit_count
+	•	cooldown_blocked_count
+	•	message_count
 
 Telegram behavior:
-- With `force=1`: include all symbols
-- Otherwise: only triggered symbols
+	•	With force=1: include all symbols
+	•	Otherwise: only symbols that pass:
+	•	criteria hit
+	•	not in cooldown
+	•	reco=strong
 
----
+⸻
 
-## 9) Storage (Upstash)
+10) Storage (Upstash)
 
-### Rolling series
-Key: `series5m:{instId}`  
+Rolling series
+
+Key: series5m:{instId}
 Used for deltas + levels
 
-### Alert state
+Alert state
+
 Keys:
-- `alert:lastState15m:{instId}`
-- `alert:lastSentAt:{instId}`
+	•	alert:lastState15m:{instId}
+	•	alert:lastSentAt:{instId}
 
-Only non-dry `/api/alert` may write these.
+Only non-dry /api/alert may write these, and only when a DM is actually sent for a symbol.
 
----
+⸻
 
-## 10) Acceptance criteria (definition of done)
+11) Acceptance criteria (definition of done)
 
 System is correct when:
+	1.	/api/multi never sends Telegram DMs.
+	2.	/api/alert is the only sender.
+	3.	/api/alert sends DM only when:
+	•	criteria met, reco=strong, and not in cooldown, or
+	•	force=1
+	4.	dry=1 triggers no Telegram and no writes.
+	5.	debug=1 does not affect DM behavior.
+	6.	Recommendation (bias, reco) and levels always present in DM.
+	7.	All thresholds/cooldown configurable via CFG + env vars.
+	8.	Telegram messages never exceed limit and never split within a ticker block.
+	9.	QStash scheduler triggers /api/alert (best effort cadence) and the system remains correct under drift.
 
-1. `/api/multi` never sends Telegram DMs.
-2. `/api/alert` is the only sender.
-3. `/api/alert` sends DM only when:
-   - criteria met and not in cooldown, or
-   - `force=1`
-4. `dry=1` triggers no Telegram and no writes.
-5. `debug=1` does not affect DM behavior.
-6. Recommendation and levels always present in DM.
-7. All thresholds/cooldown configurable via `CFG` + env vars.
-8. Telegram messages never exceed limit and never split within a ticker block.
-9. QStash scheduler triggers `/api/alert` (best effort cadence) and the system remains correct under drift.
+⸻
 
----
+12) Quick links
 
-## 11) Quick links
+Replace {SECRET} with your ALERT_SECRET.
 
-> Replace `{SECRET}` with your `ALERT_SECRET`.
-
-- Manual forced snapshot (send DM):  
-  `/api/alert?key={SECRET}&symbols=BTCUSDT&force=1`
-
-- Safe test mode (no send, no writes):  
-  `/api/alert?key={SECRET}&symbols=BTCUSDT&debug=1&dry=1`
-
-- Drilldown raw data (JSON only):  
-  `/api/multi?symbols=BTCUSDT&driver_tf=5m`
+	•	Manual forced snapshot (send DM):
+/api/alert?key={SECRET}&symbols=BTCUSDT&force=1
+	•	Safe test mode (no send, no writes):
+/api/alert?key={SECRET}&symbols=BTCUSDT&debug=1&dry=1
+	•	Drilldown raw data (JSON only):
+/api/multi?symbols=BTCUSDT&driver_tf=5m
