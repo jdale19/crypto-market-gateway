@@ -7,6 +7,7 @@
 // - B1 strong recommendation gate retained
 // - FIX: safeJsonParse handles string OR already-parsed object (matches multi.js)
 // - debug=1 returns skip reasons (no Telegram behavior change)
+// - NEW MACRO GATE: if BTC is in 4h bull expansion, block SHORT-bias alerts on ALTS (non-force)
 
 import { Redis } from "@upstash/redis";
 
@@ -47,6 +48,17 @@ const CFG = {
   strongEdgePct1h: Number(process.env.ALERT_STRONG_EDGE_PCT_1H || 0.15),
 
   telegramMaxChars: 3900,
+
+  // ---- MACRO GATE (BTC regime) ----
+  macro: {
+    enabled: String(process.env.ALERT_MACRO_GATE_ENABLED || "1") === "1",
+    btcSymbol: String(process.env.ALERT_MACRO_BTC_SYMBOL || "BTCUSDT").toUpperCase(),
+    // Bull expansion thresholds (4h)
+    btc4hPricePctMin: Number(process.env.ALERT_MACRO_BTC_4H_PRICE_PCT_MIN || 2.0),
+    btc4hOiPctMin: Number(process.env.ALERT_MACRO_BTC_4H_OI_PCT_MIN || 0.5),
+    // If true: block ALTs that have bias=short while BTC is bull expansion
+    blockShortsOnAltsWhenBtcBull: String(process.env.ALERT_MACRO_BLOCK_SHORTS_ON_ALTS || "1") === "1",
+  },
 
   keys: {
     last15mState: (id) => `alert:lastState15m:${id}`,
@@ -168,8 +180,10 @@ function strongRecoB1({ bias, levels, price }) {
 
   const edge = CFG.strongEdgePct1h * range;
 
-  if (bias === "long") return { strong: p <= lo + edge, reason: p <= lo + edge ? "long_near_low" : "long_not_near_low" };
-  if (bias === "short") return { strong: p >= hi - edge, reason: p >= hi - edge ? "short_near_high" : "short_not_near_high" };
+  if (bias === "long")
+    return { strong: p <= lo + edge, reason: p <= lo + edge ? "long_near_low" : "long_not_near_low" };
+  if (bias === "short")
+    return { strong: p >= hi - edge, reason: p >= hi - edge ? "short_near_high" : "short_not_near_high" };
   return { strong: false, reason: "neutral_bias" };
 }
 
@@ -184,10 +198,46 @@ function evaluateCriteria(item, lastState) {
   if (d5?.lean === d15?.lean && (abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct)
     triggers.push({ code: "momentum_confirm" });
 
-  if ((d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct && (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct)
+  if (
+    (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
+    (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct
+  )
     triggers.push({ code: "positioning_shock" });
 
   return { triggers, curState };
+}
+
+// ---- NEW: derive BTC macro regime from /api/multi results ----
+function computeBtcMacro(results) {
+  if (!CFG.macro.enabled) return { ok: false, reason: "macro_disabled", btcBullExpansion4h: false };
+
+  const btcSym = CFG.macro.btcSymbol;
+  const btcItem = (results || []).find((x) => String(x?.symbol || "").toUpperCase() === btcSym);
+
+  if (!btcItem?.ok) return { ok: false, reason: "btc_missing", btcBullExpansion4h: false };
+
+  const d4 = btcItem?.deltas?.["4h"];
+  const pricePct = asNum(d4?.price_change_pct);
+  const oiPct = asNum(d4?.oi_change_pct);
+  const lean = String(d4?.lean || "").toLowerCase();
+
+  const bull =
+    lean === "long" &&
+    Number.isFinite(pricePct) &&
+    Number.isFinite(oiPct) &&
+    pricePct >= CFG.macro.btc4hPricePctMin &&
+    oiPct >= CFG.macro.btc4hOiPctMin;
+
+  return {
+    ok: true,
+    reason: "ok",
+    btcBullExpansion4h: bull,
+    btc: {
+      lean4h: lean || null,
+      pricePct4h: Number.isFinite(pricePct) ? pricePct : null,
+      oiPct4h: Number.isFinite(oiPct) ? oiPct : null,
+    },
+  };
 }
 
 export default async function handler(req, res) {
@@ -228,6 +278,8 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
     }
 
+    const macro = computeBtcMacro(j.results || []);
+
     const now = Date.now();
     const cooldownMs = CFG.cooldownMinutes * 60000;
 
@@ -263,6 +315,30 @@ export default async function handler(req, res) {
         continue;
       }
 
+      const bias = biasFromItem(item);
+
+      // ---- NEW: MACRO GATE (block shorts on ALTs during BTC bull expansion) ----
+      if (
+        !force &&
+        CFG.macro.enabled &&
+        CFG.macro.blockShortsOnAltsWhenBtcBull &&
+        macro?.ok &&
+        macro?.btcBullExpansion4h &&
+        symbol.toUpperCase() !== CFG.macro.btcSymbol &&
+        bias === "short"
+      ) {
+        if (debug) {
+          skipped.push({
+            symbol,
+            reason: "macro_block_btc_bull_expansion",
+            btc4h: macro?.btc || null,
+          });
+        }
+        // still update lastState so flips can be detected later
+        if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+        continue;
+      }
+
       const levels = await computeLevelsFromSeries(instId);
 
       // HARD WARMUP GATE
@@ -273,7 +349,6 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const bias = biasFromItem(item);
       const reco = strongRecoB1({ bias, levels, price: item.price });
 
       if (!force && !reco.strong) {
@@ -295,7 +370,7 @@ export default async function handler(req, res) {
       return res.json({
         ok: true,
         sent: false,
-        ...(debug ? { deploy: getDeployInfo(), multiUrl, skipped } : {}),
+        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped } : {}),
       });
     }
 
@@ -325,7 +400,7 @@ export default async function handler(req, res) {
       ok: true,
       sent: !dry,
       triggered_count: triggered.length,
-      ...(debug ? { deploy: getDeployInfo(), multiUrl, skipped, triggered } : {}),
+      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered } : {}),
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
