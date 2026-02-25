@@ -60,9 +60,9 @@ No other route may send Telegram.
 
 - **Upstash QStash** triggers `/api/alert` on a cadence (target: every 5 minutes).
 - **DM is sent only when criteria hit and cooldown allows.**
-- Cadence is **best-effort** (may drift). System must remain correct under delayed/clustered runs due to cooldown + stateless fetch behavior.
+- Cadence is **best-effort** (may drift). System must remain correct under delayed or clustered runs due to cooldown + stateless fetch behavior.
 
-> Note: GitHub Actions/Vercel Cron may exist as alternatives, but QStash is the default scheduler in this repo.
+QStash is the canonical scheduler for this system.
 
 ### B) Manual snapshot
 
@@ -200,9 +200,9 @@ Output JSON includes:
 - `dry: true|false`
 - `multiUrl`
 - `triggered_count`
-- `criteria_hit_count` (criteria hit for symbols, even if blocked)
+- `criteria_hit_count`
 - `cooldown_blocked_count`
-- `message_count` (when a DM is sent, or when `dry=1` would-send)
+- `message_count`
 
 Telegram behavior:
 - With `force=1`: include all symbols
