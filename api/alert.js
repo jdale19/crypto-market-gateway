@@ -15,8 +15,12 @@
 //   - execution trigger active (mode rules)
 //   - OI rules satisfied (scalp strict; swing/build context)
 //   - not in cooldown
-// - dry=1: no Telegram, no writes
+// - dry=1: no Telegram, no writes (alert state + heartbeat disabled)
 // - Drilldown link includes only alerted symbols + BTCUSDT
+//
+// ADDITION (debug visibility; NO behavior change to alerts):
+// - Heartbeat written to Upstash on each run (unless dry=1) so you can prove QStash is calling this endpoint.
+// - When debug=1, response includes heartbeat_last_run.
 //
 // NOTE ON “15m close”
 // We approximate “current 15m close” using the current snapshot price (item.price),
@@ -105,6 +109,12 @@ const CFG = {
     minOiPct: Number(process.env.ALERT_SWING_MIN_OI_PCT || -0.5),
   },
 
+  // Heartbeat (debug/run visibility)
+  heartbeat: {
+    key: String(process.env.ALERT_HEARTBEAT_KEY || "alert:lastRun"),
+    ttlSeconds: Number(process.env.ALERT_HEARTBEAT_TTL_SECONDS || 60 * 60 * 24), // 24h
+  },
+
   keys: {
     last15mState: (id) => `alert:lastState15m:${id}`,
     lastSentAt: (id) => `alert:lastSentAt:${id}`,
@@ -157,6 +167,26 @@ function safeJsonParse(v) {
     }
   }
   return null;
+}
+
+// ---- Heartbeat helpers (NO alert logic changes) ----
+async function writeHeartbeat(payload, { dry }) {
+  if (dry) return; // v1.3: dry=1 means no writes
+  try {
+    await redis.set(CFG.heartbeat.key, JSON.stringify(payload));
+    await redis.expire(CFG.heartbeat.key, CFG.heartbeat.ttlSeconds);
+  } catch {
+    // never break alerts
+  }
+}
+
+async function readHeartbeat() {
+  try {
+    const raw = await redis.get(CFG.heartbeat.key);
+    return safeJsonParse(raw);
+  } catch {
+    return null;
+  }
 }
 
 async function sendTelegram(text) {
@@ -369,7 +399,11 @@ function adjustRecoForRegime({ item, bias, levels, price, baseReco }) {
     const up = edgeRecoCheck({ bias, levels, price, edgePct: widened });
 
     if (up.strong) {
-      return { strong: true, reason: "regime_upgrade_contraction", adj: { type: reg.type, widenedEdgePct: widened, ...reg } };
+      return {
+        strong: true,
+        reason: "regime_upgrade_contraction",
+        adj: { type: reg.type, widenedEdgePct: widened, ...reg },
+      };
     }
   }
 
@@ -404,14 +438,18 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "long_breakout",
-        triggerLine: `trigger: current 15m close > ${fmtPrice(hi)} (1h high) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+        triggerLine: `trigger: current 15m close > ${fmtPrice(hi)} (1h high) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(
+          2
+        )}%`,
       };
     }
     if (sweepReclaim) {
       return {
         ok: true,
         reason: "long_sweep_reclaim",
-        triggerLine: `trigger: sweep < ${fmtPrice(lo)} (1h low) AND current 15m close back > ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+        triggerLine: `trigger: sweep < ${fmtPrice(
+          lo
+        )} (1h low) AND current 15m close back > ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active", detail: { close15m, hi, lo, minRecent } };
@@ -426,14 +464,18 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "short_breakdown",
-        triggerLine: `trigger: current 15m close < ${fmtPrice(lo)} (1h low) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+        triggerLine: `trigger: current 15m close < ${fmtPrice(
+          lo
+        )} (1h low) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
     if (sweepReject) {
       return {
         ok: true,
         reason: "short_sweep_reject",
-        triggerLine: `trigger: sweep > ${fmtPrice(hi)} (1h high) AND current 15m close back < ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+        triggerLine: `trigger: sweep > ${fmtPrice(
+          hi
+        )} (1h high) AND current 15m close back < ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active", detail: { close15m, hi, lo, maxRecent } };
@@ -516,6 +558,18 @@ export default async function handler(req, res) {
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
     const j = await r.json().catch(() => null);
     if (!r.ok || !j?.ok) {
+      const hb = {
+        ts: Date.now(),
+        iso: new Date().toISOString(),
+        ok: false,
+        stage: "multi_fetch_failed",
+        mode,
+        risk_profile,
+        sent: false,
+        triggered_count: 0,
+        error: "multi fetch failed",
+      };
+      await writeHeartbeat(hb, { dry });
       return res.status(500).json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
     }
 
@@ -618,7 +672,8 @@ export default async function handler(req, res) {
           // Our structural break is the price trigger itself (beyond 1h hi/lo), so we evaluate execution first.
           const g = swingExecutionGate({ bias, levels, item });
           if (!g.ok) {
-            if (debug) skipped.push({ symbol, reason: `${String(mode)}_exec:${g.reason}`, bias, detail: g.detail || null });
+            if (debug)
+              skipped.push({ symbol, reason: `${String(mode)}_exec:${g.reason}`, bias, detail: g.detail || null });
             if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
             continue;
           }
@@ -649,11 +704,33 @@ export default async function handler(req, res) {
       }
     }
 
+    // ---- Heartbeat payload (written regardless of send/no-send; unless dry=1) ----
+    const itemErrors = (skipped || []).filter((s) => String(s?.reason || "") === "item_not_ok").length;
+    const topSkips = (skipped || []).slice(0, 12).map((s) => ({ symbol: s.symbol, reason: s.reason }));
+
+    // If no triggered (normal case) return quietly but still heartbeat it
     if (!force && !triggered.length) {
+      await writeHeartbeat(
+        {
+          ts: now,
+          iso: new Date(now).toISOString(),
+          ok: true,
+          mode,
+          risk_profile,
+          sent: false,
+          triggered_count: 0,
+          itemErrors,
+          topSkips,
+        },
+        { dry }
+      );
+
+      const heartbeat_last_run = debug ? await readHeartbeat() : undefined;
+
       return res.json({
         ok: true,
         sent: false,
-        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, mode, risk_profile } : {}),
+        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, mode, risk_profile, heartbeat_last_run } : {}),
       });
     }
 
@@ -689,16 +766,69 @@ export default async function handler(req, res) {
 
     if (!dry) {
       const tg = await sendTelegram(message);
-      if (!tg.ok) return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+      if (!tg.ok) {
+        await writeHeartbeat(
+          {
+            ts: now,
+            iso: new Date(now).toISOString(),
+            ok: false,
+            stage: "telegram_failed",
+            mode,
+            risk_profile,
+            sent: false,
+            triggered_count: triggered.length,
+            itemErrors,
+            topSkips,
+            telegram_error: tg.detail || null,
+          },
+          { dry }
+        );
+        return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+      }
     }
+
+    await writeHeartbeat(
+      {
+        ts: now,
+        iso: new Date(now).toISOString(),
+        ok: true,
+        mode,
+        risk_profile,
+        sent: !dry,
+        triggered_count: triggered.length,
+        itemErrors,
+        topSkips,
+      },
+      { dry }
+    );
+
+    const heartbeat_last_run = debug ? await readHeartbeat() : undefined;
 
     return res.json({
       ok: true,
       sent: !dry,
       triggered_count: triggered.length,
-      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage } : {}),
+      ...(debug
+        ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage, heartbeat_last_run }
+        : {}),
     });
   } catch (e) {
+    const now = Date.now();
+    try {
+      await writeHeartbeat(
+        {
+          ts: now,
+          iso: new Date(now).toISOString(),
+          ok: false,
+          stage: "handler_exception",
+          sent: false,
+          error: String(e?.message || e),
+        },
+        { dry: false }
+      );
+    } catch {
+      // ignore
+    }
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
