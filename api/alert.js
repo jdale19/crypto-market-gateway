@@ -127,8 +127,8 @@ const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
 const abs = (x) => (x == null ? null : Math.abs(Number(x)));
 const fmtPrice = (x) => {
   if (x == null || !Number.isFinite(x)) return "n/a";
-  if (x < 1) return x.toFixed(6);
-  if (x < 100) return x.toFixed(4);
+  if (x < 1) return x.toFixed(4);
+  if (x < 1000) return x.toFixed(3);
   return x.toFixed(2);
 };
 
