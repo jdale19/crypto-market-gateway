@@ -552,7 +552,7 @@ lines.push(drillUrl);
       ok: true,
       sent: !dry,
       triggered_count: triggered.length,
-      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile } : {}),
+      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage } : {}),
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
