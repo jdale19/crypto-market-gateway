@@ -1,11 +1,21 @@
-// /api/multi.js
+l// /api/multi.js
 // OKX PERP (SWAP) ONLY — rolling 5m series + multi-timeframe deltas (5m/15m/30m/1h/4h)
-// Always returns ALL timeframes each call, so you don't need different URLs.
+//
+// UPDATED: supports SNAPSHOT-ONLY mode (NO OKX HTTP calls)
+// - Set env MULTI_DATA_SOURCE=snapshot  (or add ?source=snapshot / ?snapshot=1)
+// - In snapshot mode, this endpoint will ONLY read snapshots from Upstash and update the rolling 5m series.
+// - Debug counters prove whether any OKX calls happened.
+//
 // Requires env vars:
 // - UPSTASH_REDIS_REST_URL
 // - UPSTASH_REDIS_REST_TOKEN
 // Optional:
 // - DEFAULT_SYMBOLS (comma list like "BTCUSDT,ETHUSDT,LDOUSDT")
+// - MULTI_DATA_SOURCE ("okx" | "snapshot") default "okx"
+// - SNAPSHOT_KEY_PREFIX (default "snap:okx:swap:")  -> key becomes `${prefix}${instId}`
+// - SNAPSHOT_SYMBOL_FALLBACK_PREFIX (default "snap:symbol:") -> `${prefix}${SYMBOL}`
+// Snapshot JSON expected (either key):
+//   { "ts": 123, "price": 123.45, "funding_rate": 0.0001, "open_interest_contracts": 123456 }
 
 import { Redis } from "@upstash/redis";
 
@@ -33,6 +43,14 @@ const TF_ORDER = ["5m", "15m", "30m", "1h", "4h"];
 const MAX_STEPS = Math.max(...Object.values(TF_TO_STEPS)); // 48
 const MAX_NEEDED_POINTS = MAX_STEPS + 1; // 49
 
+const CFG = {
+  dataSourceDefault: String(process.env.MULTI_DATA_SOURCE || "okx").toLowerCase(), // "okx" | "snapshot"
+  snapshot: {
+    keyPrefix: String(process.env.SNAPSHOT_KEY_PREFIX || "snap:okx:swap:"), // + instId
+    symbolFallbackPrefix: String(process.env.SNAPSHOT_SYMBOL_FALLBACK_PREFIX || "snap:symbol:"), // + SYMBOL (e.g. BTCUSDT)
+  },
+};
+
 function pctChange(now, prev) {
   if (prev == null || !Number.isFinite(prev) || prev === 0) return null;
   if (now == null || !Number.isFinite(now)) return null;
@@ -42,11 +60,7 @@ function pctChange(now, prev) {
 // ✅ FIX: handle string OR already-parsed object
 function safeJsonParse(v) {
   if (v == null) return null;
-
-  // If Upstash already decoded JSON into an object, keep it.
   if (typeof v === "object") return v;
-
-  // If it's a string, parse it.
   if (typeof v === "string") {
     try {
       return JSON.parse(v);
@@ -54,8 +68,6 @@ function safeJsonParse(v) {
       return null;
     }
   }
-
-  // Anything else (number, boolean) isn't valid for our points
   return null;
 }
 
@@ -92,10 +104,8 @@ function addLeanAndWhy(state, funding_rate) {
   }
 
   if (Number.isFinite(funding_rate)) {
-    if (funding_rate > 0)
-      return { lean: "neutral", why: "Not enough change data yet; funding slightly positive." };
-    if (funding_rate < 0)
-      return { lean: "neutral", why: "Not enough change data yet; funding slightly negative." };
+    if (funding_rate > 0) return { lean: "neutral", why: "Not enough change data yet; funding slightly positive." };
+    if (funding_rate < 0) return { lean: "neutral", why: "Not enough change data yet; funding slightly negative." };
   }
   return { lean: "neutral", why: "Not enough change data yet." };
 }
@@ -105,7 +115,21 @@ function normalizeDriverTf(rawTf) {
   return TF_TO_STEPS[tf] ? tf : "5m";
 }
 
-async function getOkxSwapInstrumentListCached() {
+function normalizeDataSource(req) {
+  // explicit query overrides env
+  const qSource = String(req?.query?.source || "").toLowerCase();
+  const snapFlag = String(req?.query?.snapshot || "") === "1";
+
+  if (snapFlag) return "snapshot";
+  if (qSource === "snapshot" || qSource === "snap") return "snapshot";
+  if (qSource === "okx") return "okx";
+
+  const env = String(CFG.dataSourceDefault || "okx").toLowerCase();
+  return env === "snapshot" ? "snapshot" : "okx";
+}
+
+// --- OKX instrument list caching (OKX MODE only) ---
+async function getOkxSwapInstrumentListCached(counters) {
   const cacheKey = `okx:instruments:swap:list:v1`;
   const cached = await redis.get(cacheKey);
   if (cached) {
@@ -113,11 +137,17 @@ async function getOkxSwapInstrumentListCached() {
     if (Array.isArray(list)) return list;
   }
 
+  counters.okx_http_calls += 1;
+  counters.okx_instrument_list_fetches += 1;
+
   const url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
   const r = await fetch(url);
-  if (!r.ok) return null;
+  if (!r.ok) {
+    counters.okx_http_failures += 1;
+    return null;
+  }
 
-  const j = await r.json();
+  const j = await r.json().catch(() => null);
   const list = Array.isArray(j?.data) ? j.data : null;
   if (!Array.isArray(list)) return null;
 
@@ -126,15 +156,20 @@ async function getOkxSwapInstrumentListCached() {
   return list;
 }
 
-async function resolveOkxSwapInstId(symbol) {
+async function resolveOkxSwapInstId(symbol, { dataSource, counters }) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) return null;
+
+  // SNAPSHOT MODE: do NOT touch OKX instrument list; just use the canonical instId
+  if (dataSource === "snapshot") {
+    return `${base}-USDT-SWAP`;
+  }
 
   const mapKey = `instmap:okx:swap:${base}`;
   const cached = await redis.get(mapKey);
   if (cached) return cached === "__NONE__" ? null : cached;
 
-  const list = await getOkxSwapInstrumentListCached();
+  const list = await getOkxSwapInstrumentListCached(counters);
   if (!Array.isArray(list)) {
     // If list fetch fails, fall back to guess (do NOT cache it).
     return `${base}-USDT-SWAP`;
@@ -154,22 +189,67 @@ async function resolveOkxSwapInstId(symbol) {
   return null;
 }
 
-async function fetchOkxSwap(instId) {
+// --- Snapshot read (SNAPSHOT MODE only) ---
+async function fetchSnapshotForInstId(instId, symbol, counters) {
+  const key1 = `${CFG.snapshot.keyPrefix}${instId}`;
+  const raw1 = await redis.get(key1);
+  if (raw1) {
+    const j = safeJsonParse(raw1);
+    const price = Number(j?.price);
+    const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
+    const oi = Number(j?.open_interest_contracts);
+
+    if (Number.isFinite(price) && Number.isFinite(oi)) {
+      counters.snapshot_hits += 1;
+      return { ok: true, price, funding_rate: Number.isFinite(fr) ? fr : null, open_interest_contracts: oi, ts: j?.ts ?? null, key: key1 };
+    }
+  }
+
+  const key2 = `${CFG.snapshot.symbolFallbackPrefix}${String(symbol || "").toUpperCase()}`;
+  const raw2 = await redis.get(key2);
+  if (raw2) {
+    const j = safeJsonParse(raw2);
+    const price = Number(j?.price);
+    const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
+    const oi = Number(j?.open_interest_contracts);
+
+    if (Number.isFinite(price) && Number.isFinite(oi)) {
+      counters.snapshot_hits += 1;
+      return { ok: true, price, funding_rate: Number.isFinite(fr) ? fr : null, open_interest_contracts: oi, ts: j?.ts ?? null, key: key2 };
+    }
+  }
+
+  counters.snapshot_misses += 1;
+  return { ok: false, error: "snapshot_missing" };
+}
+
+// --- OKX fetch (OKX MODE only) ---
+async function fetchOkxSwap(instId, counters) {
+  // counters prove OKX usage
+  counters.okx_http_calls += 3;
+
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
     fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
     fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
-    fetch(
-      `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`
-    ),
+    fetch(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
   ]);
 
-  if (!tickerRes.ok) return { ok: false, error: "ticker fetch failed" };
-  if (!fundingRes.ok) return { ok: false, error: "funding fetch failed" };
-  if (!oiRes.ok) return { ok: false, error: "oi fetch failed" };
+  if (!tickerRes.ok) {
+    counters.okx_http_failures += 1;
+    return { ok: false, error: "ticker fetch failed" };
+  }
+  if (!fundingRes.ok) {
+    counters.okx_http_failures += 1;
+    return { ok: false, error: "funding fetch failed" };
+  }
+  if (!oiRes.ok) {
+    counters.okx_http_failures += 1;
+    return { ok: false, error: "oi fetch failed" };
+  }
 
-  const tickerJson = await tickerRes.json();
-  const fundingJson = await fundingRes.json();
-  const oiJson = await oiRes.json();
+  const tickerJson = await tickerRes.json().catch(() => null);
+  const fundingJson = await fundingRes.json().catch(() => null);
+  const oiJson = await oiRes.json().catch(() => null);
 
   const price = Number(tickerJson?.data?.[0]?.last);
   const funding_rate = Number(fundingJson?.data?.[0]?.fundingRate);
@@ -217,13 +297,13 @@ function computeTfDeltas(points, tf, funding_rate) {
   };
 }
 
-async function fetchOne(symbol, now, driver_tf, debugMode) {
+async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, counters) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
   }
 
-  const instId = await resolveOkxSwapInstId(symbol);
+  const instId = await resolveOkxSwapInstId(symbol, { dataSource, counters });
   if (!instId) {
     return {
       ok: false,
@@ -233,12 +313,19 @@ async function fetchOne(symbol, now, driver_tf, debugMode) {
     };
   }
 
-  const okx = await fetchOkxSwap(instId);
-  if (!okx.ok) return { ok: false, symbol, instId, error: okx.error };
+  // Get current snapshot (either from OKX or from Upstash snapshot keys)
+  let cur;
+  if (dataSource === "snapshot") {
+    cur = await fetchSnapshotForInstId(instId, symbol, counters);
+  } else {
+    cur = await fetchOkxSwap(instId, counters);
+  }
 
-  const price = okx.price;
-  const funding_rate = okx.funding_rate;
-  const open_interest_contracts = okx.open_interest_contracts;
+  if (!cur.ok) return { ok: false, symbol, instId, error: cur.error };
+
+  const price = cur.price;
+  const funding_rate = cur.funding_rate;
+  const open_interest_contracts = cur.open_interest_contracts;
 
   const open_interest_usd =
     Number.isFinite(open_interest_contracts) && Number.isFinite(price) ? open_interest_contracts * price : null;
@@ -278,7 +365,6 @@ async function fetchOne(symbol, now, driver_tf, debugMode) {
   const startIdx = Math.max(0, (seriesLen || 0) - MAX_NEEDED_POINTS);
   const raw = seriesLen > 0 ? await redis.lrange(seriesKey, startIdx, endIdx) : [];
 
-  // ✅ With fixed safeJsonParse, this will stop being 0
   const points = (raw || []).map(safeJsonParse).filter(Boolean);
 
   const deltas = {};
@@ -308,11 +394,15 @@ async function fetchOne(symbol, now, driver_tf, debugMode) {
     why,
     deltas,
 
-    source: "okx_swap_public_api+upstash_series",
+    source: dataSource === "snapshot" ? "upstash_snapshot+upstash_series" : "okx_swap_public_api+upstash_series",
   };
 
   if (debugMode) {
     out.debug = {
+      data_source: dataSource,
+      snapshot_key_used: dataSource === "snapshot" ? (cur?.key || null) : null,
+      snapshot_ts: dataSource === "snapshot" ? (cur?.ts ?? null) : null,
+
       bucket_now: bucket,
       last_bucket_stored: Number.isFinite(lastBucketNum) ? lastBucketNum : null,
       wrote_point: wrotePoint,
@@ -320,7 +410,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode) {
       read_start: startIdx,
       read_end: endIdx,
       points_parsed: points.length,
-      raw_type_sample: raw?.[0] == null ? null : typeof raw[0], // quick visibility
+      raw_type_sample: raw?.[0] == null ? null : typeof raw[0],
     };
   }
 
@@ -331,6 +421,7 @@ export default async function handler(req, res) {
   try {
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
     const debugMode = String(req.query.debug || "") === "1";
+    const dataSource = normalizeDataSource(req);
 
     const symbolsRaw = String(req.query.symbols || process.env.DEFAULT_SYMBOLS || "ETHUSDT,LDOUSDT");
     const symbols = symbolsRaw
@@ -345,11 +436,22 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Too many symbols (max 50)." });
     }
 
+    // Request-level counters to PROVE OKX usage
+    const counters = {
+      data_source: dataSource,
+      okx_http_calls: 0,
+      okx_http_failures: 0,
+      okx_instrument_list_fetches: 0,
+      snapshot_hits: 0,
+      snapshot_misses: 0,
+    };
+
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf, debugMode)));
+    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf, debugMode, dataSource, counters)));
 
     res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json({
+
+    const payload = {
       ok: true,
       ts: now,
       symbols,
@@ -357,9 +459,15 @@ export default async function handler(req, res) {
       timeframes: TF_ORDER,
       results,
       note:
-        "OKX perps-only. Rolling 5m series (24h). Each response includes deltas for 5m/15m/30m/1h/4h derived from 5m points.",
-      tip: "Add &debug=1 to see series_len / wrote_point / bucket info.",
-    });
+        dataSource === "snapshot"
+          ? "SNAPSHOT mode. NO OKX calls. Reads current snapshot from Upstash and updates rolling 5m series; deltas derived from stored points."
+          : "OKX perps-only. Rolling 5m series (24h). Each response includes deltas for 5m/15m/30m/1h/4h derived from 5m points.",
+      tip: "Add &debug=1 to see per-symbol series_len / wrote_point plus request counters showing OKX calls (or none).",
+    };
+
+    if (debugMode) payload.debug = { counters };
+
+    return res.status(200).json(payload);
   } catch (err) {
     return res.status(500).json({ ok: false, error: "server error", detail: String(err?.message || err) });
   }
