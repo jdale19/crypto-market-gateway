@@ -541,6 +541,7 @@ const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
 lines.push(drillUrl);
 
     const message = lines.join("\n");
+    const renderedMessage = message;
 
     if (!dry) {
       const tg = await sendTelegram(message);
