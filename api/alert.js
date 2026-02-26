@@ -12,10 +12,14 @@
 //   - If 4h expansion in one direction, downgrade fade signals (strong->weak)
 //   - If extreme contraction, optionally upgrade near-edge signals (weak->strong) via wider edge
 //
-// STEP 1 (Mode + Risk Wiring, no behavior change):
+// STEP 1 (Mode + Risk Wiring):
 // - Parse mode + risk_profile from query params
 // - Fall back to env defaults DEFAULT_MODE / DEFAULT_RISK_PROFILE
 // - Echo mode/risk_profile in debug JSON only
+//
+// STEP 2 (Mode-aware Bias):
+// - scalp => bias from 15m lean (fallback item lean)
+// - swing/build => bias from 4h lean (fallback 15m, then item lean)
 
 import { Redis } from "@upstash/redis";
 
@@ -108,7 +112,7 @@ function normalizeDriverTf(raw) {
   return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
 }
 
-// STEP 1: mode + risk normalizers (wiring only)
+// STEP 1: mode + risk normalizers
 function normalizeMode(raw) {
   const m = String(raw || "").toLowerCase();
   return ["scalp", "swing", "build"].includes(m) ? m : null;
@@ -199,9 +203,18 @@ async function computeLevelsFromSeries(instId) {
   return out;
 }
 
-function biasFromItem(item) {
-  const lean = item?.deltas?.["15m"]?.lean || item?.lean || "neutral";
-  return String(lean).toLowerCase();
+// STEP 2: mode-aware bias selection
+function biasFromItem(item, mode) {
+  const m = String(mode || "scalp").toLowerCase();
+
+  if (m === "swing" || m === "build") {
+    const lean4h = item?.deltas?.["4h"]?.lean || item?.deltas?.["15m"]?.lean || item?.lean || "neutral";
+    return String(lean4h).toLowerCase();
+  }
+
+  // scalp (default)
+  const lean15m = item?.deltas?.["15m"]?.lean || item?.lean || "neutral";
+  return String(lean15m).toLowerCase();
 }
 
 // ---- edge check helper (used for base + contraction upgrade) ----
@@ -376,7 +389,7 @@ export default async function handler(req, res) {
     const dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
-    // STEP 1: parse mode + risk_profile (wiring only)
+    // STEP 1: parse mode + risk_profile
     const mode = normalizeMode(req.query.mode) || CFG.defaultMode;
     const risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
 
@@ -441,7 +454,8 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const bias = biasFromItem(item);
+      // STEP 2: mode-aware bias
+      const bias = biasFromItem(item, mode);
 
       // ---- MACRO GATE (block shorts on ALTs during BTC bull expansion) ----
       if (
