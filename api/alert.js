@@ -11,6 +11,11 @@
 // - NEW REGIME ADJUST (expansion + contraction):
 //   - If 4h expansion in one direction, downgrade fade signals (strong->weak)
 //   - If extreme contraction, optionally upgrade near-edge signals (weak->strong) via wider edge
+//
+// STEP 1 (Mode + Risk Wiring, no behavior change):
+// - Parse mode + risk_profile from query params
+// - Fall back to env defaults DEFAULT_MODE / DEFAULT_RISK_PROFILE
+// - Echo mode/risk_profile in debug JSON only
 
 import { Redis } from "@upstash/redis";
 
@@ -38,6 +43,10 @@ function getDeployInfo() {
 
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
+
+  // STEP 1 defaults (wiring only)
+  defaultMode: String(process.env.DEFAULT_MODE || "scalp").toLowerCase(),
+  defaultRisk: String(process.env.DEFAULT_RISK_PROFILE || "normal").toLowerCase(),
 
   momentumAbs5mPricePct: 0.1,
   shockOi15mPct: 0.5,
@@ -99,6 +108,7 @@ function normalizeDriverTf(raw) {
   return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
 }
 
+// STEP 1: mode + risk normalizers (wiring only)
 function normalizeMode(raw) {
   const m = String(raw || "").toLowerCase();
   return ["scalp", "swing", "build"].includes(m) ? m : null;
@@ -287,7 +297,8 @@ function computeSymbolRegime(item) {
   const p4 = asNum(d4?.price_change_pct);
   const oi4 = asNum(d4?.oi_change_pct);
 
-  if (!Number.isFinite(p4) || !Number.isFinite(oi4)) return { ok: false, type: "unknown", lean4h: lean4h || null, p4, oi4 };
+  if (!Number.isFinite(p4) || !Number.isFinite(oi4))
+    return { ok: false, type: "unknown", lean4h: lean4h || null, p4, oi4 };
 
   const bullExpansion =
     lean4h === "long" && p4 >= CFG.regime.expansionPricePctMin && oi4 >= CFG.regime.expansionOiPctMin;
@@ -314,25 +325,32 @@ function adjustRecoForRegime({ item, bias, levels, price, baseReco }) {
   // Expansion: downgrade fade setups (strong->weak)
   if (reg?.ok && baseReco?.strong) {
     if (reg.type === "bull_expansion" && bias === "short") {
-      return { strong: false, reason: "regime_downgrade_bull_expansion_fade", adj: { type: reg.type, ...reg } };
+      return {
+        strong: false,
+        reason: "regime_downgrade_bull_expansion_fade",
+        adj: { type: reg.type, ...reg },
+      };
     }
     if (reg.type === "bear_expansion" && bias === "long") {
-      return { strong: false, reason: "regime_downgrade_bear_expansion_fade", adj: { type: reg.type, ...reg } };
+      return {
+        strong: false,
+        reason: "regime_downgrade_bear_expansion_fade",
+        adj: { type: reg.type, ...reg },
+      };
     }
   }
 
   // Contraction: optional upgrade weak->strong if within wider edge band
-  if (
-    reg?.ok &&
-    reg.type === "contraction" &&
-    CFG.regime.contractionUpgradeEnabled &&
-    !baseReco?.strong
-  ) {
+  if (reg?.ok && reg.type === "contraction" && CFG.regime.contractionUpgradeEnabled && !baseReco?.strong) {
     const widened = CFG.strongEdgePct1h * Math.max(1, CFG.regime.contractionUpgradeEdgeMult);
     const up = edgeRecoCheck({ bias, levels, price, edgePct: widened });
 
     if (up.strong) {
-      return { strong: true, reason: "regime_upgrade_contraction", adj: { type: reg.type, widenedEdgePct: widened, ...reg } };
+      return {
+        strong: true,
+        reason: "regime_upgrade_contraction",
+        adj: { type: reg.type, widenedEdgePct: widened, ...reg },
+      };
     }
   }
 
@@ -344,9 +362,7 @@ export default async function handler(req, res) {
     const secret = process.env.ALERT_SECRET || "";
 
     const authHeader = String(req.headers.authorization || "");
-    const bearer = authHeader.toLowerCase().startsWith("bearer ")
-      ? authHeader.slice(7).trim()
-      : "";
+    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
 
     const key = String(req.query.key || "");
     const provided = bearer || key;
@@ -359,6 +375,10 @@ export default async function handler(req, res) {
     const force = String(req.query.force || "") === "1";
     const dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
+
+    // STEP 1: parse mode + risk_profile (wiring only)
+    const mode = normalizeMode(req.query.mode) || CFG.defaultMode;
+    const risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
 
     const querySyms = normalizeSymbols(req.query.symbols);
     const envSyms = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
@@ -374,7 +394,9 @@ export default async function handler(req, res) {
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
     const j = await r.json().catch(() => null);
     if (!r.ok || !j?.ok) {
-      return res.status(500).json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
+      return res
+        .status(500)
+        .json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
     }
 
     const macro = computeBtcMacro(j.results || []);
@@ -387,7 +409,12 @@ export default async function handler(req, res) {
 
     for (const item of j.results || []) {
       if (!item?.ok) {
-        if (debug) skipped.push({ symbol: item?.symbol || "?", reason: "item_not_ok", detail: item?.error || null });
+        if (debug)
+          skipped.push({
+            symbol: item?.symbol || "?",
+            reason: "item_not_ok",
+            detail: item?.error || null,
+          });
         continue;
       }
 
@@ -468,7 +495,7 @@ export default async function handler(req, res) {
       return res.json({
         ok: true,
         sent: false,
-        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped } : {}),
+        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, mode, risk_profile } : {}),
       });
     }
 
@@ -498,7 +525,7 @@ export default async function handler(req, res) {
       ok: true,
       sent: !dry,
       triggered_count: triggered.length,
-      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered } : {}),
+      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile } : {}),
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
