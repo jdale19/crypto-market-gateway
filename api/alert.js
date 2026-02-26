@@ -526,7 +526,19 @@ export default async function handler(req, res) {
       lines.push("");
     }
 
-    lines.push(multiUrl);
+    // Drilldown should include only alerted symbols + BTC for context
+const drillSyms = Array.from(
+  new Set([
+    ...triggered.map((x) => String(x.symbol || "").toUpperCase()).filter(Boolean),
+    CFG.macro.btcSymbol,
+  ])
+);
+
+const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
+  drillSyms.join(",")
+)}&driver_tf=${encodeURIComponent(driver_tf)}`;
+
+lines.push(drillUrl);
 
     const message = lines.join("\n");
 
