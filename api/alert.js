@@ -523,6 +523,12 @@ function swingExecutionGate({ bias, levels, item }) {
 }
 
 export default async function handler(req, res) {
+  // IMPORTANT: declare these outside try so catch can respect dry=1 (no writes)
+  let dry = false;
+  let debug = false;
+  let mode = CFG.defaultMode;
+  let risk_profile = CFG.defaultRisk;
+
   try {
     const secret = process.env.ALERT_SECRET || "";
 
@@ -536,13 +542,13 @@ export default async function handler(req, res) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    const debug = String(req.query.debug || "") === "1";
+    debug = String(req.query.debug || "") === "1";
     const force = String(req.query.force || "") === "1";
-    const dry = String(req.query.dry || "") === "1";
+    dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
-    const mode = normalizeMode(req.query.mode) || CFG.defaultMode;
-    const risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
+    mode = normalizeMode(req.query.mode) || CFG.defaultMode;
+    risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
 
     const querySyms = normalizeSymbols(req.query.symbols);
     const envSyms = normalizeSymbols(process.env.DEFAULT_SYMBOLS);
@@ -558,18 +564,21 @@ export default async function handler(req, res) {
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
     const j = await r.json().catch(() => null);
     if (!r.ok || !j?.ok) {
-      const hb = {
-        ts: Date.now(),
-        iso: new Date().toISOString(),
-        ok: false,
-        stage: "multi_fetch_failed",
-        mode,
-        risk_profile,
-        sent: false,
-        triggered_count: 0,
-        error: "multi fetch failed",
-      };
-      await writeHeartbeat(hb, { dry });
+      const nowFail = Date.now();
+      await writeHeartbeat(
+        {
+          ts: nowFail,
+          iso: new Date(nowFail).toISOString(),
+          ok: false,
+          stage: "multi_fetch_failed",
+          mode,
+          risk_profile,
+          sent: false,
+          triggered_count: 0,
+          error: "multi fetch failed",
+        },
+        { dry }
+      );
       return res.status(500).json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
     }
 
@@ -673,7 +682,12 @@ export default async function handler(req, res) {
           const g = swingExecutionGate({ bias, levels, item });
           if (!g.ok) {
             if (debug)
-              skipped.push({ symbol, reason: `${String(mode)}_exec:${g.reason}`, bias, detail: g.detail || null });
+              skipped.push({
+                symbol,
+                reason: `${String(mode)}_exec:${g.reason}`,
+                bias,
+                detail: g.detail || null,
+              });
             if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
             continue;
           }
@@ -809,26 +823,38 @@ export default async function handler(req, res) {
       sent: !dry,
       triggered_count: triggered.length,
       ...(debug
-        ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage, heartbeat_last_run }
+        ? {
+            deploy: getDeployInfo(),
+            multiUrl,
+            macro,
+            skipped,
+            triggered,
+            mode,
+            risk_profile,
+            renderedMessage,
+            heartbeat_last_run,
+          }
         : {}),
     });
   } catch (e) {
     const now = Date.now();
-    try {
-      await writeHeartbeat(
-        {
-          ts: now,
-          iso: new Date(now).toISOString(),
-          ok: false,
-          stage: "handler_exception",
-          sent: false,
-          error: String(e?.message || e),
-        },
-        { dry: false }
-      );
-    } catch {
-      // ignore
-    }
+
+    // IMPORTANT: respect dry=1 even on exceptions (no writes)
+    await writeHeartbeat(
+      {
+        ts: now,
+        iso: new Date(now).toISOString(),
+        ok: false,
+        stage: "handler_exception",
+        mode,
+        risk_profile,
+        sent: false,
+        triggered_count: 0,
+        error: String(e?.message || e),
+      },
+      { dry }
+    );
+
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
