@@ -99,6 +99,16 @@ function normalizeDriverTf(raw) {
   return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
 }
 
+function normalizeMode(raw) {
+  const m = String(raw || "").toLowerCase();
+  return ["scalp", "swing", "build"].includes(m) ? m : null;
+}
+
+function normalizeRisk(raw) {
+  const r = String(raw || "").toLowerCase();
+  return ["conservative", "normal", "aggressive"].includes(r) ? r : null;
+}
+
 const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
 const abs = (x) => (x == null ? null : Math.abs(Number(x)));
 const fmtPrice = (x) => {
