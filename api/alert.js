@@ -27,6 +27,13 @@
 //   short: price <= 1h_lo AND 15m OI change >= +0.50%
 // - Adds a "Trigger:" line to the DM for clarity.
 // - Avoids vague "reclaim" language by using explicit conditions.
+//
+// STEP 4 (Scalp pass condition change):
+// - In scalp mode (non-force): allow alert if EITHER
+//     A) reco is strong (near-edge)
+//     OR
+//     B) strict scalp gate passes (break + OI confirm)
+// - This prevents weak_reco from blocking a valid breakout scalp.
 
 import { Redis } from "@upstash/redis";
 
@@ -372,11 +379,19 @@ function scalpStrictGate({ item, bias, levels, price }) {
 
   if (bias === "long") {
     const ok = p >= hi;
-    return { ok, reason: ok ? "price_break_hi" : "price_not_break_hi", triggerLine: `Trigger: price >= ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%` };
+    return {
+      ok,
+      reason: ok ? "price_break_hi" : "price_not_break_hi",
+      triggerLine: `Trigger: price >= ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+    };
   }
   if (bias === "short") {
     const ok = p <= lo;
-    return { ok, reason: ok ? "price_break_lo" : "price_not_break_lo", triggerLine: `Trigger: price <= ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%` };
+    return {
+      ok,
+      reason: ok ? "price_break_lo" : "price_not_break_lo",
+      triggerLine: `Trigger: price <= ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+    };
   }
 
   return { ok: false, reason: "neutral_bias" };
@@ -482,22 +497,36 @@ export default async function handler(req, res) {
         continue;
       }
 
+      // ---- reco + regime adjust ----
       const baseReco = strongRecoB1({ bias, levels, price: item.price });
       const reco = adjustRecoForRegime({ item, bias, levels, price: item.price, baseReco });
 
-      if (!force && !reco.strong) {
-        if (debug) skipped.push({ symbol, reason: `weak_reco:${reco.reason}` });
-        if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
-        continue;
-      }
-
-      // STEP 3: strict scalp gate (only when mode=scalp and non-force)
+      // ---- STEP 4: scalp allow if (reco strong) OR (scalp gate ok) ----
       let triggerLine = null;
+
       if (!force && String(mode) === "scalp") {
         const g = scalpStrictGate({ item, bias, levels, price: item.price });
         triggerLine = g.triggerLine || null;
-        if (!g.ok) {
-          if (debug) skipped.push({ symbol, reason: `scalp_gate:${g.reason}`, bias, oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null });
+
+        const allow = !!reco.strong || !!g.ok;
+        if (!allow) {
+          if (debug) {
+            const whyReco = `weak_reco:${reco.reason}`;
+            const whyGate = `scalp_gate:${g.reason}`;
+            skipped.push({
+              symbol,
+              reason: `${whyReco} | ${whyGate}`,
+              bias,
+              oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
+            });
+          }
+          if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+          continue;
+        }
+      } else {
+        // Non-scalp modes keep original rule: must be strong reco unless force
+        if (!force && !reco.strong) {
+          if (debug) skipped.push({ symbol, reason: `weak_reco:${reco.reason}` });
           if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
           continue;
         }
