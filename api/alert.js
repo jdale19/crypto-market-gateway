@@ -125,11 +125,17 @@ function normalizeRisk(raw) {
 
 const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
 const abs = (x) => (x == null ? null : Math.abs(Number(x)));
+
+// ✅ FIXED: matches your agreed precision rules
+// <1 => 4 decimals
+// 1..999 => 3 decimals
+// >=1000 => 2 decimals
 const fmtPrice = (x) => {
-  if (x == null || !Number.isFinite(x)) return "n/a";
-  if (x < 1) return x.toFixed(4);
-  if (x < 1000) return x.toFixed(3);
-  return x.toFixed(2);
+  if (x == null || !Number.isFinite(Number(x))) return "n/a";
+  const n = Number(x);
+  if (n < 1) return n.toFixed(4);
+  if (n < 1000) return n.toFixed(3);
+  return n.toFixed(2);
 };
 
 // ✅ FIX: handle string OR already-parsed object (same as multi.js)
@@ -407,9 +413,7 @@ export default async function handler(req, res) {
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
     const j = await r.json().catch(() => null);
     if (!r.ok || !j?.ok) {
-      return res
-        .status(500)
-        .json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
+      return res.status(500).json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
     }
 
     const macro = computeBtcMacro(j.results || []);
@@ -422,12 +426,7 @@ export default async function handler(req, res) {
 
     for (const item of j.results || []) {
       if (!item?.ok) {
-        if (debug)
-          skipped.push({
-            symbol: item?.symbol || "?",
-            reason: "item_not_ok",
-            detail: item?.error || null,
-          });
+        if (debug) skipped.push({ symbol: item?.symbol || "?", reason: "item_not_ok", detail: item?.error || null });
         continue;
       }
 
@@ -467,13 +466,7 @@ export default async function handler(req, res) {
         symbol.toUpperCase() !== CFG.macro.btcSymbol &&
         bias === "short"
       ) {
-        if (debug) {
-          skipped.push({
-            symbol,
-            reason: "macro_block_btc_bull_expansion",
-            btc4h: macro?.btc || null,
-          });
-        }
+        if (debug) skipped.push({ symbol, reason: "macro_block_btc_bull_expansion", btc4h: macro?.btc || null });
         if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
         continue;
       }
@@ -527,18 +520,18 @@ export default async function handler(req, res) {
     }
 
     // Drilldown should include only alerted symbols + BTC for context
-const drillSyms = Array.from(
-  new Set([
-    ...triggered.map((x) => String(x.symbol || "").toUpperCase()).filter(Boolean),
-    CFG.macro.btcSymbol,
-  ])
-);
+    const drillSyms = Array.from(
+      new Set([
+        ...triggered.map((x) => String(x.symbol || "").toUpperCase()).filter(Boolean),
+        CFG.macro.btcSymbol,
+      ])
+    );
 
-const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
-  drillSyms.join(",")
-)}&driver_tf=${encodeURIComponent(driver_tf)}`;
+    const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
+      drillSyms.join(",")
+    )}&driver_tf=${encodeURIComponent(driver_tf)}`;
 
-lines.push(drillUrl);
+    lines.push(drillUrl);
 
     const message = lines.join("\n");
     const renderedMessage = message;
@@ -552,7 +545,9 @@ lines.push(drillUrl);
       ok: true,
       sent: !dry,
       triggered_count: triggered.length,
-      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage } : {}),
+      ...(debug
+        ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage }
+        : {}),
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
