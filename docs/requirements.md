@@ -1,347 +1,218 @@
-Crypto Market Gateway — Requirements (v1)
-
-Last updated: 2026-02-25
+Crypto Market Gateway — Requirements (v1.3)
+Last updated: 2026-02-26
 Owner: jdale19
 
-Goal: Get low-noise Telegram DMs that tell you when it’s worth looking, plus a lightweight recommendation + key levels so you can decide fast.
+SYSTEM GOAL
+Send low-noise Telegram DMs only when a trade is executable within ~15 minutes, using structure (1h levels), OI confirmation, mode-aware bias, macro context, and strict execution gating.
+If it is not actionable now → no DM.
 
-⸻
-
-0) What we are building (one sentence)
-
-A Vercel-hosted API that pulls OKX perps data, computes short-horizon deltas (5m/15m/30m/1h/4h), stores minimal state in Upstash, and sends Telegram DMs only when alert criteria are hit AND the recommendation is strong AND levels are warm (or when manually forced).
-
-⸻
-
-1) Architectural Authority
+1) ARCHITECTURE
 
 1.1 /api/multi — Data Only
-
-/api/multi:
-	• Fetches OKX perps snapshot data
-	• Computes deltas for multiple time horizons
-	• Maintains the rolling 5m series in Upstash
-	• Returns structured JSON
+Responsibilities:
+- Fetch OKX perps snapshot
+- Compute deltas (5m, 15m, 30m, 1h, 4h)
+- Maintain rolling 5m series in Upstash
+- Compute levels from stored 5m series:
+  - 1h high / low / mid
+  - 4h high / low / mid (if warm)
+- Return structured JSON
 
 It MUST NOT:
-	• Send Telegram messages
-	• Evaluate alert criteria
-	• Enforce cooldown
-	• Write alert state (lastSentAt, lastState15m)
-	• Make alert decisions
-
-Acceptance test: calling /api/multi under any query parameters must not produce a Telegram DM.
-
-⸻
+- Send Telegram
+- Enforce cooldown
+- Evaluate alert criteria
+- Write alert state
 
 1.2 /api/alert — Only Alert Sender
+Responsibilities:
+- Authenticate
+- Call /api/multi
+- Evaluate criteria
+- Apply macro gates
+- Apply warmup gate
+- Apply B1 edge rule
+- Apply mode rules
+- Apply strict execution trigger
+- Enforce cooldown
+- Write alert state
+- Send Telegram
 
-/api/alert is the only endpoint allowed to send Telegram DMs and to evaluate alert logic.
+Only this endpoint may send Telegram.
 
-It is responsible for:
-	• Authenticating requests via secret
-	• Calling /api/multi
-	• Evaluating criteria
-	• Enforcing per-symbol cooldown
-	• Computing recommendation + levels
-	• Applying a hard warmup gate (non-force requires 1h levels ready)
-	• Applying a strong recommendation gate (B1) for non-force alerts
-	• Writing alert state:
-		• lastSentAt only when a DM is actually sent
-		• lastState15m updated on non-dry runs so “setup flip” can be detected later
-	• Sending Telegram message(s)
+2) USER CONFIGURABLE DEFAULTS
 
-No other route may send Telegram.
+Supported inputs:
+- mode=scalp|swing|build
+- risk_profile=conservative|normal|aggressive
 
-⸻
+Precedence:
+1. Explicit query param
+2. Stored setting (Upstash, optional)
+3. Env default
 
-2) Primary user workflow (hybrid)
+Env defaults:
+- DEFAULT_MODE (default: scalp)
+- DEFAULT_RISK_PROFILE (default: normal)
 
-A) Automatic (low-noise)
-	• Upstash QStash triggers /api/alert on a cadence (target: every 5 minutes).
-	• DM is sent only when:
-		• criteria hit
-		• 1h levels are warm
-		• recommendation is strong
-		• cooldown allows
-	• Cadence is best-effort (may drift). System must remain correct under delayed or clustered runs due to cooldown + stateless fetch behavior.
+Defaults apply to both /api/multi and /api/alert.
 
-QStash is the canonical scheduler for this system.
+3) BIAS LOGIC (MODE-AWARE)
 
-B) Manual snapshot
-	• One-click snapshot via:
+scalp → 15m lean (confirm 5m)
+swing → 4h lean (confirm 15m)
+build → 4h lean (1D proxy optional)
 
-/api/alert?key={SECRET}&force=1
-
-	• Always sends formatted Telegram DM.
-	• Bypasses criteria, warmup gate, recommendation gate, and cooldown.
-
-Drilldown
-	• DM includes a link to:
-
-/api/multi?…
-
-	• This is raw JSON for inspection and debugging.
-
-⸻
-
-3) Recommendation feature (FIRST-CLASS)
-
-Every DM section for a symbol must include:
-
-3.1 Bias
-	• Derived from 15m lean (fallback to driver lean).
-	• Displayed as:
-
+Output:
 bias=long|short|neutral
 
-3.2 Actionable watch line
+4) LEVELS
 
-Based on bias and levels. Examples:
-	• If bias=short:
-Breakdown < 1h low = continuation; reclaim > 1h mid = fade risk
+From stored 5m series:
+- 1h high / low / mid (required)
+- 4h high / low / mid (optional)
 
-	• If bias=long:
-Breakout > 1h high = continuation; lose < 1h mid = fade risk
+Round levels based on price:
+≥ 1000 → 2 decimals
+1–999 → 3 decimals
+<1 → 4 decimals
 
-3.3 Key levels
+Triggers must print numeric values explicitly.
+Example:
+trigger: next 15m close > 1987.56 (1h high)
 
-Computed from stored 5m series:
-	• 1h high / low / mid
-	• 4h high / low / mid (if available; otherwise indicated as warmup)
+5) ALERT CRITERIA (Detection Layer)
 
-Source: Upstash series5m:{instId}.
+1) Setup flip
+15m state changed vs stored state
 
-3.4 Recommendation strength
+2) Momentum confirmation
+5m lean == 15m lean
+AND abs(5m price_change_pct) ≥ 0.10%
 
-Each DM must include:
+3) Positioning shock
+15m oi_change_pct ≥ 0.50%
+AND abs(15m price_change_pct) ≥ 0.20%
 
-reco=strong|weak
+4) force=1
 
-⸻
+6) WARMUP GATE
 
-4) Alert Criteria v1
+Non-force alerts require:
+levels["1h"].warmup == false
 
-Trigger candidates for a symbol if any of the following:
+7) MACRO GATE
 
-(1) Setup flip
-15m state changed vs last stored state.
+BTC Bull Expansion 4H:
+If BTC 4h:
+- lean=long
+- price_change_pct ≥ 2.0
+- oi_change_pct ≥ 0.5
 
-(2) Momentum confirmation
-	• 5m lean == 15m lean
-	• AND abs(5m price_change_pct) ≥ 0.10%
+Block SHORT bias alerts on non-BTC symbols.
 
-(3) Positioning shock
-	• 15m oi_change_pct ≥ +0.50%
-	• AND abs(15m price_change_pct) ≥ 0.20%
-
-(4) Manual override
-	• force=1 always sends
-
-⸻
-
-5) Warmup gate (HARD)
-
-Non-force alerts must NOT send unless levels are ready:
-	• Require levels["1h"].warmup == false for a symbol to be eligible when force=0.
-
-Purpose: if levels are not warm, signals are not actionable and should not notify.
-
-5.1 Macro Regime Gate (BTC 4h)
-
-Non-force alerts must also pass macro regime filter.
-
-Definition:
-
-BTC_BULL_EXPANSION_4H =
-	•	BTC 4h lean == “long”
-	•	AND BTC 4h price_change_pct ≥ ALERT_MACRO_BTC_4H_PRICE_PCT_MIN (default 2.0)
-	•	AND BTC 4h oi_change_pct ≥ ALERT_MACRO_BTC_4H_OI_PCT_MIN (default 0.5)
-
-If BTC_BULL_EXPANSION_4H = true:
-	•	Block SHORT bias alerts on non-BTC symbols.
-
-Force=1 bypasses macro gate.
-
-Config:
-	•	ALERT_MACRO_GATE_ENABLED (default 1)
-	•	ALERT_MACRO_BTC_4H_PRICE_PCT_MIN (default 2.0)
-	•	ALERT_MACRO_BTC_4H_OI_PCT_MIN (default 0.5)
-
-⸻
-
-6) Strong recommendation gate (B1)
-
-Even if criteria hit and warmup is ready, /api/alert must only send (when force=0) if the recommendation is strong.
-
-B1 definition (edge-of-range gate)
-
-Using 1h levels derived from the stored series:
+8) B1 EDGE RULE
 
 Let:
-	• hi = 1h high
-	• lo = 1h low
-	• range = hi - lo
-	• edge = ALERT_STRONG_EDGE_PCT_1H * range
+hi = 1h high
+lo = 1h low
+range = hi - lo
+edge = ALERT_STRONG_EDGE_PCT_1H × range
 
-Then:
-	• If bias=long: reco=strong only if price <= lo + edge
-	• If bias=short: reco=strong only if price >= hi - edge
-	• If bias=neutral or 1h warmup/missing: reco=weak
+Default:
+ALERT_STRONG_EDGE_PCT_1H = 0.15
 
-Purpose: reduce noise for non-real-time viewing by alerting only when price is near an actionable edge.
+Long: price ≤ lo + edge
+Short: price ≥ hi - edge
 
-Config:
-	• ALERT_STRONG_EDGE_PCT_1H (default 0.15)
-	• Example: 0.15 = “outer 15% of the 1h range”
+Must be true for reco=strong.
 
-⸻
+9) STRICT EXECUTION RULES (Scalp Mode)
 
-7) Anti-spam
+Non-force scalp alert sends ONLY if ALL are true:
 
-Cooldown
-	• Per symbol: 20 minutes (configurable via env var ALERT_COOLDOWN_MINUTES)
-	• Ignored when force=1
+1) Criteria hit
+2) B1 edge satisfied
 
-Only /api/alert may write:
-	• alert:lastSentAt:{instId}
+3) Price trigger active (current 15m close):
 
-State write rules:
-	• When dry=1: write nothing (no lastSentAt, no lastState15m).
-	• When force=0 and DM is not sent:
-		• Do NOT write lastSentAt
-		• DO update lastState15m (non-dry) to support future setup-flip detection.
+Long:
+- 15m close > 1h high
+OR
+- sweep < 1h low AND 15m close back above 1h low
 
-⸻
+Short:
+- 15m close < 1h low
+OR
+- sweep > 1h high AND 15m close back below 1h high
 
-8) Dry Mode (Testing Contract)
+4) Strict OI confirmation:
 
-When dry=1 is present:
-	• Evaluate criteria
-	• Compute levels + recommendation strength
-	• Return JSON normally
-	• Never send Telegram
-	• Never write any state (no lastSentAt, no lastState15m)
+15m oi_change_pct ≥ 0.50%
 
-Dry = pure read-only run.
+If OI spike not present → no DM.
+No WAIT alerts.
+Binary execution only.
 
-⸻
+10) SWING MODE EXECUTION
 
-9) Telegram formatting constraints (REQUIRED)
+Requires:
+- Criteria hit
+- B1 edge satisfied OR structural break
+- Price trigger active (15m close beyond level)
 
-	• Telegram has a hard limit (4096 chars). Keep a safety buffer.
-	• If the alert payload is too large, /api/alert must split into multiple Telegram messages.
-	• Splitting must occur only between tickers (each ticker is an atomic block; never split a ticker across messages).
-	• If multiple messages are sent, they should be labeled (i/N).
+OI used as context only:
+- No strict 0.50% spike required
+- Must not be sharply negative against direction
 
-⸻
+11) BUILD MODE
 
-10) Endpoints (contract)
+Focus on:
+- Structural zones
+- Ladder adds
+- Liquidation safety
 
-10.1 /api/multi
+Execution must still be actionable.
+No heads-up only alerts.
 
-Purpose:
-	• Fetch OKX data
-	• Compute deltas
-	• Maintain rolling 5m series
+12) TELEGRAM BEHAVIOR
 
-Must not:
-	• Send Telegram
-	• Write alert state or cooldown
+Send DM only when:
+- criteria met
+- warmup passed
+- macro gate passed
+- B1 edge satisfied
+- execution trigger active
+- OI rules satisfied (if scalp)
+- not in cooldown
 
-10.2 /api/alert
+Otherwise → silent.
 
-Purpose:
-	• Authenticate request
-	• Call /api/multi
-	• Evaluate criteria
-	• Enforce cooldown
-	• Compute recommendation + levels
-	• Apply warmup gate (1h levels required)
-	• Apply strong-recommendation gate (B1)
-	• Send Telegram
+13) DRILLDOWN LINK
 
-Auth
-	• Preferred (QStash): Authorization: Bearer {SECRET}
-	• Fallback (manual): ?key={SECRET}
+DM drilldown includes:
+- Only alerted symbol(s)
+- PLUS BTCUSDT
 
-Input query params
-	• symbols=...
-	• driver_tf=...
-	• force=1
-	• debug=1
-	• dry=1
-	• key=... (optional fallback for manual testing)
+14) COOLDOWN
 
-Output JSON must include at minimum:
-	• ok
-	• sent: true|false
-	• triggered_count
-	• multiUrl
+ALERT_COOLDOWN_MINUTES = 20
+Ignored when force=1.
 
-Optional (only if implemented):
-	• dry: true|false
-	• criteria_hit_count
-	• cooldown_blocked_count
-	• message_count
+15) DRY MODE
 
-Telegram behavior:
-	• With force=1: include all symbols
-	• Otherwise: only symbols that pass:
-		• criteria hit
-		• not in cooldown
-		• 1h levels warm
-		• reco=strong
+dry=1:
+- No Telegram
+- No state writes
 
-⸻
+16) ACCEPTANCE CRITERIA
 
-11) Storage (Upstash)
-
-Rolling series
-	• Key: series5m:{instId}
-	• Used for deltas + levels
-
-Alert state
-	• alert:lastState15m:{instId}
-	• alert:lastSentAt:{instId}
-
-Only non-dry /api/alert may write these:
-	• lastSentAt only when a DM is actually sent
-	• lastState15m updated on non-dry runs to support setup-flip detection
-
-⸻
-
-12) Acceptance criteria (definition of done)
-
-System is correct when:
-	1. /api/multi never sends Telegram DMs.
-	2. /api/alert is the only sender.
-	3. /api/alert sends DM only when:
-		• criteria met
-		• 1h warm
-  • macro regime gate passed
-		• reco=strong
-		• not in cooldown
-		or
-		• force=1
-	4. dry=1 triggers no Telegram and no writes.
-	5. debug=1 does not affect DM behavior.
-	6. Recommendation (bias, reco) and levels always present in DM.
-	7. All thresholds/cooldown configurable via env vars.
-	8. Telegram messages never exceed limit and never split within a ticker block.
-	9. QStash scheduler triggers /api/alert (best effort cadence) and system remains correct under drift.
-
-⸻
-
-13) Quick links
-
-Replace {SECRET} with your ALERT_SECRET.
-
-Manual forced snapshot (send DM):
-/api/alert?key={SECRET}&symbols=BTCUSDT&force=1
-
-Safe test mode (no send, no writes):
-/api/alert?key={SECRET}&symbols=BTCUSDT&debug=1&dry=1
-
-Drilldown raw data (JSON only):
-/api/multi?symbols=BTCUSDT&driver_tf=5m
+1. /api/multi never sends Telegram
+2. /api/alert is sole sender
+3. Scalp sends only when strict execution rule satisfied
+4. Swing does not require 15m OI ≥ 0.50%
+5. No WAIT alerts in automatic mode
+6. Triggers include numeric level values
+7. Drilldown scoped correctly
+8. Cooldown enforced
+9. All thresholds configurable via env
