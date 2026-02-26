@@ -11,9 +11,9 @@
 //   - criteria hit
 //   - warmup passed (1h levels ready)
 //   - macro gate passed
-//   - B1 edge satisfied (reco=strong)
+//   - (B1 edge satisfied OR structural break) depending on mode rules
 //   - execution trigger active (mode rules)
-//   - OI rules satisfied (scalp strict)
+//   - OI rules satisfied (scalp strict; swing/build context)
 //   - not in cooldown
 // - dry=1: no Telegram, no writes
 // - Drilldown link includes only alerted symbols + BTCUSDT
@@ -55,9 +55,9 @@ const CFG = {
   defaultRisk: String(process.env.DEFAULT_RISK_PROFILE || "normal").toLowerCase(),
 
   // Criteria thresholds (v1.3)
-  momentumAbs5mPricePct: 0.1,
-  shockOi15mPct: 0.5,
-  shockAbs15mPricePct: 0.2,
+  momentumAbs5mPricePct: Number(process.env.ALERT_MOMENTUM_ABS_5M_PRICE_PCT || 0.1),
+  shockOi15mPct: Number(process.env.ALERT_SHOCK_OI_15M_PCT || 0.5),
+  shockAbs15mPricePct: Number(process.env.ALERT_SHOCK_ABS_15M_PRICE_PCT || 0.2),
 
   // Levels windows (from stored 5m series)
   levelWindows: {
@@ -95,7 +95,14 @@ const CFG = {
 
   // Scalp sweep detection uses recent 5m points
   scalp: {
-    sweepLookbackPoints: Number(process.env.ALERT_SCALP_SWEEP_LOOKBACK_POINTS || 3), // last N points
+    sweepLookbackPoints: Number(process.env.ALERT_SCALP_SWEEP_LOOKBACK_POINTS || 3),
+  },
+
+  // Swing/build OI context rule (v1.3)
+  // "Must not be sharply negative against direction"
+  // We codify as: 15m OI change must be >= minOiPct (default -0.50%)
+  swing: {
+    minOiPct: Number(process.env.ALERT_SWING_MIN_OI_PCT || -0.5),
   },
 
   keys: {
@@ -371,22 +378,6 @@ function adjustRecoForRegime({ item, bias, levels, price, baseReco }) {
 
 /**
  * STRICT EXECUTION (v1.3) — SCALP
- * Non-force scalp sends ONLY if ALL are true:
- * - criteria hit (handled outside)
- * - B1 edge satisfied (handled outside; reco.strong must be true)
- * - price trigger active (15m close proxy + sweep pattern)
- * - strict OI confirmation: 15m oi_change_pct >= 0.50%
- *
- * Price trigger definitions (v1.3):
- * Long:
- *  - close > 1h high
- *  OR
- *  - sweep < 1h low AND close back above 1h low
- *
- * Short:
- *  - close < 1h low
- *  OR
- *  - sweep > 1h high AND close back below 1h high
  */
 async function scalpExecutionGate({ instId, item, bias, levels }) {
   const l1h = levels?.["1h"];
@@ -394,13 +385,12 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
 
   const hi = asNum(l1h.hi);
   const lo = asNum(l1h.lo);
-  const close15m = asNum(item?.price); // proxy for current 15m close
+  const close15m = asNum(item?.price);
   if (hi == null || lo == null || close15m == null) return { ok: false, reason: "missing_levels_or_price" };
 
   const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
   if (!Number.isFinite(oi15) || oi15 < CFG.shockOi15mPct) return { ok: false, reason: "oi15_not_confirming" };
 
-  // Recent series points to approximate sweep
   const recent = await getRecentPricesFromSeries(instId, CFG.scalp.sweepLookbackPoints);
   const minRecent = recent.length ? Math.min(...recent) : null;
   const maxRecent = recent.length ? Math.max(...recent) : null;
@@ -424,11 +414,7 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         triggerLine: `trigger: sweep < ${fmtPrice(lo)} (1h low) AND current 15m close back > ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
-    return {
-      ok: false,
-      reason: "price_trigger_not_active",
-      detail: { close15m, hi, lo, minRecent },
-    };
+    return { ok: false, reason: "price_trigger_not_active", detail: { close15m, hi, lo, minRecent } };
   }
 
   if (bias === "short") {
@@ -450,25 +436,16 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         triggerLine: `trigger: sweep > ${fmtPrice(hi)} (1h high) AND current 15m close back < ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
-    return {
-      ok: false,
-      reason: "price_trigger_not_active",
-      detail: { close15m, hi, lo, maxRecent },
-    };
+    return { ok: false, reason: "price_trigger_not_active", detail: { close15m, hi, lo, maxRecent } };
   }
 
   return { ok: false, reason: "neutral_bias" };
 }
 
 /**
- * SWING MODE EXECUTION (v1.3)
- * Requires:
- * - criteria hit
- * - B1 edge satisfied OR structural break
- * - price trigger active (15m close proxy beyond level)
- * - OI used as context only (no strict 0.50% spike required)
- *
- * Here: “structural break” approximated as current price beyond 1h hi/lo in direction of bias.
+ * SWING/BUILD EXECUTION (v1.3)
+ * - requires price trigger active (beyond 1h level)
+ * - OI used as context only (no strict spike), but must not be sharply negative
  */
 function swingExecutionGate({ bias, levels, item }) {
   const l1h = levels?.["1h"];
@@ -478,6 +455,11 @@ function swingExecutionGate({ bias, levels, item }) {
   const lo = asNum(l1h.lo);
   const p = asNum(item?.price);
   if (hi == null || lo == null || p == null) return { ok: false, reason: "missing_levels_or_price" };
+
+  const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
+  if (Number.isFinite(oi15) && oi15 < CFG.swing.minOiPct) {
+    return { ok: false, reason: "oi15_too_negative_for_swing", detail: { oi15, min: CFG.swing.minOiPct } };
+  }
 
   if (bias === "long") {
     const ok = p > hi;
@@ -564,13 +546,11 @@ export default async function handler(req, res) {
 
       const { triggers, curState } = evaluateCriteria(item, lastState);
 
-      // Detection layer must hit (unless force)
       if (!force && !triggers.length) {
         if (debug) skipped.push({ symbol, reason: "no_triggers" });
         continue;
       }
 
-      // Cooldown (unless force)
       if (!force && Number.isFinite(lastSent) && lastSent != null && now - lastSent < cooldownMs) {
         if (debug) skipped.push({ symbol, reason: "cooldown" });
         continue;
@@ -578,7 +558,6 @@ export default async function handler(req, res) {
 
       const bias = biasFromItem(item, mode);
 
-      // Macro gate: block SHORT bias alts during BTC bull expansion (unless force)
       if (
         !force &&
         CFG.macro.enabled &&
@@ -595,30 +574,28 @@ export default async function handler(req, res) {
 
       const levels = await computeLevelsFromSeries(instId);
 
-      // Warmup gate (unless force)
       if (!force && levels?.["1h"]?.warmup) {
         if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
         if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
         continue;
       }
 
-      // B1 edge (reco strong) — required for automatic mode (unless force)
       const baseReco = strongRecoB1({ bias, levels, price: item.price });
       const reco = adjustRecoForRegime({ item, bias, levels, price: item.price, baseReco });
 
       let triggerLine = null;
       let execReason = null;
+      let usedStructuralBreak = false;
 
       if (!force) {
-        // v1.3: B1 must be satisfied for reco=strong (used by all automatic modes)
-        if (!reco.strong) {
-          if (debug) skipped.push({ symbol, reason: `weak_reco:${reco.reason}` });
-          if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
-          continue;
-        }
-
-        // Mode execution gates
         if (String(mode) === "scalp") {
+          // v1.3: scalp REQUIRES B1 (reco strong)
+          if (!reco.strong) {
+            if (debug) skipped.push({ symbol, reason: `weak_reco:${reco.reason}` });
+            if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+            continue;
+          }
+
           const g = await scalpExecutionGate({ instId, item, bias, levels });
           if (!g.ok) {
             if (debug) {
@@ -633,28 +610,22 @@ export default async function handler(req, res) {
             if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
             continue;
           }
+
           triggerLine = g.triggerLine || null;
           execReason = g.reason || null;
-        } else if (String(mode) === "swing") {
-          // v1.3: swing can use “B1 OR structural break”; since B1 already true here,
-          // we still require an execution trigger (price beyond level) to be actionable now.
+        } else {
+          // swing/build: v1.3 requires (B1 OR structural break) AND price trigger active.
+          // Our structural break is the price trigger itself (beyond 1h hi/lo), so we evaluate execution first.
           const g = swingExecutionGate({ bias, levels, item });
           if (!g.ok) {
-            if (debug) skipped.push({ symbol, reason: `swing_exec:${g.reason}`, bias });
+            if (debug) skipped.push({ symbol, reason: `${String(mode)}_exec:${g.reason}`, bias, detail: g.detail || null });
             if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
             continue;
           }
-          triggerLine = g.triggerLine || null;
-          execReason = g.reason || null;
-        } else if (String(mode) === "build") {
-          // v1.3: build still must be actionable now; we keep it strict by requiring a trigger beyond a level
-          // (same as swing trigger for “act now”).
-          const g = swingExecutionGate({ bias, levels, item });
-          if (!g.ok) {
-            if (debug) skipped.push({ symbol, reason: `build_exec:${g.reason}`, bias });
-            if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
-            continue;
-          }
+
+          // At this point, structural break is true (execution trigger active).
+          // So allow passing even if reco is weak.
+          usedStructuralBreak = !reco.strong;
           triggerLine = g.triggerLine || null;
           execReason = g.reason || null;
         }
@@ -669,6 +640,7 @@ export default async function handler(req, res) {
         reco,
         triggerLine,
         execReason,
+        usedStructuralBreak,
       });
 
       if (!dry) {
@@ -699,7 +671,6 @@ export default async function handler(req, res) {
       lines.push("");
     }
 
-    // Drilldown includes only alerted symbols + BTC (v1.3)
     const drillSyms = Array.from(
       new Set([
         ...triggered.map((x) => String(x.symbol || "").toUpperCase()).filter(Boolean),
