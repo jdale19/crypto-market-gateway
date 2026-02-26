@@ -20,6 +20,13 @@
 // STEP 2 (Mode-aware Bias):
 // - scalp => bias from 15m lean (fallback item lean)
 // - swing/build => bias from 4h lean (fallback 15m, then item lean)
+//
+// STEP 3 (Strict Scalp Execution Gate - non-force only):
+// - mode=scalp requires price to be at/through the actionable breakout edge AND OI to confirm.
+//   long:  price >= 1h_hi AND 15m OI change >= +0.50%
+//   short: price <= 1h_lo AND 15m OI change >= +0.50%
+// - Adds a "Trigger:" line to the DM for clarity.
+// - Avoids vague "reclaim" language by using explicit conditions.
 
 import { Redis } from "@upstash/redis";
 
@@ -48,7 +55,7 @@ function getDeployInfo() {
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
 
-  // STEP 1 defaults (wiring only)
+  // STEP 1 defaults
   defaultMode: String(process.env.DEFAULT_MODE || "scalp").toLowerCase(),
   defaultRisk: String(process.env.DEFAULT_RISK_PROFILE || "normal").toLowerCase(),
 
@@ -112,7 +119,6 @@ function normalizeDriverTf(raw) {
   return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
 }
 
-// STEP 1: mode + risk normalizers
 function normalizeMode(raw) {
   const m = String(raw || "").toLowerCase();
   return ["scalp", "swing", "build"].includes(m) ? m : null;
@@ -126,10 +132,7 @@ function normalizeRisk(raw) {
 const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
 const abs = (x) => (x == null ? null : Math.abs(Number(x)));
 
-// ✅ FIXED: matches your agreed precision rules
-// <1 => 4 decimals
-// 1..999 => 3 decimals
-// >=1000 => 2 decimals
+// Agreed precision rules
 const fmtPrice = (x) => {
   if (x == null || !Number.isFinite(Number(x))) return "n/a";
   const n = Number(x);
@@ -138,7 +141,6 @@ const fmtPrice = (x) => {
   return n.toFixed(2);
 };
 
-// ✅ FIX: handle string OR already-parsed object (same as multi.js)
 function safeJsonParse(v) {
   if (v == null) return null;
   if (typeof v === "object") return v;
@@ -209,7 +211,6 @@ async function computeLevelsFromSeries(instId) {
   return out;
 }
 
-// STEP 2: mode-aware bias selection
 function biasFromItem(item, mode) {
   const m = String(mode || "scalp").toLowerCase();
 
@@ -218,12 +219,10 @@ function biasFromItem(item, mode) {
     return String(lean4h).toLowerCase();
   }
 
-  // scalp (default)
   const lean15m = item?.deltas?.["15m"]?.lean || item?.lean || "neutral";
   return String(lean15m).toLowerCase();
 }
 
-// ---- edge check helper (used for base + contraction upgrade) ----
 function edgeRecoCheck({ bias, levels, price, edgePct }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { strong: false, reason: "1h_warmup" };
@@ -249,7 +248,6 @@ function edgeRecoCheck({ bias, levels, price, edgePct }) {
   return { strong: false, reason: "neutral_bias" };
 }
 
-// ---- base B1 reco ----
 function strongRecoB1({ bias, levels, price }) {
   return edgeRecoCheck({ bias, levels, price, edgePct: CFG.strongEdgePct1h });
 }
@@ -274,7 +272,6 @@ function evaluateCriteria(item, lastState) {
   return { triggers, curState };
 }
 
-// ---- derive BTC macro regime from /api/multi results ----
 function computeBtcMacro(results) {
   if (!CFG.macro.enabled) return { ok: false, reason: "macro_disabled", btcBullExpansion4h: false };
 
@@ -307,7 +304,6 @@ function computeBtcMacro(results) {
   };
 }
 
-// ---- NEW: per-symbol 4h regime ----
 function computeSymbolRegime(item) {
   if (!CFG.regime.enabled) return { ok: false, type: "off" };
 
@@ -335,45 +331,55 @@ function computeSymbolRegime(item) {
   return { ok: true, type: "neutral", lean4h, p4, oi4 };
 }
 
-// ---- NEW: adjust reco using regime (expansion downgrade + contraction upgrade) ----
 function adjustRecoForRegime({ item, bias, levels, price, baseReco }) {
   if (!CFG.regime.enabled) return { ...baseReco, adj: { type: "none" } };
 
   const reg = computeSymbolRegime(item);
 
-  // Expansion: downgrade fade setups (strong->weak)
   if (reg?.ok && baseReco?.strong) {
     if (reg.type === "bull_expansion" && bias === "short") {
-      return {
-        strong: false,
-        reason: "regime_downgrade_bull_expansion_fade",
-        adj: { type: reg.type, ...reg },
-      };
+      return { strong: false, reason: "regime_downgrade_bull_expansion_fade", adj: { type: reg.type, ...reg } };
     }
     if (reg.type === "bear_expansion" && bias === "long") {
-      return {
-        strong: false,
-        reason: "regime_downgrade_bear_expansion_fade",
-        adj: { type: reg.type, ...reg },
-      };
+      return { strong: false, reason: "regime_downgrade_bear_expansion_fade", adj: { type: reg.type, ...reg } };
     }
   }
 
-  // Contraction: optional upgrade weak->strong if within wider edge band
   if (reg?.ok && reg.type === "contraction" && CFG.regime.contractionUpgradeEnabled && !baseReco?.strong) {
     const widened = CFG.strongEdgePct1h * Math.max(1, CFG.regime.contractionUpgradeEdgeMult);
     const up = edgeRecoCheck({ bias, levels, price, edgePct: widened });
 
     if (up.strong) {
-      return {
-        strong: true,
-        reason: "regime_upgrade_contraction",
-        adj: { type: reg.type, widenedEdgePct: widened, ...reg },
-      };
+      return { strong: true, reason: "regime_upgrade_contraction", adj: { type: reg.type, widenedEdgePct: widened, ...reg } };
     }
   }
 
   return { ...baseReco, adj: { type: reg?.type || "unknown", ...reg } };
+}
+
+// STEP 3: strict scalp execution gate (non-force only)
+function scalpStrictGate({ item, bias, levels, price }) {
+  const l1h = levels?.["1h"];
+  if (!l1h || l1h.warmup) return { ok: false, reason: "1h_warmup" };
+
+  const hi = asNum(l1h.hi);
+  const lo = asNum(l1h.lo);
+  const p = asNum(price);
+  if (hi == null || lo == null || p == null) return { ok: false, reason: "missing_levels" };
+
+  const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
+  if (!Number.isFinite(oi15) || oi15 < CFG.shockOi15mPct) return { ok: false, reason: "oi15_not_confirming" };
+
+  if (bias === "long") {
+    const ok = p >= hi;
+    return { ok, reason: ok ? "price_break_hi" : "price_not_break_hi", triggerLine: `Trigger: price >= ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%` };
+  }
+  if (bias === "short") {
+    const ok = p <= lo;
+    return { ok, reason: ok ? "price_break_lo" : "price_not_break_lo", triggerLine: `Trigger: price <= ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%` };
+  }
+
+  return { ok: false, reason: "neutral_bias" };
 }
 
 export default async function handler(req, res) {
@@ -395,7 +401,6 @@ export default async function handler(req, res) {
     const dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
-    // STEP 1: parse mode + risk_profile
     const mode = normalizeMode(req.query.mode) || CFG.defaultMode;
     const risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
 
@@ -453,10 +458,8 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // STEP 2: mode-aware bias
       const bias = biasFromItem(item, mode);
 
-      // ---- MACRO GATE (block shorts on ALTs during BTC bull expansion) ----
       if (
         !force &&
         CFG.macro.enabled &&
@@ -473,14 +476,12 @@ export default async function handler(req, res) {
 
       const levels = await computeLevelsFromSeries(instId);
 
-      // HARD WARMUP GATE
       if (!force && levels?.["1h"]?.warmup) {
         if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
         if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
         continue;
       }
 
-      // Base reco then regime-adjusted reco
       const baseReco = strongRecoB1({ bias, levels, price: item.price });
       const reco = adjustRecoForRegime({ item, bias, levels, price: item.price, baseReco });
 
@@ -490,7 +491,19 @@ export default async function handler(req, res) {
         continue;
       }
 
-      triggered.push({ symbol, price: item.price, bias, triggers, levels, reco });
+      // STEP 3: strict scalp gate (only when mode=scalp and non-force)
+      let triggerLine = null;
+      if (!force && String(mode) === "scalp") {
+        const g = scalpStrictGate({ item, bias, levels, price: item.price });
+        triggerLine = g.triggerLine || null;
+        if (!g.ok) {
+          if (debug) skipped.push({ symbol, reason: `scalp_gate:${g.reason}`, bias, oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null });
+          if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+          continue;
+        }
+      }
+
+      triggered.push({ symbol, price: item.price, bias, triggers, levels, reco, triggerLine });
 
       if (!dry) {
         await redis.set(CFG.keys.lastSentAt(instId), String(now));
@@ -516,10 +529,10 @@ export default async function handler(req, res) {
       const lvl = l1h && !l1h.warmup ? ` | 1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)}` : "";
       const recoTxt = t.reco?.strong ? "strong" : "weak";
       lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias} | reco=${recoTxt}${lvl}`);
+      if (t.triggerLine) lines.push(t.triggerLine);
       lines.push("");
     }
 
-    // Drilldown should include only alerted symbols + BTC for context
     const drillSyms = Array.from(
       new Set([
         ...triggered.map((x) => String(x.symbol || "").toUpperCase()).filter(Boolean),
@@ -545,9 +558,7 @@ export default async function handler(req, res) {
       ok: true,
       sent: !dry,
       triggered_count: triggered.length,
-      ...(debug
-        ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage }
-        : {}),
+      ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage } : {}),
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
