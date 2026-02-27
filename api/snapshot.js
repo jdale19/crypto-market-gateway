@@ -1,5 +1,7 @@
 // /api/snapshot.js
 // OKX PERP (SWAP) ONLY — strict 5m bucket snapshots + 5m deltas + state
+// Batch mode: supports ?symbols=BTCUSDT,ETHUSDT,...
+//
 // Requires env vars:
 // - UPSTASH_REDIS_REST_URL
 // - UPSTASH_REDIS_REST_TOKEN
@@ -50,6 +52,22 @@ function baseFromSymbolUSDT(symbol) {
   const s = String(symbol || "").toUpperCase();
   if (!s.endsWith("USDT")) return null;
   return s.slice(0, -4);
+}
+
+function normalizeSymbolsQuery(req) {
+  // Accept either ?symbols=BTCUSDT,ETHUSDT or ?symbol=BTCUSDT
+  const raw =
+    (req?.query?.symbols != null ? String(req.query.symbols) : "") ||
+    (req?.query?.symbol != null ? String(req.query.symbol) : "") ||
+    "";
+
+  const arr = raw
+    .split(",")
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+
+  // Safety default if caller provided nothing
+  return arr.length ? arr : ["ETHUSDT"];
 }
 
 async function fetchWithTimeout(url) {
@@ -170,111 +188,102 @@ async function fetchOkxSwap(instId) {
   };
 }
 
+async function processOneSymbol(symbol, reqCache) {
+  const base = baseFromSymbolUSDT(symbol);
+  if (!base) {
+    return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
+  }
+
+  const instId = await resolveOkxSwapInstId(symbol, reqCache);
+  if (!instId) {
+    return { ok: false, symbol, instId: `${base}-USDT-SWAP`, error: "no OKX perp market (perps-only mode)" };
+  }
+
+  const okx = await fetchOkxSwap(instId);
+  if (!okx.ok) return { ok: false, symbol, instId, error: okx.error };
+
+  const now = Date.now();
+  const price = okx.price;
+  const funding_rate = okx.funding_rate;
+  const open_interest_contracts = okx.open_interest_contracts;
+
+  const open_interest_usd =
+    Number.isFinite(open_interest_contracts) && Number.isFinite(price)
+      ? open_interest_contracts * price
+      : null;
+
+  const bucket = Math.floor(now / BUCKET_MS);
+  const keyNow = `snap5m:${instId}:${bucket}`;
+  const keyPrev = `snap5m:${instId}:${bucket - 1}`;
+
+  const snapNowRaw = await redis.get(keyNow);
+  const snapPrevRaw = await redis.get(keyPrev);
+
+  let snapNow = safeJsonParse(snapNowRaw);
+  const snapPrev = safeJsonParse(snapPrevRaw);
+
+  if (!snapNow) {
+    snapNow = { price, funding_rate, open_interest_contracts, ts: now };
+    await redis.set(keyNow, JSON.stringify(snapNow));
+    await redis.expire(keyNow, SNAP_TTL_SECONDS);
+  }
+
+  const price_change_5m_pct = pctChange(snapNow?.price, snapPrev?.price);
+  const oi_change_5m_pct = pctChange(snapNow?.open_interest_contracts, snapPrev?.open_interest_contracts);
+
+  const funding_change_5m =
+    Number.isFinite(snapNow?.funding_rate) && Number.isFinite(snapPrev?.funding_rate)
+      ? snapNow.funding_rate - snapPrev.funding_rate
+      : null;
+
+  const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
+  const warmup_5m = !(snapNow && snapPrev);
+
+  return {
+    ok: true,
+    symbol,
+    instId,
+    ts: now,
+    price,
+    funding_rate,
+    open_interest_contracts,
+    open_interest_usd,
+    price_change_5m_pct,
+    oi_change_5m_pct,
+    funding_change_5m,
+    state,
+    warmup_5m,
+    source: "okx_swap_public_api+upstash_state",
+  };
+}
+
 export default async function handler(req, res) {
   try {
-    const symbol = String(
-  req.query.symbol ||
-  (String(req.query.symbols || "").split(",")[0]) ||
-  "ETHUSDT"
-).toUpperCase();
-    const base = baseFromSymbolUSDT(symbol);
+    const symbols = normalizeSymbolsQuery(req);
 
-    if (!base) {
-      return res.status(400).json({
-        ok: false,
-        symbol,
-        error: "unsupported symbol format (expected like ETHUSDT)",
-      });
-    }
-
+    // request-scope cache
     const reqCache = { swapList: null, swapInstSet: null, instMap: new Map() };
-    const instId = await resolveOkxSwapInstId(symbol, reqCache);
 
-    if (!instId) {
-      return res.status(404).json({
-        ok: false,
-        symbol,
-        instId: `${base}-USDT-SWAP`,
-        error: "no OKX perp market (perps-only mode)",
-      });
-    }
-
-    // ---- Fetch OKX current values ----
-    const okx = await fetchOkxSwap(instId);
-    if (!okx.ok) {
-      return res.status(502).json({ ok: false, symbol, instId, error: okx.error });
-    }
-
-    const now = Date.now();
-    const price = okx.price;
-    const funding_rate = okx.funding_rate;
-    const open_interest_contracts = okx.open_interest_contracts;
-
-    const open_interest_usd =
-      Number.isFinite(open_interest_contracts) && Number.isFinite(price)
-        ? open_interest_contracts * price
-        : null;
-
-    // ---- Strict 5-minute bucketing ----
-    const bucket = Math.floor(now / BUCKET_MS);
-    const keyNow = `snap5m:${instId}:${bucket}`;
-    const keyPrev = `snap5m:${instId}:${bucket - 1}`;
-
-    const snapNowRaw = await redis.get(keyNow);
-    const snapPrevRaw = await redis.get(keyPrev);
-
-    let snapNow = safeJsonParse(snapNowRaw);
-    const snapPrev = safeJsonParse(snapPrevRaw);
-
-    // Anchor the bucket once (store JSON string)
-    if (!snapNow) {
-      snapNow = {
-        price,
-        funding_rate,
-        open_interest_contracts,
-        ts: now,
-      };
-      await redis.set(keyNow, JSON.stringify(snapNow));
-      await redis.expire(keyNow, SNAP_TTL_SECONDS);
-    }
-
-    const price_change_5m_pct = pctChange(snapNow?.price, snapPrev?.price);
-    const oi_change_5m_pct = pctChange(
-      snapNow?.open_interest_contracts,
-      snapPrev?.open_interest_contracts
-    );
-
-    const funding_change_5m =
-      Number.isFinite(snapNow?.funding_rate) && Number.isFinite(snapPrev?.funding_rate)
-        ? snapNow.funding_rate - snapPrev.funding_rate
-        : null;
-
-    const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
-    const warmup_5m = !(snapNow && snapPrev);
+    const results = await Promise.all(symbols.map((s) => processOneSymbol(s, reqCache)));
 
     res.setHeader("Cache-Control", "no-store");
+
+    // Preserve old response shape for single-symbol calls
+    if (results.length === 1) {
+      const r0 = results[0];
+      return res.status(r0.ok ? 200 : 502).json({
+        ...r0,
+        note:
+          "Strict 5-minute deltas compare current 5m bucket vs previous 5m bucket. warmup_5m=true until previous bucket exists.",
+      });
+    }
+
     return res.status(200).json({
       ok: true,
-      symbol,
-      instId,
-      ts: now,
-
-      // Current values (live)
-      price,
-      funding_rate,
-      open_interest_contracts,
-      open_interest_usd,
-
-      // Strict 5m deltas (bucket anchored)
-      price_change_5m_pct,
-      oi_change_5m_pct,
-      funding_change_5m,
-      state,
-      warmup_5m,
-
-      source: "okx_swap_public_api+upstash_state",
-      note:
-        "Strict 5-minute deltas compare current 5m bucket vs previous 5m bucket. warmup_5m=true until previous bucket exists.",
+      ts: Date.now(),
+      symbols,
+      results,
+      note: "Batch snapshot write. Each symbol writes `snap5m:${instId}:${bucket}` (24h TTL).",
     });
   } catch (err) {
     return res.status(500).json({
