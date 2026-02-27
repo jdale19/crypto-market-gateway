@@ -558,8 +558,8 @@ export default async function handler(req, res) {
     const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 
     const multiUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
-      symbols.join(",")
-    )}&driver_tf=${encodeURIComponent(driver_tf)}`;
+  symbols.join(",")
+)}&driver_tf=${encodeURIComponent(driver_tf)}&source=snapshot`;
 
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
     const j = await r.json().catch(() => null);
