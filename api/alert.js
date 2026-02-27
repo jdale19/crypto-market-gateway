@@ -357,7 +357,7 @@ function evaluateCriteria(item, lastState, mode) {
   (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct ||
   (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
   
-  const shockHit = m === "scalp" ? shock5 : (shock5 || shock15);
+  const shockHit = shock5 || shock15;
 
   if (shockHit) triggers.push({ code: "positioning_shock" });
 
