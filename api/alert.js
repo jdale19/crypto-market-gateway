@@ -350,13 +350,13 @@ function evaluateCriteria(item, lastState, mode) {
   // - scalp: still 5m (fast)
   // - swing/build: allow EITHER 5m OR 15m shock to trigger review
   const shock5 =
-    (d5?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
-    (abs(d5?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
+  (d5?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct ||
+  (abs(d5?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
 
   const shock15 =
-    (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
-    (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
-
+  (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct ||
+  (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
+  
   const shockHit = m === "scalp" ? shock5 : (shock5 || shock15);
 
   if (shockHit) triggers.push({ code: "positioning_shock" });
