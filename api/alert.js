@@ -318,10 +318,10 @@ function strongRecoB1({ bias, levels, price }) {
  * - SCALP detection uses 5m state (faster “setup flip”) and 5m momentum.
  * - SWING/BUILD keep 15m-based detection.
  *
- * UPDATE (THIS EDIT):
- * - Loosen detection overall so fewer symbols die at "no_triggers":
- *   - momentum_confirm: remove 5m/15m lean-alignment requirement for swing/build
- *   - positioning_shock: trigger if OI shock OR price shock (instead of requiring both)
+ * UPDATE:
+ * - momentum_confirm: no longer requires 5m/15m lean alignment
+ * - positioning_shock: trigger if OI shock OR price shock (instead of requiring both)
+ * - shockHit is deterministic across all modes (no scalp-only ternary red herring)
  */
 function evaluateCriteria(item, lastState, mode) {
   const m = String(mode || "scalp").toLowerCase();
@@ -333,30 +333,26 @@ function evaluateCriteria(item, lastState, mode) {
 
   // State flip TF:
   // - scalp: 5m (fast)
-  // - swing/build: 15m (keep, but we can loosen later if you want)
+  // - swing/build: 15m
   const stateTf = m === "scalp" ? d5 : d15;
   const curState = String(stateTf?.state || "unknown");
 
   if (lastState && curState !== lastState) triggers.push({ code: "setup_flip" });
 
-  // Momentum confirm (LOOSENED ACROSS ALL MODES):
-  // Old swing/build: required d5.lean === d15.lean
-  // New: momentum is momentum — if 5m move is big enough, review it.
+  // Momentum confirm (LOOSENED ACROSS ALL MODES)
   if ((abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct) {
     triggers.push({ code: "momentum_confirm" });
   }
 
-  // Positioning shock (LOOSENED ACROSS ALL MODES):
-  // - scalp: still 5m (fast)
-  // - swing/build: allow EITHER 5m OR 15m shock to trigger review
+  // Positioning shock (LOOSENED ACROSS ALL MODES)
   const shock5 =
-  (d5?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct ||
-  (abs(d5?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
+    (d5?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct ||
+    (abs(d5?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
 
   const shock15 =
-  (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct ||
-  (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
-  
+    (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct ||
+    (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
+
   const shockHit = shock5 || shock15;
 
   if (shockHit) triggers.push({ code: "positioning_shock" });
@@ -663,6 +659,14 @@ export default async function handler(req, res) {
 
       if (!force && !triggers.length) {
         if (debug) skipped.push({ symbol, reason: "no_triggers" });
+
+        // Seed/refresh lastState even when skipping on detection
+        // Otherwise setup_flip can never fire in quiet regimes.
+        if (!dry && curState && curState !== "unknown") {
+          await redis.set(CFG.keys.lastState(mode, instId), curState);
+          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState); // legacy mirror
+        }
+
         continue;
       }
 
