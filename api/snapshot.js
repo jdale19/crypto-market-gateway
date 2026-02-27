@@ -172,7 +172,11 @@ async function fetchOkxSwap(instId) {
 
 export default async function handler(req, res) {
   try {
-    const symbol = String(req.query.symbol || "ETHUSDT").toUpperCase();
+    const symbol = String(
+  req.query.symbol ||
+  (String(req.query.symbols || "").split(",")[0]) ||
+  "ETHUSDT"
+).toUpperCase();
     const base = baseFromSymbolUSDT(symbol);
 
     if (!base) {
