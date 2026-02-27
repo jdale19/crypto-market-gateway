@@ -255,17 +255,38 @@ async function getRecentPricesFromSeries(instId, n) {
     .filter((x) => x != null);
 }
 
-// v1.3 bias logic
+// v1.3 bias logic (UPDATED: swing prefers 1h lean)
 function biasFromItem(item, mode) {
   const m = String(mode || "scalp").toLowerCase();
 
-  if (m === "swing" || m === "build") {
-    const lean4h = item?.deltas?.["4h"]?.lean || item?.deltas?.["15m"]?.lean || item?.lean || "neutral";
-    return String(lean4h).toLowerCase();
+  // BUILD: anchor to higher timeframe
+  if (m === "build") {
+    const lean =
+      item?.deltas?.["4h"]?.lean ||
+      item?.deltas?.["1h"]?.lean ||
+      item?.deltas?.["15m"]?.lean ||
+      item?.lean ||
+      "neutral";
+    return String(lean).toLowerCase();
   }
 
-  const lean15m = item?.deltas?.["15m"]?.lean || item?.lean || "neutral";
-  return String(lean15m).toLowerCase();
+  // SWING: prefer 1h lean (fallback 4h -> 15m)
+  if (m === "swing") {
+    const lean =
+      item?.deltas?.["1h"]?.lean ||
+      item?.deltas?.["4h"]?.lean ||
+      item?.deltas?.["15m"]?.lean ||
+      item?.lean ||
+      "neutral";
+    return String(lean).toLowerCase();
+  }
+
+  // SCALP (default): prefer 15m lean
+  const lean =
+    item?.deltas?.["15m"]?.lean ||
+    item?.lean ||
+    "neutral";
+  return String(lean).toLowerCase();
 }
 
 // B1 edge check (v1.3)
@@ -558,8 +579,8 @@ export default async function handler(req, res) {
     const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 
     const multiUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
-  symbols.join(",")
-)}&driver_tf=${encodeURIComponent(driver_tf)}&source=snapshot`;
+      symbols.join(",")
+    )}&driver_tf=${encodeURIComponent(driver_tf)}&source=snapshot`;
 
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
     const j = await r.json().catch(() => null);
