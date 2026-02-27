@@ -317,6 +317,11 @@ function strongRecoB1({ bias, levels, price }) {
  * Change:
  * - SCALP detection uses 5m state (faster “setup flip”) and 5m momentum.
  * - SWING/BUILD keep 15m-based detection.
+ *
+ * UPDATE (THIS EDIT):
+ * - Loosen detection overall so fewer symbols die at "no_triggers":
+ *   - momentum_confirm: remove 5m/15m lean-alignment requirement for swing/build
+ *   - positioning_shock: trigger if OI shock OR price shock (instead of requiring both)
  */
 function evaluateCriteria(item, lastState, mode) {
   const m = String(mode || "scalp").toLowerCase();
@@ -334,29 +339,27 @@ function evaluateCriteria(item, lastState, mode) {
 
   if (lastState && curState !== lastState) triggers.push({ code: "setup_flip" });
 
-  // Momentum confirm:
-  // - scalp: 5m momentum alone is enough (no 15m dependency)
-  // - swing/build: keep original 5m+15m agreement requirement
-  if (m === "scalp") {
-    if ((abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct) {
-      triggers.push({ code: "momentum_confirm" });
-    }
-  } else {
-    if (d5?.lean === d15?.lean && (abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct) {
-      triggers.push({ code: "momentum_confirm" });
-    }
+  // Momentum confirm (LOOSENED):
+  // All modes: if 5m momentum is large enough, it’s worth evaluating entry.
+  if ((abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct) {
+    triggers.push({ code: "momentum_confirm" });
   }
 
-  // Positioning shock:
-  // Keep the same thresholds/env vars.
-  // - scalp: use 5m OI+price shock (faster)
-  // - swing/build: keep 15m OI+price shock (legacy)
+  // Positioning shock (LOOSENED):
+  // - scalp: use 5m (faster)
+  // - swing/build: keep 15m (stable)
   const shockTf = m === "scalp" ? d5 : d15;
-  if (
-    (shockTf?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
-    (abs(shockTf?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct
-  ) {
-    triggers.push({ code: "positioning_shock" });
+
+  const oi = asNum(shockTf?.oi_change_pct);
+  const pxAbs = abs(shockTf?.price_change_pct) ?? 0;
+
+  const oiShock = (oi ?? -Infinity) >= CFG.shockOi15mPct;
+  const pxShock = pxAbs >= CFG.shockAbs15mPricePct;
+
+  // OLD: oiShock && pxShock
+  // NEW: oiShock || pxShock
+  if (oiShock || pxShock) {
+    triggers.push({ code: "positioning_shock", detail: { oiShock, pxShock, oi, pxAbs } });
   }
 
   return { triggers, curState };
