@@ -1,18 +1,18 @@
 // /api/alert.js
-// Crypto Market Gateway — Requirements (v1.3) aligned
+// Crypto Market Gateway — Requirements (v2.x) aligned (mode-aware bias + mode-aware detection)
 //
 // SYSTEM GOAL
-// Send low-noise Telegram DMs only when a trade is executable within ~15 minutes.
+// Send low-noise Telegram DMs only when an entry is actionable NOW under the active mode.
 // If it is not actionable now → no DM.
 //
-// KEY BEHAVIOR (v1.3)
-// - /api/alert is the ONLY sender
+// KEY BEHAVIOR
+// - /api/alert is the ONLY Telegram sender
 // - Non-force sends ONLY if:
-//   - criteria hit
+//   - detection triggers hit (mode-aware; scalp uses 5m state)
 //   - warmup passed (1h levels ready)
 //   - macro gate passed
 //   - (B1 edge satisfied OR structural break) depending on mode rules
-//   - execution trigger active (mode rules)
+//   - entry trigger active (mode rules)
 //   - OI rules satisfied (scalp strict; swing/build context)
 //   - not in cooldown
 // - dry=1: no Telegram, no writes (alert state + heartbeat disabled)
@@ -22,10 +22,9 @@
 // - Heartbeat written to Upstash on each run (unless dry=1) so you can prove QStash is calling this endpoint.
 // - When debug=1, response includes heartbeat_last_run.
 //
-// NOTE ON “15m close”
-// We approximate “current 15m close” using the current snapshot price (item.price),
+// NOTE ON “close”
+// We approximate the relevant “current close” using the current snapshot price (item.price),
 // and we implement sweep logic using the stored 5m series (recent points).
-// If you later add true 15m candle close/high/low from OKX, you can swap in real values.
 
 import { Redis } from "@upstash/redis";
 
@@ -54,11 +53,11 @@ function getDeployInfo() {
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
 
-  // Defaults (v1.3)
+  // Defaults
   defaultMode: String(process.env.DEFAULT_MODE || "scalp").toLowerCase(),
   defaultRisk: String(process.env.DEFAULT_RISK_PROFILE || "normal").toLowerCase(),
 
-  // Criteria thresholds (v1.3)
+  // Detection thresholds (env names kept for backwards compatibility)
   momentumAbs5mPricePct: Number(process.env.ALERT_MOMENTUM_ABS_5M_PRICE_PCT || 0.1),
   shockOi15mPct: Number(process.env.ALERT_SHOCK_OI_15M_PCT || 0.5),
   shockAbs15mPricePct: Number(process.env.ALERT_SHOCK_ABS_15M_PRICE_PCT || 0.2),
@@ -69,12 +68,12 @@ const CFG = {
     "4h": 48,
   },
 
-  // B1 edge (v1.3)
+  // B1 edge
   strongEdgePct1h: Number(process.env.ALERT_STRONG_EDGE_PCT_1H || 0.15),
 
   telegramMaxChars: 3900,
 
-  // Macro gate (v1.3)
+  // Macro gate
   macro: {
     enabled: String(process.env.ALERT_MACRO_GATE_ENABLED || "1") === "1",
     btcSymbol: String(process.env.ALERT_MACRO_BTC_SYMBOL || "BTCUSDT").toUpperCase(),
@@ -83,7 +82,7 @@ const CFG = {
     blockShortsOnAltsWhenBtcBull: String(process.env.ALERT_MACRO_BLOCK_SHORTS_ON_ALTS || "1") === "1",
   },
 
-  // Optional regime adjust (kept; does not bypass B1/execution rules)
+  // Optional regime adjust (kept; does not bypass B1/entry rules)
   regime: {
     enabled: String(process.env.ALERT_REGIME_ENABLED || "1") === "1",
 
@@ -102,7 +101,7 @@ const CFG = {
     sweepLookbackPoints: Number(process.env.ALERT_SCALP_SWEEP_LOOKBACK_POINTS || 3),
   },
 
-  // Swing/build OI context rule (v1.3)
+  // Swing/build OI context rule
   // "Must not be sharply negative against direction"
   // We codify as: 15m OI change must be >= minOiPct (default -0.50%)
   swing: {
@@ -116,7 +115,12 @@ const CFG = {
   },
 
   keys: {
+    // NEW: mode-aware state key so scalp can track 5m state flips without colliding with swing/build
+    lastState: (mode, id) => `alert:lastState:${String(mode || "unknown")}:${id}`,
+
+    // LEGACY: kept so existing state doesn’t vanish if you downgrade / compare
     last15mState: (id) => `alert:lastState15m:${id}`,
+
     lastSentAt: (id) => `alert:lastSentAt:${id}`,
     series5m: (id) => `series5m:${id}`,
   },
@@ -147,7 +151,7 @@ function normalizeRisk(raw) {
 const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
 const abs = (x) => (x == null ? null : Math.abs(Number(x)));
 
-// v1.3 rounding rules
+// rounding rules
 const fmtPrice = (x) => {
   const n = Number(x);
   if (!Number.isFinite(n)) return "n/a";
@@ -171,7 +175,7 @@ function safeJsonParse(v) {
 
 // ---- Heartbeat helpers (NO alert logic changes) ----
 async function writeHeartbeat(payload, { dry }) {
-  if (dry) return; // v1.3: dry=1 means no writes
+  if (dry) return; // dry=1 means no writes
   try {
     await redis.set(CFG.heartbeat.key, JSON.stringify(payload));
     await redis.expire(CFG.heartbeat.key, CFG.heartbeat.ttlSeconds);
@@ -255,12 +259,10 @@ async function getRecentPricesFromSeries(instId, n) {
     .filter((x) => x != null);
 }
 
-// v1.3 bias logic (UPDATED: mode intent, NOT snapshot cadence)
-// scalp -> 5m lean (fast)
-// swing -> 1h lean (medium)
-// build -> 4h lean (slow)
-//
-// Drop-in replacement for biasFromItem(item, mode)
+// bias logic (mode intent, NOT snapshot cadence)
+// scalp -> 5m lean
+// swing -> 1h lean
+// build -> 4h lean
 function biasFromItem(item, mode) {
   const m = String(mode || "scalp").toLowerCase();
 
@@ -272,11 +274,10 @@ function biasFromItem(item, mode) {
   if (m === "build") return lean4h;
   if (m === "swing") return lean1h;
 
-  // scalp (default)
-  return lean5m;
+  return lean5m; // scalp default
 }
 
-// B1 edge check (v1.3)
+// B1 edge check
 function edgeRecoCheck({ bias, levels, price, edgePct }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { strong: false, reason: "1h_warmup" };
@@ -306,28 +307,62 @@ function strongRecoB1({ bias, levels, price }) {
   return edgeRecoCheck({ bias, levels, price, edgePct: CFG.strongEdgePct1h });
 }
 
-// Criteria layer (v1.3)
-function evaluateCriteria(item, lastState) {
+/**
+ * DETECTION (mode-aware)
+ *
+ * Why it exists:
+ * - It’s a *pre-filter* to avoid evaluating entry validity for every symbol on every run.
+ * - It reduces noise and reduces state churn.
+ *
+ * Change:
+ * - SCALP detection uses 5m state (faster “setup flip”) and 5m momentum.
+ * - SWING/BUILD keep 15m-based detection.
+ */
+function evaluateCriteria(item, lastState, mode) {
+  const m = String(mode || "scalp").toLowerCase();
+
   const d5 = item?.deltas?.["5m"];
   const d15 = item?.deltas?.["15m"];
+
   const triggers = [];
-  const curState = String(d15?.state || "unknown");
+
+  // State flip TF:
+  // - scalp: 5m state flips
+  // - swing/build: 15m state flips (legacy behavior)
+  const stateTf = m === "scalp" ? d5 : d15;
+  const curState = String(stateTf?.state || "unknown");
 
   if (lastState && curState !== lastState) triggers.push({ code: "setup_flip" });
 
-  if (d5?.lean === d15?.lean && (abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct)
-    triggers.push({ code: "momentum_confirm" });
+  // Momentum confirm:
+  // - scalp: 5m momentum alone is enough (no 15m dependency)
+  // - swing/build: keep original 5m+15m agreement requirement
+  if (m === "scalp") {
+    if ((abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct) {
+      triggers.push({ code: "momentum_confirm" });
+    }
+  } else {
+    if (d5?.lean === d15?.lean && (abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct) {
+      triggers.push({ code: "momentum_confirm" });
+    }
+  }
 
+  // Positioning shock:
+  // Keep the same thresholds/env vars.
+  // - scalp: use 5m OI+price shock (faster)
+  // - swing/build: keep 15m OI+price shock (legacy)
+  const shockTf = m === "scalp" ? d5 : d15;
   if (
-    (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
-    (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct
-  )
+    (shockTf?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
+    (abs(shockTf?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct
+  ) {
     triggers.push({ code: "positioning_shock" });
+  }
 
   return { triggers, curState };
 }
 
-// Macro gate (v1.3)
+// Macro gate
 function computeBtcMacro(results) {
   if (!CFG.macro.enabled) return { ok: false, reason: "macro_disabled", btcBullExpansion4h: false };
 
@@ -360,7 +395,7 @@ function computeBtcMacro(results) {
   };
 }
 
-// Optional regime adjust (does not override B1/execution)
+// Optional regime adjust (does not override B1/entry)
 function computeSymbolRegime(item) {
   if (!CFG.regime.enabled) return { ok: false, type: "off" };
 
@@ -419,7 +454,7 @@ function adjustRecoForRegime({ item, bias, levels, price, baseReco }) {
 }
 
 /**
- * STRICT EXECUTION (v1.3) — SCALP
+ * STRICT ENTRY (SCALP)
  */
 async function scalpExecutionGate({ instId, item, bias, levels }) {
   const l1h = levels?.["1h"];
@@ -427,8 +462,8 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
 
   const hi = asNum(l1h.hi);
   const lo = asNum(l1h.lo);
-  const close15m = asNum(item?.price);
-  if (hi == null || lo == null || close15m == null) return { ok: false, reason: "missing_levels_or_price" };
+  const priceNow = asNum(item?.price);
+  if (hi == null || lo == null || priceNow == null) return { ok: false, reason: "missing_levels_or_price" };
 
   const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
   if (!Number.isFinite(oi15) || oi15 < CFG.shockOi15mPct) return { ok: false, reason: "oi15_not_confirming" };
@@ -438,15 +473,15 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
   const maxRecent = recent.length ? Math.max(...recent) : null;
 
   if (bias === "long") {
-    const breakout = close15m > hi;
+    const breakout = priceNow > hi;
     const sweptDown = minRecent != null && minRecent < lo;
-    const sweepReclaim = sweptDown && close15m > lo;
+    const sweepReclaim = sweptDown && priceNow > lo;
 
     if (breakout) {
       return {
         ok: true,
         reason: "long_breakout",
-        triggerLine: `trigger: current 15m close > ${fmtPrice(hi)} (1h high) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(
+        triggerLine: `trigger: current price > ${fmtPrice(hi)} (1h high) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(
           2
         )}%`,
       };
@@ -457,24 +492,22 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         reason: "long_sweep_reclaim",
         triggerLine: `trigger: sweep < ${fmtPrice(
           lo
-        )} (1h low) AND current 15m close back > ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+        )} (1h low) AND current price back > ${fmtPrice(lo)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
-    return { ok: false, reason: "price_trigger_not_active", detail: { close15m, hi, lo, minRecent } };
+    return { ok: false, reason: "price_trigger_not_active", detail: { priceNow, hi, lo, minRecent } };
   }
 
   if (bias === "short") {
-    const breakdown = close15m < lo;
+    const breakdown = priceNow < lo;
     const sweptUp = maxRecent != null && maxRecent > hi;
-    const sweepReject = sweptUp && close15m < hi;
+    const sweepReject = sweptUp && priceNow < hi;
 
     if (breakdown) {
       return {
         ok: true,
         reason: "short_breakdown",
-        triggerLine: `trigger: current 15m close < ${fmtPrice(
-          lo
-        )} (1h low) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+        triggerLine: `trigger: current price < ${fmtPrice(lo)} (1h low) AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
     if (sweepReject) {
@@ -483,17 +516,17 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         reason: "short_sweep_reject",
         triggerLine: `trigger: sweep > ${fmtPrice(
           hi
-        )} (1h high) AND current 15m close back < ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
+        )} (1h high) AND current price back < ${fmtPrice(hi)} AND 15m OI >= ${CFG.shockOi15mPct.toFixed(2)}%`,
       };
     }
-    return { ok: false, reason: "price_trigger_not_active", detail: { close15m, hi, lo, maxRecent } };
+    return { ok: false, reason: "price_trigger_not_active", detail: { priceNow, hi, lo, maxRecent } };
   }
 
   return { ok: false, reason: "neutral_bias" };
 }
 
 /**
- * SWING/BUILD EXECUTION (v1.3)
+ * ENTRY (SWING/BUILD)
  * - requires price trigger active (beyond 1h level)
  * - OI used as context only (no strict spike), but must not be sharply negative
  */
@@ -516,7 +549,7 @@ function swingExecutionGate({ bias, levels, item }) {
     return {
       ok,
       reason: ok ? "swing_break_above_1h_high" : "swing_not_beyond_1h_high",
-      triggerLine: `trigger: current 15m close > ${fmtPrice(hi)} (1h high)`,
+      triggerLine: `trigger: current price > ${fmtPrice(hi)} (1h high)`,
     };
   }
   if (bias === "short") {
@@ -524,7 +557,7 @@ function swingExecutionGate({ bias, levels, item }) {
     return {
       ok,
       reason: ok ? "swing_break_below_1h_low" : "swing_not_beyond_1h_low",
-      triggerLine: `trigger: current 15m close < ${fmtPrice(lo)} (1h low)`,
+      triggerLine: `trigger: current price < ${fmtPrice(lo)} (1h low)`,
     };
   }
   return { ok: false, reason: "neutral_bias" };
@@ -607,15 +640,24 @@ export default async function handler(req, res) {
       const instId = String(item.instId || "");
       const symbol = String(item.symbol || "?");
 
-      const [lastStateRaw, lastSentRaw] = await Promise.all([
-        redis.get(CFG.keys.last15mState(instId)),
+      // Mode-aware state read:
+      // - Prefer new per-mode key
+      // - For swing/build, fallback to legacy 15m key to preserve continuity
+      const [lastStateModeRaw, lastStateLegacyRaw, lastSentRaw] = await Promise.all([
+        redis.get(CFG.keys.lastState(mode, instId)),
+        mode !== "scalp" ? redis.get(CFG.keys.last15mState(instId)) : Promise.resolve(null),
         redis.get(CFG.keys.lastSentAt(instId)),
       ]);
 
-      const lastState = lastStateRaw ? String(lastStateRaw) : null;
+      const lastState = lastStateModeRaw
+        ? String(lastStateModeRaw)
+        : mode !== "scalp" && lastStateLegacyRaw
+        ? String(lastStateLegacyRaw)
+        : null;
+
       const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
 
-      const { triggers, curState } = evaluateCriteria(item, lastState);
+      const { triggers, curState } = evaluateCriteria(item, lastState, mode);
 
       if (!force && !triggers.length) {
         if (debug) skipped.push({ symbol, reason: "no_triggers" });
@@ -639,7 +681,12 @@ export default async function handler(req, res) {
         bias === "short"
       ) {
         if (debug) skipped.push({ symbol, reason: "macro_block_btc_bull_expansion", btc4h: macro?.btc || null });
-        if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+
+        // write state (unless dry), so setup_flip works next run
+        if (!dry && curState) {
+          await redis.set(CFG.keys.lastState(mode, instId), curState);
+          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState); // legacy mirror
+        }
         continue;
       }
 
@@ -647,7 +694,11 @@ export default async function handler(req, res) {
 
       if (!force && levels?.["1h"]?.warmup) {
         if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
-        if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+
+        if (!dry && curState) {
+          await redis.set(CFG.keys.lastState(mode, instId), curState);
+          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState); // legacy mirror
+        }
         continue;
       }
 
@@ -660,10 +711,13 @@ export default async function handler(req, res) {
 
       if (!force) {
         if (String(mode) === "scalp") {
-          // v1.3: scalp REQUIRES B1 (reco strong)
+          // scalp REQUIRES B1 (reco strong)
           if (!reco.strong) {
             if (debug) skipped.push({ symbol, reason: `weak_reco:${reco.reason}` });
-            if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+
+            if (!dry && curState) {
+              await redis.set(CFG.keys.lastState(mode, instId), curState);
+            }
             continue;
           }
 
@@ -678,15 +732,17 @@ export default async function handler(req, res) {
                 detail: g.detail || null,
               });
             }
-            if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+
+            if (!dry && curState) {
+              await redis.set(CFG.keys.lastState(mode, instId), curState);
+            }
             continue;
           }
 
           triggerLine = g.triggerLine || null;
           execReason = g.reason || null;
         } else {
-          // swing/build: v1.3 requires (B1 OR structural break) AND price trigger active.
-          // Our structural break is the price trigger itself (beyond 1h hi/lo), so we evaluate execution first.
+          // swing/build: requires price trigger active; B1 can be bypassed via structural break
           const g = swingExecutionGate({ bias, levels, item });
           if (!g.ok) {
             if (debug)
@@ -696,12 +752,14 @@ export default async function handler(req, res) {
                 bias,
                 detail: g.detail || null,
               });
-            if (!dry && curState) await redis.set(CFG.keys.last15mState(instId), curState);
+
+            if (!dry && curState) {
+              await redis.set(CFG.keys.lastState(mode, instId), curState);
+              await redis.set(CFG.keys.last15mState(instId), curState); // legacy mirror for swing/build
+            }
             continue;
           }
 
-          // At this point, structural break is true (execution trigger active).
-          // So allow passing even if reco is weak.
           usedStructuralBreak = !reco.strong;
           triggerLine = g.triggerLine || null;
           execReason = g.reason || null;
@@ -722,7 +780,11 @@ export default async function handler(req, res) {
 
       if (!dry) {
         await redis.set(CFG.keys.lastSentAt(instId), String(now));
-        if (curState) await redis.set(CFG.keys.last15mState(instId), curState);
+
+        if (curState) {
+          await redis.set(CFG.keys.lastState(mode, instId), curState);
+          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState); // legacy mirror
+        }
       }
     }
 
@@ -730,7 +792,6 @@ export default async function handler(req, res) {
     const itemErrors = (skipped || []).filter((s) => String(s?.reason || "") === "item_not_ok").length;
     const topSkips = (skipped || []).slice(0, 12).map((s) => ({ symbol: s.symbol, reason: s.reason }));
 
-    // If no triggered (normal case) return quietly but still heartbeat it
     if (!force && !triggered.length) {
       await writeHeartbeat(
         {
@@ -784,7 +845,6 @@ export default async function handler(req, res) {
     lines.push(drillUrl);
 
     const message = lines.join("\n");
-    const renderedMessage = message;
 
     if (!dry) {
       const tg = await sendTelegram(message);
@@ -839,7 +899,7 @@ export default async function handler(req, res) {
             triggered,
             mode,
             risk_profile,
-            renderedMessage,
+            renderedMessage: message,
             heartbeat_last_run,
           }
         : {}),
@@ -847,7 +907,6 @@ export default async function handler(req, res) {
   } catch (e) {
     const now = Date.now();
 
-    // IMPORTANT: respect dry=1 even on exceptions (no writes)
     await writeHeartbeat(
       {
         ts: now,
