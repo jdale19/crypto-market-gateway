@@ -1,10 +1,6 @@
 // /api/snapshot.js
 // OKX PERP (SWAP) ONLY — strict 5m bucket snapshots + 5m deltas + state
-// Batch mode: supports ?symbols=BTCUSDT,ETHUSDT,...
-//
-// Requires env vars:
-// - UPSTASH_REDIS_REST_URL
-// - UPSTASH_REDIS_REST_TOKEN
+// Supports batch mode: ?symbols=BTCUSDT,ETHUSDT,...
 
 import { Redis } from "@upstash/redis";
 
@@ -13,34 +9,26 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-const BUCKET_MS = 5 * 60 * 1000; // 300,000 ms
-const SNAP_TTL_SECONDS = 60 * 60 * 24; // 24h
-
-// OKX instrument discovery cache
-const INST_MAP_TTL_SECONDS = 60 * 60 * 24; // 24h
-const INST_LIST_TTL_SECONDS = 60 * 60 * 12; // 12h
-
+const BUCKET_MS = 5 * 60 * 1000;
+const SNAP_TTL_SECONDS = 60 * 60 * 24;
+const INST_MAP_TTL_SECONDS = 60 * 60 * 24;
+const INST_LIST_TTL_SECONDS = 60 * 60 * 12;
 const FETCH_TIMEOUT_MS = 8000;
 
 function pctChange(now, prev) {
-  if (prev == null || !Number.isFinite(prev) || prev === 0) return null;
-  if (now == null || !Number.isFinite(now)) return null;
+  if (!Number.isFinite(prev) || prev === 0) return null;
+  if (!Number.isFinite(now)) return null;
   return ((now - prev) / prev) * 100;
 }
 
 function safeJsonParse(v) {
-  try {
-    return JSON.parse(v);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(v); } catch { return null; }
 }
 
 function classifyState(priceChgPct, oiChgPct) {
   if (priceChgPct == null || oiChgPct == null) return "unknown";
   const pUp = priceChgPct > 0;
   const oiUp = oiChgPct > 0;
-
   if (pUp && !oiUp) return "shorts closing";
   if (!pUp && !oiUp) return "longs closing";
   if (pUp && oiUp) return "longs opening";
@@ -55,19 +43,15 @@ function baseFromSymbolUSDT(symbol) {
 }
 
 function normalizeSymbolsQuery(req) {
-  // Accept either ?symbols=BTCUSDT,ETHUSDT or ?symbol=BTCUSDT
   const raw =
     (req?.query?.symbols != null ? String(req.query.symbols) : "") ||
     (req?.query?.symbol != null ? String(req.query.symbol) : "") ||
-    "";
+    "ETHUSDT";
 
-  const arr = raw
+  return raw
     .split(",")
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
-
-  // Safety default if caller provided nothing
-  return arr.length ? arr : ["ETHUSDT"];
 }
 
 async function fetchWithTimeout(url) {
@@ -85,7 +69,6 @@ async function getOkxSwapInstrumentListCached(reqCache) {
 
   const cacheKey = `okx:instruments:swap:list:v1`;
   const cached = await redis.get(cacheKey);
-
   if (cached) {
     const list = safeJsonParse(cached);
     if (Array.isArray(list)) {
@@ -94,8 +77,9 @@ async function getOkxSwapInstrumentListCached(reqCache) {
     }
   }
 
-  const url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
-  const r = await fetchWithTimeout(url);
+  const r = await fetchWithTimeout(
+    "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+  );
   if (!r.ok) return null;
 
   const j = await r.json();
@@ -124,8 +108,6 @@ async function resolveOkxSwapInstId(symbol, reqCache) {
   }
 
   const list = await getOkxSwapInstrumentListCached(reqCache);
-
-  // If list fetch fails, fall back to guess (don’t cache it)
   if (!Array.isArray(list)) {
     const guess = `${base}-USDT-SWAP`;
     reqCache.instMap.set(base, guess);
@@ -133,18 +115,9 @@ async function resolveOkxSwapInstId(symbol, reqCache) {
   }
 
   const target = `${base}-USDT-SWAP`.toUpperCase();
+  const exists = list.some((x) => String(x?.instId).toUpperCase() === target);
 
-  // Build request-scope set once
-  if (!reqCache.swapInstSet) {
-    const set = new Set();
-    for (const x of list) {
-      const id = String(x?.instId || "").toUpperCase();
-      if (id) set.add(id);
-    }
-    reqCache.swapInstSet = set;
-  }
-
-  if (reqCache.swapInstSet.has(target)) {
+  if (exists) {
     await redis.set(mapKey, target);
     await redis.expire(mapKey, INST_MAP_TTL_SECONDS);
     reqCache.instMap.set(base, target);
@@ -159,60 +132,41 @@ async function resolveOkxSwapInstId(symbol, reqCache) {
 
 async function fetchOkxSwap(instId) {
   const [tickerRes, fundingRes, oiRes] = await Promise.all([
-    fetchWithTimeout(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
-    fetchWithTimeout(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
-    fetchWithTimeout(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
+    fetchWithTimeout(`https://www.okx.com/api/v5/market/ticker?instId=${instId}`),
+    fetchWithTimeout(`https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`),
+    fetchWithTimeout(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`),
   ]);
 
-  if (!tickerRes.ok) return { ok: false, error: "ticker fetch failed" };
-  if (!fundingRes.ok) return { ok: false, error: "funding fetch failed" };
-  if (!oiRes.ok) return { ok: false, error: "oi fetch failed" };
+  if (!tickerRes.ok || !fundingRes.ok || !oiRes.ok)
+    return { ok: false, error: "okx fetch failed" };
 
-  const tickerJson = await tickerRes.json();
-  const fundingJson = await fundingRes.json();
-  const oiJson = await oiRes.json();
+  const ticker = await tickerRes.json();
+  const funding = await fundingRes.json();
+  const oi = await oiRes.json();
 
-  const price = Number(tickerJson?.data?.[0]?.last);
-  const funding_rate = Number(fundingJson?.data?.[0]?.fundingRate);
-  const open_interest_contracts = Number(oiJson?.data?.[0]?.oi);
+  const price = Number(ticker?.data?.[0]?.last);
+  const funding_rate = Number(funding?.data?.[0]?.fundingRate);
+  const open_interest_contracts = Number(oi?.data?.[0]?.oi);
 
-  if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts)) {
-    return { ok: false, error: "instrument not found or missing data" };
-  }
+  if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts))
+    return { ok: false, error: "instrument missing data" };
 
-  return {
-    ok: true,
-    price,
-    funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
-    open_interest_contracts,
-  };
+  return { ok: true, price, funding_rate, open_interest_contracts };
 }
 
-async function processOneSymbol(symbol, reqCache) {
+async function processOne(symbol, reqCache) {
   const base = baseFromSymbolUSDT(symbol);
-  if (!base) {
-    return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
-  }
+  if (!base) return { ok: false, symbol, error: "bad symbol format" };
 
   const instId = await resolveOkxSwapInstId(symbol, reqCache);
-  if (!instId) {
-    return { ok: false, symbol, instId: `${base}-USDT-SWAP`, error: "no OKX perp market (perps-only mode)" };
-  }
+  if (!instId) return { ok: false, symbol, error: "no perp market" };
 
   const okx = await fetchOkxSwap(instId);
-  if (!okx.ok) return { ok: false, symbol, instId, error: okx.error };
+  if (!okx.ok) return { ok: false, symbol, error: okx.error };
 
   const now = Date.now();
-  const price = okx.price;
-  const funding_rate = okx.funding_rate;
-  const open_interest_contracts = okx.open_interest_contracts;
-
-  const open_interest_usd =
-    Number.isFinite(open_interest_contracts) && Number.isFinite(price)
-      ? open_interest_contracts * price
-      : null;
-
   const bucket = Math.floor(now / BUCKET_MS);
+
   const keyNow = `snap5m:${instId}:${bucket}`;
   const keyPrev = `snap5m:${instId}:${bucket - 1}`;
 
@@ -223,36 +177,42 @@ async function processOneSymbol(symbol, reqCache) {
   const snapPrev = safeJsonParse(snapPrevRaw);
 
   if (!snapNow) {
-    snapNow = { price, funding_rate, open_interest_contracts, ts: now };
+    snapNow = {
+      price: okx.price,
+      funding_rate: okx.funding_rate,
+      open_interest_contracts: okx.open_interest_contracts,
+      ts: now,
+    };
     await redis.set(keyNow, JSON.stringify(snapNow));
     await redis.expire(keyNow, SNAP_TTL_SECONDS);
   }
 
   const price_change_5m_pct = pctChange(snapNow?.price, snapPrev?.price);
-  const oi_change_5m_pct = pctChange(snapNow?.open_interest_contracts, snapPrev?.open_interest_contracts);
+  const oi_change_5m_pct = pctChange(
+    snapNow?.open_interest_contracts,
+    snapPrev?.open_interest_contracts
+  );
 
   const funding_change_5m =
-    Number.isFinite(snapNow?.funding_rate) && Number.isFinite(snapPrev?.funding_rate)
+    Number.isFinite(snapNow?.funding_rate) &&
+    Number.isFinite(snapPrev?.funding_rate)
       ? snapNow.funding_rate - snapPrev.funding_rate
       : null;
-
-  const state = classifyState(price_change_5m_pct, oi_change_5m_pct);
-  const warmup_5m = !(snapNow && snapPrev);
 
   return {
     ok: true,
     symbol,
     instId,
     ts: now,
-    price,
-    funding_rate,
-    open_interest_contracts,
-    open_interest_usd,
+    price: okx.price,
+    funding_rate: okx.funding_rate,
+    open_interest_contracts: okx.open_interest_contracts,
+    open_interest_usd: okx.open_interest_contracts * okx.price,
     price_change_5m_pct,
     oi_change_5m_pct,
     funding_change_5m,
-    state,
-    warmup_5m,
+    state: classifyState(price_change_5m_pct, oi_change_5m_pct),
+    warmup_5m: !(snapNow && snapPrev),
     source: "okx_swap_public_api+upstash_state",
   };
 }
@@ -260,22 +220,16 @@ async function processOneSymbol(symbol, reqCache) {
 export default async function handler(req, res) {
   try {
     const symbols = normalizeSymbolsQuery(req);
+    const reqCache = { swapList: null, instMap: new Map() };
 
-    // request-scope cache
-    const reqCache = { swapList: null, swapInstSet: null, instMap: new Map() };
-
-    const results = await Promise.all(symbols.map((s) => processOneSymbol(s, reqCache)));
+    const results = await Promise.all(
+      symbols.map((s) => processOne(s, reqCache))
+    );
 
     res.setHeader("Cache-Control", "no-store");
 
-    // Preserve old response shape for single-symbol calls
     if (results.length === 1) {
-      const r0 = results[0];
-      return res.status(r0.ok ? 200 : 502).json({
-        ...r0,
-        note:
-          "Strict 5-minute deltas compare current 5m bucket vs previous 5m bucket. warmup_5m=true until previous bucket exists.",
-      });
+      return res.status(results[0].ok ? 200 : 502).json(results[0]);
     }
 
     return res.status(200).json({
@@ -283,13 +237,11 @@ export default async function handler(req, res) {
       ts: Date.now(),
       symbols,
       results,
-      note: "Batch snapshot write. Each symbol writes `snap5m:${instId}:${bucket}` (24h TTL).",
     });
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: "server error",
-      detail: String(err?.message || err),
+      error: String(err?.message || err),
     });
   }
 }
