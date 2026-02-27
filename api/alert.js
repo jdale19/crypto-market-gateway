@@ -332,35 +332,34 @@ function evaluateCriteria(item, lastState, mode) {
   const triggers = [];
 
   // State flip TF:
-  // - scalp: 5m state flips
-  // - swing/build: 15m state flips (legacy behavior)
+  // - scalp: 5m (fast)
+  // - swing/build: 15m (keep, but we can loosen later if you want)
   const stateTf = m === "scalp" ? d5 : d15;
   const curState = String(stateTf?.state || "unknown");
 
   if (lastState && curState !== lastState) triggers.push({ code: "setup_flip" });
 
-  // Momentum confirm (LOOSENED):
-  // All modes: if 5m momentum is large enough, it’s worth evaluating entry.
+  // Momentum confirm (LOOSENED ACROSS ALL MODES):
+  // Old swing/build: required d5.lean === d15.lean
+  // New: momentum is momentum — if 5m move is big enough, review it.
   if ((abs(d5?.price_change_pct) ?? 0) >= CFG.momentumAbs5mPricePct) {
     triggers.push({ code: "momentum_confirm" });
   }
 
-  // Positioning shock (LOOSENED):
-  // - scalp: use 5m (faster)
-  // - swing/build: keep 15m (stable)
-  const shockTf = m === "scalp" ? d5 : d15;
+  // Positioning shock (LOOSENED ACROSS ALL MODES):
+  // - scalp: still 5m (fast)
+  // - swing/build: allow EITHER 5m OR 15m shock to trigger review
+  const shock5 =
+    (d5?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
+    (abs(d5?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
 
-  const oi = asNum(shockTf?.oi_change_pct);
-  const pxAbs = abs(shockTf?.price_change_pct) ?? 0;
+  const shock15 =
+    (d15?.oi_change_pct ?? -Infinity) >= CFG.shockOi15mPct &&
+    (abs(d15?.price_change_pct) ?? 0) >= CFG.shockAbs15mPricePct;
 
-  const oiShock = (oi ?? -Infinity) >= CFG.shockOi15mPct;
-  const pxShock = pxAbs >= CFG.shockAbs15mPricePct;
+  const shockHit = m === "scalp" ? shock5 : (shock5 || shock15);
 
-  // OLD: oiShock && pxShock
-  // NEW: oiShock || pxShock
-  if (oiShock || pxShock) {
-    triggers.push({ code: "positioning_shock", detail: { oiShock, pxShock, oi, pxAbs } });
-  }
+  if (shockHit) triggers.push({ code: "positioning_shock" });
 
   return { triggers, curState };
 }
