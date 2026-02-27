@@ -190,32 +190,31 @@ async function resolveOkxSwapInstId(symbol, { dataSource, counters }) {
 }
 
 // --- Snapshot read (SNAPSHOT MODE only) ---
+// ✅ UPDATED: read the SAME keys written by /api/snapshot.js
+// /api/snapshot.js stores: `snap5m:${instId}:${bucket}`
 async function fetchSnapshotForInstId(instId, symbol, counters) {
-  const key1 = `${CFG.snapshot.keyPrefix}${instId}`;
-  const raw1 = await redis.get(key1);
-  if (raw1) {
-    const j = safeJsonParse(raw1);
+  const now = Date.now();
+  const bucket = Math.floor(now / BUCKET_MS);
+
+  const key = `snap5m:${instId}:${bucket}`;
+  const raw = await redis.get(key);
+
+  if (raw) {
+    const j = safeJsonParse(raw);
     const price = Number(j?.price);
     const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
     const oi = Number(j?.open_interest_contracts);
 
     if (Number.isFinite(price) && Number.isFinite(oi)) {
       counters.snapshot_hits += 1;
-      return { ok: true, price, funding_rate: Number.isFinite(fr) ? fr : null, open_interest_contracts: oi, ts: j?.ts ?? null, key: key1 };
-    }
-  }
-
-  const key2 = `${CFG.snapshot.symbolFallbackPrefix}${String(symbol || "").toUpperCase()}`;
-  const raw2 = await redis.get(key2);
-  if (raw2) {
-    const j = safeJsonParse(raw2);
-    const price = Number(j?.price);
-    const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
-    const oi = Number(j?.open_interest_contracts);
-
-    if (Number.isFinite(price) && Number.isFinite(oi)) {
-      counters.snapshot_hits += 1;
-      return { ok: true, price, funding_rate: Number.isFinite(fr) ? fr : null, open_interest_contracts: oi, ts: j?.ts ?? null, key: key2 };
+      return {
+        ok: true,
+        price,
+        funding_rate: Number.isFinite(fr) ? fr : null,
+        open_interest_contracts: oi,
+        ts: j?.ts ?? null,
+        key,
+      };
     }
   }
 
