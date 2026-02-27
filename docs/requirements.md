@@ -13,197 +13,149 @@ evaluated at the time of the alert run using:
 
 - Structure derived from stored 5m series (1h levels required)
 - Participation (OI) used as confirmation or context (mode-dependent)
-- Mode-aware bias selection (timeframe depends on mode)
+- Mode-aware bias selection
 - BTC macro gate (risk-control filter)
 - Edge filter near structural extremes (B1 / 1h edge rule)
 - Mode-specific entry trigger logic
 - Cooldown + state gating
-- Snapshot-sourced data only (for alerts), for rate-limit safety
+- Snapshot-sourced data only (for alerts)
 
 If entry validity rules are not satisfied now → no DM.
 
-The system does not send “heads up” alerts in automatic mode.
-It sends alerts only when the entry condition is active according to the mode rules.
+The system does not send informational or “heads up” alerts.
+Binary contract: actionable now → DM, otherwise silent.
 
 ------------------------------------------------------------
 1) ARCHITECTURE (FROZEN)
 
-1.1 /api/snapshot — ONLY OKX Caller (data authority)
-Purpose:
-Populate Upstash with bucket-aligned snapshots so downstream endpoints can run
-without hitting OKX.
-
-Responsibilities:
-- Fetch OKX perps data (SWAP only)
-- Resolve instId via cached instrument map
-- Write 5m bucket snapshots:
-  snap5m:{instId}:{bucket}
+1.1 /api/snapshot — ONLY OKX Caller
+- Fetches OKX perps data (SWAP only)
+- Writes 5m bucket snapshots
 - TTL: 24h
+- Safe to run every 5 minutes
+- Must NOT send Telegram
+- Must NOT evaluate alert logic
 
-Must:
-- Be the ONLY endpoint that calls OKX
-- Be safe to run every 5 minutes
+1.2 /api/multi — Snapshot Reader + Derivation
+- Reads snapshot-only data (no OKX calls)
+- Maintains rolling 5m series (series5m:{instId})
+- Derives 5m / 15m / 30m / 1h / 4h deltas
+- Must NOT send Telegram
+- Must NOT evaluate alert criteria
 
-Must NOT:
-- Send Telegram
-- Evaluate alert criteria
-- Write alert state (cooldown/lastSent/lastState)
-
-------------------------------------------------------------
-
-1.2 /api/multi — Snapshot Reader + Derivation Engine (data only)
-Purpose:
-Return a structured multi-symbol view of derived deltas/structure for analysis
-and for /api/alert consumption.
-
-Responsibilities:
-- In snapshot mode: read current values from Upstash snapshots (NO OKX calls)
-- Maintain rolling 5m series:
-  series5m:{instId}  (24h window derived from 5m points)
-- Compute multi-timeframe deltas derived from the stored 5m series:
-  5m, 15m, 30m, 1h, 4h
-- Provide driver_tf output and per-tf deltas
-
-Must NOT:
-- Send Telegram
-- Enforce cooldown
-- Evaluate alert criteria
-- Write alert state
-
-Alert pipeline MUST call:
-  /api/multi?...&source=snapshot
+1.3 /api/alert — ONLY Telegram Sender
+- Authenticates
+- Calls /api/multi in snapshot mode
+- Applies detection gate
+- Applies macro gate
+- Applies warmup gate
+- Applies B1 edge filter
+- Applies mode-specific entry validity
+- Enforces cooldown
+- Writes alert state
+- Writes heartbeat
+- Sends Telegram
 
 ------------------------------------------------------------
+2) SCHEDULING
 
-1.3 /api/alert — ONLY Telegram Sender (state + delivery)
-Purpose:
-Evaluate entry validity and send Telegram DMs only when actionable.
-
-Responsibilities:
-- Authenticate requests
-- Call /api/multi in snapshot mode
-- Apply detection filters (mode-aware)
-- Apply macro risk gate
-- Apply warmup gate (structure availability)
-- Apply edge filter (B1 / 1h edge)
-- Apply mode-specific entry validity rules
-- Enforce cooldown
-- Write alert state
-- Write heartbeat
-- Send Telegram DM
-
-Only this endpoint may send Telegram.
-
-------------------------------------------------------------
-2) SCHEDULING CONTRACT (QStash)
-
-Job A — Snapshot Writer
-URL:
-  /api/snapshot?symbols=...
-Cron:
+Snapshot:
   */5 * * * *
-Goal:
-  Keep snapshot keys fresh for the current 5m bucket.
 
-Job B — Alert Evaluator
-URL:
-  /api/alert?key=...&driver_tf=5m
-Cron:
+Alert:
   1-59/5 * * * *
-Goal:
-  Run alert evaluation shortly after snapshots update.
+
+Alert always consumes snapshot data only.
 
 ------------------------------------------------------------
 4) USER CONFIGURABLE DEFAULTS
 
-Supported query parameters:
+Query params:
 - mode=scalp|swing|build
 - risk_profile=conservative|normal|aggressive
-- driver_tf=5m|15m|30m|1h|4h
+- driver_tf
 - force=1
 - dry=1
 - debug=1
 
 Precedence:
-1) Explicit query param
-2) Env defaults
+1) Query param
+2) Env default
 
-Env defaults:
-- DEFAULT_MODE (current production may override)
+Env:
+- DEFAULT_MODE
 - DEFAULT_RISK_PROFILE=normal
 
 ------------------------------------------------------------
-5) MODE CONTRACT (ALIGNED WITH CODE)
+5) MODE CONTRACT (CURRENT IMPLEMENTATION)
 
-Mode determines:
-- Which lean drives bias
-- Which timeframe drives detection
-- How strict OI confirmation is
-- What constitutes an actionable entry trigger
+Bias source:
+- scalp → 5m lean
+- swing → 1h lean
+- build → 4h lean
 
-BIAS SOURCE (CURRENT IMPLEMENTATION):
-- scalp → bias uses 5m lean
-- swing → bias uses 1h lean
-- build → bias uses 4h lean
+Detection state flip timeframe:
+- scalp → 5m state
+- swing/build → 15m state
 
 ------------------------------------------------------------
 7) STRUCTURE & LEVELS
 
-Required:
-- 1h high / low / mid  (12 × 5m points)
+Derived from stored 5m series.
 
-Warmup gate:
-levels["1h"].warmup must be false for non-force alerts.
+Required:
+- 1h high / low / mid (12 × 5m points)
+
+Warmup:
+levels["1h"].warmup must be false unless force=1.
 
 ------------------------------------------------------------
-9) DETECTION LAYER (MODE-AWARE PRE-FILTER)
+9) DETECTION LAYER (OPENED APERTURE — CURRENT CODE)
 
 Purpose:
-Determine whether a symbol is worth evaluating for entry validity.
+Determine whether a symbol proceeds to full entry evaluation.
 
-9.1 Scalp Detection (5m-native)
-
-A) setup_flip
-- 5m state changed vs stored last state
-
-B) momentum_confirm
-- abs(5m price_change_pct) ≥ ALERT_MOMENTUM_ABS_5M_PRICE_PCT (default 0.10%)
-
-C) positioning_shock
-- 5m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT (default 0.50%)
-- abs(5m price_change_pct) ≥ ALERT_SHOCK_ABS_15M_PRICE_PCT (default 0.20%)
-
-9.2 Swing/Build Detection (15m-based)
+Detection triggers (ANY may fire):
 
 A) setup_flip
-- 15m state changed vs stored last state
+- State changed vs stored lastState
+  - scalp → 5m state
+  - swing/build → 15m state
 
 B) momentum_confirm
-- 5m lean == 15m lean
 - abs(5m price_change_pct) ≥ ALERT_MOMENTUM_ABS_5M_PRICE_PCT
+- No lean alignment requirement
 
 C) positioning_shock
-- 15m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT
-- abs(15m price_change_pct) ≥ ALERT_SHOCK_ABS_15M_PRICE_PCT
+- Triggered if EITHER of the following is true:
+    - 5m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT
+    OR
+    - abs(5m price_change_pct) ≥ ALERT_SHOCK_ABS_15M_PRICE_PCT
+    OR
+    - 15m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT
+    OR
+    - abs(15m price_change_pct) ≥ ALERT_SHOCK_ABS_15M_PRICE_PCT
+
+Shock logic uses OR, not AND.
 
 If no detection triggers fire and force != 1 → symbol skipped.
 
 ------------------------------------------------------------
-11) EDGE FILTER (B1) — 1h STRUCTURAL PROXIMITY
+11) EDGE FILTER (B1)
 
-Edge:
 edge = ALERT_STRONG_EDGE_PCT_1H × (1h high − 1h low)
+
 Default: 0.15
 
-Long valid if:
+Long strong if:
 price ≤ lo + edge
 
-Short valid if:
+Short strong if:
 price ≥ hi − edge
 
-Mode requirements:
-- scalp → REQUIRED
-- swing/build → optional if structural break active
+Mode rules:
+- scalp → B1 required
+- swing/build → may bypass if structural break active
 
 ------------------------------------------------------------
 12) ENTRY VALIDITY RULES
@@ -212,21 +164,21 @@ Mode requirements:
 
 Requirements (non-force):
 
-1) Scalp detection triggers present
+1) Detection triggered
 2) Warmup passed
 3) Macro gate passed
-4) Edge filter strong
+4) B1 edge strong
 5) Entry trigger active:
 
    Long:
-   - current price > 1h high
+   - price > 1h high
      OR
-   - sweep below 1h low AND current price reclaimed above 1h low
+   - sweep below 1h low AND reclaimed above 1h low
 
    Short:
-   - current price < 1h low
+   - price < 1h low
      OR
-   - sweep above 1h high AND current price rejected below 1h high
+   - sweep above 1h high AND rejected below 1h high
 
 6) Strict OI confirmation:
    - 15m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT
@@ -236,19 +188,21 @@ Requirements (non-force):
 
 Requirements:
 
-1) Swing detection triggers present
+1) Detection triggered
 2) Warmup passed
 3) Macro gate passed
 4) Entry trigger active:
    - Long: price > 1h high
    - Short: price < 1h low
-5) OI context:
+5) OI context rule:
    - 15m oi_change_pct ≥ ALERT_SWING_MIN_OI_PCT (default -0.50%)
+
+B1 not required if structural break active.
 
 ------------------------------------------------------------
 13) TELEGRAM DELIVERY
 
-Send DM only if entry validity true for ≥1 symbol after all gates.
+DM only if ≥1 symbol passes full entry validity.
 
 Include:
 - symbol
@@ -261,7 +215,6 @@ Include:
 ------------------------------------------------------------
 15) COOLDOWN
 
-Default:
 ALERT_COOLDOWN_MINUTES = 20
 
 Blocks repeat sends unless force=1.
@@ -270,26 +223,25 @@ Blocks repeat sends unless force=1.
 16) DRY MODE
 
 dry=1:
-- No Telegram send
+- No Telegram
 - No state writes
 - No heartbeat writes
 
 ------------------------------------------------------------
 17) HEARTBEAT
 
-/api/alert writes heartbeat record each run (unless dry=1).
+/api/alert writes heartbeat each run unless dry=1.
 
 ------------------------------------------------------------
 18) SYSTEM INVARIANTS
 
 - Only /api/snapshot calls OKX
-- /api/alert consumes snapshot mode only
-- Binary send contract:
-  Entry valid now → DM
-  Entry not valid now → silent
+- /api/alert uses snapshot-only data
+- Deterministic 5m cadence
+- Binary send contract
 
 ------------------------------------------------------------
-20) CONFIGURABLE ENV VARS (CURRENTLY IMPLEMENTED)
+20) CONFIGURABLE ENV VARS
 
 - ALERT_MOMENTUM_ABS_5M_PRICE_PCT
 - ALERT_SHOCK_OI_15M_PCT
