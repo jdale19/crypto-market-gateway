@@ -255,38 +255,25 @@ async function getRecentPricesFromSeries(instId, n) {
     .filter((x) => x != null);
 }
 
-// v1.3 bias logic (UPDATED: swing prefers 1h lean)
+// v1.3 bias logic (UPDATED: mode intent, NOT snapshot cadence)
+// scalp -> 5m lean (fast)
+// swing -> 1h lean (medium)
+// build -> 4h lean (slow)
+//
+// Drop-in replacement for biasFromItem(item, mode)
 function biasFromItem(item, mode) {
   const m = String(mode || "scalp").toLowerCase();
 
-  // BUILD: anchor to higher timeframe
-  if (m === "build") {
-    const lean =
-      item?.deltas?.["4h"]?.lean ||
-      item?.deltas?.["1h"]?.lean ||
-      item?.deltas?.["15m"]?.lean ||
-      item?.lean ||
-      "neutral";
-    return String(lean).toLowerCase();
-  }
+  const lean5m = String(item?.deltas?.["5m"]?.lean || item?.lean || "neutral").toLowerCase();
+  const lean15m = String(item?.deltas?.["15m"]?.lean || lean5m || "neutral").toLowerCase();
+  const lean1h = String(item?.deltas?.["1h"]?.lean || lean15m || "neutral").toLowerCase();
+  const lean4h = String(item?.deltas?.["4h"]?.lean || lean1h || "neutral").toLowerCase();
 
-  // SWING: prefer 1h lean (fallback 4h -> 15m)
-  if (m === "swing") {
-    const lean =
-      item?.deltas?.["1h"]?.lean ||
-      item?.deltas?.["4h"]?.lean ||
-      item?.deltas?.["15m"]?.lean ||
-      item?.lean ||
-      "neutral";
-    return String(lean).toLowerCase();
-  }
+  if (m === "build") return lean4h;
+  if (m === "swing") return lean1h;
 
-  // SCALP (default): prefer 15m lean
-  const lean =
-    item?.deltas?.["15m"]?.lean ||
-    item?.lean ||
-    "neutral";
-  return String(lean).toLowerCase();
+  // scalp (default)
+  return lean5m;
 }
 
 // B1 edge check (v1.3)
