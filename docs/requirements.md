@@ -1,4 +1,4 @@
-Crypto Market Gateway — Requirements (v2.3)
+Crypto Market Gateway — Requirements (v2.4)
 Last updated: 2026-02-27
 Owner: jdale19
 
@@ -12,12 +12,12 @@ currently actionable under the active user-specified mode and risk profile.
 evaluated at the time of the alert run using:
 
 - Structure derived from stored 5m series (1h levels required)
-- Positioning / participation (OI) as confirmation or context (mode-dependent)
-- Mode-aware bias selection
+- Participation (OI) used as confirmation or context (mode-dependent)
+- Mode-aware bias selection (timeframe depends on mode)
 - BTC macro gate (risk-control filter)
 - Edge filter near structural extremes (B1 / 1h edge rule)
 - Mode-specific entry trigger logic
-- Cooldown and state gating
+- Cooldown + state gating
 - Snapshot-sourced data only (for alerts), for rate-limit safety
 
 If entry validity rules are not satisfied now → no DM.
@@ -29,7 +29,6 @@ It sends alerts only when the entry condition is active according to the mode ru
 1) ARCHITECTURE (FROZEN)
 
 1.1 /api/snapshot — ONLY OKX Caller (data authority)
-
 Purpose:
 Populate Upstash with bucket-aligned snapshots so downstream endpoints can run
 without hitting OKX.
@@ -40,7 +39,6 @@ Responsibilities:
 - Write 5m bucket snapshots:
   snap5m:{instId}:{bucket}
 - TTL: 24h
-- Provide strict 5m bucket deltas (for debugging/inspection)
 
 Must:
 - Be the ONLY endpoint that calls OKX
@@ -54,7 +52,6 @@ Must NOT:
 ------------------------------------------------------------
 
 1.2 /api/multi — Snapshot Reader + Derivation Engine (data only)
-
 Purpose:
 Return a structured multi-symbol view of derived deltas/structure for analysis
 and for /api/alert consumption.
@@ -80,14 +77,13 @@ Alert pipeline MUST call:
 ------------------------------------------------------------
 
 1.3 /api/alert — ONLY Telegram Sender (state + delivery)
-
 Purpose:
 Evaluate entry validity and send Telegram DMs only when actionable.
 
 Responsibilities:
 - Authenticate requests
 - Call /api/multi in snapshot mode
-- Apply detection filters (criteria)
+- Apply detection filters (mode-aware)
 - Apply macro risk gate
 - Apply warmup gate (structure availability)
 - Apply edge filter (B1 / 1h edge)
@@ -101,8 +97,6 @@ Only this endpoint may send Telegram.
 
 ------------------------------------------------------------
 2) SCHEDULING CONTRACT (QStash)
-
-Two independent scheduled jobs:
 
 Job A — Snapshot Writer
 URL:
@@ -129,7 +123,6 @@ Design guarantee:
 3) RATE-LIMIT & DATA SOURCE GUARANTEE
 
 Steady state:
-
 - /api/snapshot  → calls OKX
 - /api/multi     → reads Upstash only (snapshot mode)
 - /api/alert     → reads snapshot mode only
@@ -145,7 +138,7 @@ Supported query parameters:
 - risk_profile=conservative|normal|aggressive
 - driver_tf=5m|15m|30m|1h|4h
 - force=1          (override detection + cooldown; see section 9)
-- dry=1            (no Telegram + no state writes; see section 18)
+- dry=1            (no Telegram + no state writes; see section 16)
 - debug=1          (include debug payloads, heartbeat visibility)
 
 Precedence:
@@ -157,11 +150,12 @@ Env defaults:
 - DEFAULT_RISK_PROFILE=normal
 
 ------------------------------------------------------------
-5) MODE CONTRACT (AS IMPLEMENTED)
+5) MODE CONTRACT (AS INTENDED)
 
-Mode is user-specified and determines:
+Mode determines:
 - Which lean drives bias
-- How strict OI requirements are
+- Which timeframe drives detection (pre-filter)
+- How strict OI is
 - What constitutes an actionable entry trigger
 
 Supported modes:
@@ -169,28 +163,29 @@ Supported modes:
 - swing
 - build
 
-BIAS SOURCE (CURRENT IMPLEMENTATION):
-- scalp → bias uses 15m lean (with 5m used in criteria confirmation)
-- swing → bias uses 4h lean (fallback to 15m lean if needed)
-- build → bias uses 4h lean (fallback to 15m lean if needed)
+BIAS SOURCE (UPDATED SPEC):
+- scalp → bias uses 15m lean (fast intent, but not tick-level)
+- swing → bias uses 1h lean (fallback 4h → 15m)
+- build → bias uses 4h lean (fallback 1h → 15m)
 
-Note on precision:
-These modes are evaluated on a 5-minute scheduler cadence using snapshot-derived data.
-They are designed for “actionable now under cadence,” not tick-level execution.
+PRECISION NOTE:
+Modes are evaluated on a 5-minute cadence using snapshot-derived data.
+“Scalp” here means “structural scalp under cadence,” not 1-minute/tick execution.
 
 ------------------------------------------------------------
 6) RISK PROFILE CONTRACT (CURRENT STATE)
 
-Risk profile is a user-specified label that may adjust thresholds in the future.
+Purpose:
+Allow future threshold tuning without changing endpoint contracts.
 
 Current implementation status:
-- risk_profile is accepted and surfaced in /api/alert debug output
-- risk_profile does not materially change thresholds unless configured via env rules
+- risk_profile accepted and surfaced in /api/alert debug output
+- risk_profile does not change thresholds unless explicitly configured via env rules
 
 Invariants risk_profile never bypasses:
 - Macro gate
 - Warmup gate
-- Entry trigger requirement
+- Entry validity requirement
 - Binary “send vs silent” contract
 
 ------------------------------------------------------------
@@ -224,31 +219,45 @@ Non-force alerts require:
 levels["1h"].warmup == false
 
 ------------------------------------------------------------
-9) DETECTION LAYER (PRE-FILTERS)
+9) DETECTION LAYER (MODE-AWARE PRE-FILTERS)
 
 Purpose:
 Avoid evaluating entry validity on every symbol every run unless there is a setup worth checking.
 
-These are detection triggers (not entry triggers):
+Detection triggers are NOT the same as entry triggers.
+Detection answers: “is it worth checking this symbol right now?”
+Entry validity answers: “is the entry active right now?”
 
-A) setup_flip
-- 15m state changed vs stored last state
+9.1 Scalp Detection (5m-native)
+A) setup_flip_5m
+- 5m state changed vs stored last 5m state
+
+B) momentum_5m
+- abs(5m price_change_pct) ≥ ALERT_SCALP_MOMENTUM_ABS_5M_PRICE_PCT (default 0.10%)
+
+C) positioning_shock_5m
+- 5m oi_change_pct ≥ ALERT_SCALP_SHOCK_OI_5M_PCT (default: configurable)
+- abs(5m price_change_pct) ≥ ALERT_SCALP_SHOCK_ABS_5M_PRICE_PCT (default: configurable)
+
+9.2 Swing/Build Detection (15m-based)
+A) setup_flip_15m
+- 15m state changed vs stored last 15m state
 
 B) momentum_confirm
 - 5m lean == 15m lean
 - abs(5m price_change_pct) ≥ ALERT_MOMENTUM_ABS_5M_PRICE_PCT (default 0.10%)
 
-C) positioning_shock
+C) positioning_shock_15m
 - 15m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT (default 0.50%)
 - abs(15m price_change_pct) ≥ ALERT_SHOCK_ABS_15M_PRICE_PCT (default 0.20%)
 
-D) force=1 (query parameter)
+9.3 force=1 (query parameter)
 - Overrides detection gating and cooldown gating
 - Still respects authentication
 - Still respects dry mode behavior
-- (Macro/warmup behavior remains as implemented; do not assume force bypasses safety gates unless explicitly coded)
+- Macro/warmup behavior remains as implemented unless explicitly coded to bypass
 
-If none of A/B/C are true and force!=1 → symbol is skipped (silent).
+If no detection triggers are true and force!=1 → symbol is skipped (silent).
 
 ------------------------------------------------------------
 10) BTC MACRO GATE (RISK CONTROL)
@@ -262,12 +271,11 @@ BTC is considered in bull expansion if:
 - BTC 4h price_change_pct ≥ ALERT_MACRO_BTC_4H_PRICE_PCT_MIN (default 2.0)
 - BTC 4h oi_change_pct ≥ ALERT_MACRO_BTC_4H_OI_PCT_MIN (default 0.5)
 
-Behavior (as implemented):
+Behavior:
 - If BTC bull expansion is true and ALERT_MACRO_BLOCK_SHORTS_ON_ALTS=1,
   then block SHORT bias alerts on non-BTC symbols.
 
-Note:
-The inverse rule (blocking longs during BTC bear expansion) is not part of the current spec
+Inverse macro behavior (blocking longs during BTC bear expansion) is not part of this spec
 unless explicitly implemented.
 
 ------------------------------------------------------------
@@ -287,30 +295,29 @@ Edge condition:
 - Long edge valid if price ≤ lo + edge
 - Short edge valid if price ≥ hi - edge
 
-Mode requirements (as implemented):
+Mode requirements:
 - scalp: edge filter REQUIRED (reco must be strong)
-- swing/build: edge filter is evaluated but entry may still be valid via structural break logic
+- swing/build: edge filter evaluated but entry may still be valid via structural break logic
 
 “B1” meaning:
-B1 = primary structural edge filter on 1h range.
+Primary structural edge filter on the 1h range.
 
 ------------------------------------------------------------
 12) ENTRY VALIDITY RULES (MODE-SPECIFIC)
 
 Terminology:
-Use “entry validity” or “entry trigger active” instead of “execution.”
+Use “entry validity” or “entry trigger active” (not “execution”).
 
-12.1 SCALP — Strict Entry Validity
-
+12.1 SCALP — Strict Entry Validity (structural scalp under 5m cadence)
 Purpose:
 Only alert when the market is actively breaking structure AND participation confirms.
 
 Requirements (non-force):
-1) Detection triggers present (section 9)
+1) Scalp detection triggers present (section 9.1)
 2) Warmup passed (section 8)
 3) Macro gate passed (section 10)
 4) Edge filter strong (section 11)
-5) Entry trigger active (price-based, approximated using current snapshot price):
+5) Entry trigger active (approximated using current snapshot price):
    Long:
    - current price > 1h high
      OR
@@ -319,21 +326,18 @@ Requirements (non-force):
    - current price < 1h low
      OR
    - sweep above 1h high AND current price rejected back below 1h high
-6) Strict OI confirmation:
-   15m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT (default 0.50%)
+6) Strict OI confirmation (5m-native for scalp):
+   5m oi_change_pct ≥ ALERT_SCALP_STRICT_OI_5M_PCT (default: configurable)
 
-Precision note (be honest):
-Scalp is evaluated on a 5-minute cadence using snapshot data.
-It is not 1-minute/tick scalp. It is “structural scalp under cadence.”
-If you require true 1-minute scalp, architectural changes are required (see checklist).
+Precision note:
+This is 5m-cadence scalp. True 1-minute scalp requires architectural changes.
 
-12.2 SWING — Entry Validity
-
+12.2 SWING — Entry Validity (1h bias)
 Purpose:
 Alert on meaningful structure breaks with less reliance on OI spikes.
 
 Requirements (non-force):
-1) Detection triggers present
+1) Swing detection triggers present (section 9.2)
 2) Warmup passed
 3) Macro gate passed
 4) Entry trigger active:
@@ -341,22 +345,19 @@ Requirements (non-force):
    - Short: current price < 1h low
 5) Edge filter OR structural break:
    - Structural break is the active entry trigger itself (beyond 1h high/low)
-6) OI context:
+6) OI context (not spike):
    - Must not be sharply negative against direction
-   - Codified as: 15m OI change >= ALERT_SWING_MIN_OI_PCT (default -0.50%)
+   - Codified as: 15m oi_change_pct ≥ ALERT_SWING_MIN_OI_PCT (default -0.50%)
 
-12.3 BUILD — Entry Validity
-
+12.3 BUILD — Entry Validity (4h bias)
 Purpose:
-Alert only when there is an actionable structural condition for positioning.
-No informational alerts.
+Alert only when there is an actionable structural condition for positioning. No informational alerts.
 
 Requirements (non-force):
-- Must satisfy detection + warmup + macro
+- Build detection triggers present (section 9.2)
+- Warmup + macro gates pass
 - Must satisfy an actionable structural condition consistent with build intent
 - OI used as context, not spike-dependent
-
-(If build mode logic differs in code, the code is the source of truth; keep doc aligned.)
 
 ------------------------------------------------------------
 13) DELIVERY LAYER — TELEGRAM
@@ -367,8 +368,6 @@ Telegram is the delivery mechanism for validated entry states.
 Rule:
 Send DM only when entry validity is true for at least one symbol
 after applying all gates + cooldown.
-
-Otherwise: silent.
 
 Message must include:
 - symbol, price
@@ -399,7 +398,7 @@ ALERT_COOLDOWN_MINUTES = 20
 
 Behavior:
 - Blocks repeat sends for a symbol within cooldown window
-- Ignored when force=1 (query parameter)
+- Ignored when force=1
 
 ------------------------------------------------------------
 16) DRY MODE
@@ -407,7 +406,7 @@ Behavior:
 Purpose:
 Safe testing without sending messages or mutating alert state.
 
-dry=1 (query parameter):
+dry=1:
 - No Telegram send
 - No alert state writes (cooldown, lastSent, lastState)
 - No heartbeat writes
@@ -450,14 +449,16 @@ State lives in Upstash, not memory.
 1) /api/multi never sends Telegram
 2) /api/alert is the sole Telegram sender
 3) /api/alert calls /api/multi in snapshot mode in production
-4) Scalp requires strict OI confirmation and edge filter
-5) Swing does not require OI spike threshold
-6) No informational/WAIT alerts in automatic mode
-7) Trigger lines include explicit numeric levels
-8) Drilldown scoped to alerted symbols + BTC
-9) Cooldown enforced except when force=1
-10) OKX calls occur only in /api/snapshot
-11) Debug counters can prove data source usage
+4) Scalp detection is 5m-native (no 15m dependency)
+5) Scalp requires strict OI confirmation (5m)
+6) Swing bias uses 1h lean (fallback 4h → 15m)
+7) Swing does not require OI spike threshold
+8) No informational/WAIT alerts in automatic mode
+9) Trigger lines include explicit numeric levels
+10) Drilldown scoped to alerted symbols + BTC
+11) Cooldown enforced except when force=1
+12) OKX calls occur only in /api/snapshot
+13) Debug counters prove data source usage
 
 ------------------------------------------------------------
 20) CONFIGURABILITY
@@ -470,3 +471,9 @@ All thresholds are configurable via env vars, including:
 - ALERT_SWING_MIN_OI_PCT
 - ALERT_MACRO_* thresholds
 - ALERT_COOLDOWN_MINUTES
+
+New (for scalp detection + strict OI):
+- ALERT_SCALP_MOMENTUM_ABS_5M_PRICE_PCT
+- ALERT_SCALP_SHOCK_OI_5M_PCT
+- ALERT_SCALP_SHOCK_ABS_5M_PRICE_PCT
+- ALERT_SCALP_STRICT_OI_5M_PCT
