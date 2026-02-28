@@ -7,7 +7,9 @@
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
 // - SWING/BUILD: "B1 reversal" entry option (bounce/reject near 1h extremes)
 // - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
-// - LEVERAGE RECO: structure-based base leverage + OI/funding adjustments + printed in DM
+// - MESSAGE CONTRACT: include "Entry:" one-liner (trader style)
+// - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
+// - LEVERAGE RECO: advisory only (compact line) + OI/funding adjustments
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -153,7 +155,7 @@ function normalizeRisk(raw) {
   return ["conservative", "normal", "aggressive"].includes(r) ? r : null;
 }
 
-// NEW: multi-mode parsing
+// multi-mode parsing
 function normalizeModes(raw) {
   const allowed = new Set(MODE_PRIORITY);
   return String(raw || "")
@@ -235,6 +237,16 @@ async function sendTelegram(text) {
   const j = await r.json().catch(() => null);
   if (!r.ok || !j?.ok) return { ok: false, detail: j };
   return { ok: true };
+}
+
+// State write helper to satisfy v2.6 seeding rule (mirror legacy for swing/build)
+async function writeLastState(mode, instId, curState, { dry }) {
+  if (dry) return;
+  if (!curState || curState === "unknown") return;
+  try {
+    await redis.set(CFG.keys.lastState(mode, instId), curState);
+    if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState); // legacy mirror
+  } catch {}
 }
 
 async function computeLevelsFromSeries(instId) {
@@ -340,7 +352,8 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
   const price = asNum(entryPrice);
   if (hi == null || lo == null || price == null) return null;
 
-  // Invalidation = opposite 1h extreme (simple structure proxy)
+  // NOTE: this is a STRUCTURE proxy only (advisory) — not your actual invalidation rule.
+  // We use the opposite 1h extreme as a "worst case" structure stop distance.
   const invalidation = bias === "long" ? lo : hi;
   const distancePct = Math.abs((price - invalidation) / price) * 100;
 
@@ -449,7 +462,7 @@ function computeBtcMacro(results) {
 }
 
 /**
- * STRICT ENTRY (SCALP) — unchanged logic, UPDATED COPY
+ * STRICT ENTRY (SCALP) — unchanged logic, UPDATED COPY (message contract ready)
  */
 async function scalpExecutionGate({ instId, item, bias, levels }) {
   const l1h = levels?.["1h"];
@@ -476,18 +489,14 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "long_breakout",
-        triggerLine: `SCALP LONG: broke 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${fmtPct(
-          CFG.shockOi15mPct
-        )}) → momentum entry`,
+        entryLine: `broke above 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
       };
     }
     if (sweepReclaim) {
       return {
         ok: true,
         reason: "long_sweep_reclaim",
-        triggerLine: `SCALP LONG: swept 1h low (${fmtPrice(lo)}) then reclaimed + OI confirms (15m ≥ ${fmtPct(
-          CFG.shockOi15mPct
-        )}) → reversal scalp`,
+        entryLine: `swept 1h low (${fmtPrice(lo)}) then reclaimed + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -502,18 +511,14 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "short_breakdown",
-        triggerLine: `SCALP SHORT: broke 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${fmtPct(
-          CFG.shockOi15mPct
-        )}) → momentum entry`,
+        entryLine: `broke below 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
       };
     }
     if (sweepReject) {
       return {
         ok: true,
         reason: "short_sweep_reject",
-        triggerLine: `SCALP SHORT: swept 1h high (${fmtPrice(hi)}) then rejected + OI confirms (15m ≥ ${fmtPct(
-          CFG.shockOi15mPct
-        )}) → fade scalp`,
+        entryLine: `swept 1h high (${fmtPrice(hi)}) then rejected + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -528,9 +533,7 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
  *  A) BREAK: price beyond 1h high/low
  *  B) REVERSAL: tag B1 band + 5m push away from extreme
  *
- * UPDATED COPY:
- * - No “high zone/low zone” without numbers
- * - Always prints the actual B1 band range (ex: 1.594–1.597)
+ * Returns entryLine (for "Entry:" DM line).
  */
 function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   const l1h = levels?.["1h"];
@@ -567,27 +570,21 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   const lowBandTxt = `${fmtPrice(lowBandLo)}–${fmtPrice(lowBandHi)}`;
   const highBandTxt = `${fmtPrice(highBandLo)}–${fmtPrice(highBandHi)}`;
 
-  // A) Breakout/breakdown
   if (bias === "long") {
     if (p > hi) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_break_above_1h_high`,
-        triggerLine: `${modeLabel} LONG: broke above 1h high (${fmtPrice(hi)}) → continuation setup`,
+        entryLine: `break above 1h high (${fmtPrice(hi)}) → continuation`,
       };
     }
 
-    // B) Reversal
     const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
-
     if (reversalOk) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_long`,
-        triggerLine: `${modeLabel} LONG: tagged B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(
-          CFG.swingReversalMin5mMovePct
-        )}) → bounce setup`,
-        bands: { lowBandTxt, highBandTxt },
+        entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(CFG.swingReversalMin5mMovePct)})`,
       };
     }
 
@@ -599,21 +596,16 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_break_below_1h_low`,
-        triggerLine: `${modeLabel} SHORT: broke below 1h low (${fmtPrice(lo)}) → continuation setup`,
+        entryLine: `break below 1h low (${fmtPrice(lo)}) → continuation`,
       };
     }
 
-    // B) Reversal
     const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
-
     if (reversalOk) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_short`,
-        triggerLine: `${modeLabel} SHORT: tagged B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(
-          CFG.swingReversalMin5mMovePct
-        )}) → rejection setup`,
-        bands: { lowBandTxt, highBandTxt },
+        entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(CFG.swingReversalMin5mMovePct)})`,
       };
     }
 
@@ -628,7 +620,7 @@ export default async function handler(req, res) {
   let debug = false;
   let risk_profile = CFG.defaultRisk;
 
-  // NEW: we will evaluate potentially multiple modes in priority order
+  // evaluate potentially multiple modes in priority order
   let modes = ["scalp"];
 
   try {
@@ -649,18 +641,15 @@ export default async function handler(req, res) {
     dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
-    // --- Modes: query overrides env, env overrides legacy defaultMode ---
+    // Modes: query overrides env, env overrides legacy defaultMode
     const queryModes = normalizeModes(req.query.mode);
     const envModes = normalizeModes(CFG.defaultModesRaw);
-    const legacyMode = normalizeModes(CFG.defaultMode).length ? normalizeModes(CFG.defaultMode) : ["scalp"];
 
-    const baseModes = queryModes.length
-      ? queryModes
-      : envModes.length
-      ? envModes
-      : legacyMode.length
-      ? legacyMode
-      : ["scalp"];
+    // legacy fallback (single value) -> normalize into array if valid
+    const legacyAsList = normalizeModes(CFG.defaultMode);
+    const legacyMode = legacyAsList.length ? legacyAsList : ["scalp"];
+
+    const baseModes = queryModes.length ? queryModes : envModes.length ? envModes : legacyMode.length ? legacyMode : ["scalp"];
     modes = prioritizeModes(baseModes);
 
     risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
@@ -742,16 +731,14 @@ export default async function handler(req, res) {
         if (!force && !triggers.length) {
           if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
 
-          // Seed/refresh lastState even when skipping
-          if (!dry && curState && curState !== "unknown") {
-            await redis.set(CFG.keys.lastState(mode, instId), curState);
-          }
+          // v2.6 seeding rule (incl legacy mirror for swing/build)
+          await writeLastState(mode, instId, curState, { dry });
           continue;
         }
 
         const bias = biasFromItem(item, mode);
 
-        // Macro block (mode-aware)
+        // Macro block
         if (
           !force &&
           CFG.macro.enabled &&
@@ -763,23 +750,21 @@ export default async function handler(req, res) {
         ) {
           if (debug) skipped.push({ symbol, mode, reason: "macro_block_btc_bull_expansion", btc4h: macro?.btc || null });
 
-          if (!dry && curState && curState !== "unknown") {
-            await redis.set(CFG.keys.lastState(mode, instId), curState);
-          }
+          await writeLastState(mode, instId, curState, { dry });
           continue;
         }
 
-        // SCALP requires strong B1 before execution gate
         const b1 = strongRecoB1({ bias, levels, price: item.price });
 
-        let triggerLine = null;
+        let entryLine = null;
         let execReason = null;
 
         if (!force) {
           if (mode === "scalp") {
+            // scalp requires B1 strong
             if (!b1.strong) {
               if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
-              if (!dry && curState && curState !== "unknown") await redis.set(CFG.keys.lastState(mode, instId), curState);
+              await writeLastState(mode, instId, curState, { dry });
               continue;
             }
 
@@ -793,27 +778,26 @@ export default async function handler(req, res) {
                   bias,
                   oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
                 });
-              if (!dry && curState && curState !== "unknown") await redis.set(CFG.keys.lastState(mode, instId), curState);
+              await writeLastState(mode, instId, curState, { dry });
               continue;
             }
 
-            triggerLine = g.triggerLine || null;
+            entryLine = g.entryLine || null;
             execReason = g.reason || null;
           } else {
             const modeLabel = mode === "build" ? "BUILD" : "SWING";
             const g = swingExecutionGate({ bias, levels, item, modeLabel });
             if (!g.ok) {
               if (debug) skipped.push({ symbol, mode, reason: `${mode}_exec:${g.reason}`, bias, detail: g.detail || null });
-              if (!dry && curState && curState !== "unknown") await redis.set(CFG.keys.lastState(mode, instId), curState);
+              await writeLastState(mode, instId, curState, { dry });
               continue;
             }
 
-            triggerLine = g.triggerLine || null;
+            entryLine = g.entryLine || null;
             execReason = g.reason || null;
           }
         }
 
-        // Winner found
         winner = {
           mode,
           symbol,
@@ -822,12 +806,12 @@ export default async function handler(req, res) {
           triggers,
           levels,
           b1,
-          triggerLine,
+          entryLine,
           execReason,
           curState,
         };
 
-        // Attach leverage suggestion (advisory)
+        // Leverage advisory (compact)
         winner.leverage = computeLeverageSuggestion({
           bias: winner.bias,
           entryPrice: winner.price,
@@ -844,9 +828,7 @@ export default async function handler(req, res) {
 
       if (!dry) {
         await redis.set(CFG.keys.lastSentAt(instId), String(now));
-        if (winner.curState && winner.curState !== "unknown") {
-          await redis.set(CFG.keys.lastState(winner.mode, instId), winner.curState);
-        }
+        await writeLastState(winner.mode, instId, winner.curState, { dry });
       }
     }
 
@@ -892,15 +874,20 @@ export default async function handler(req, res) {
         `${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl} | mode=${String(t.mode).toUpperCase()}`
       );
 
-      if (t.triggerLine) lines.push(t.triggerLine);
+      if (t.entryLine) lines.push(`Entry: ${t.entryLine}`);
 
-      // Leverage advisory block (compact)
+      // Leverage advisory (single compact line to keep DM clean)
       if (t.leverage) {
-        lines.push(`Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`);
-        lines.push(`Based on invalidation distance ${fmtPct(t.leverage.distancePct)}`);
-        if (t.leverage.flags?.oiReduced) lines.push(`OI elevated → size reduced`);
-        if (t.leverage.flags?.fundingReduced) lines.push(`Funding stretched → size reduced`);
-      }
+  lines.push(`Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`);
+  lines.push(`Based on invalidation distance ${fmtPct(t.leverage.distancePct)}`);
+
+  if (t.leverage.oi5 > CFG.leverage.oiReduce1 || t.leverage.oi15 > CFG.leverage.oiReduce1) {
+    lines.push(`OI elevated → size reduced`);
+  }
+  if (t.leverage.funding > CFG.leverage.fundingReduce1) {
+    lines.push(`Funding stretched → size reduced`);
+  }
+}
 
       lines.push("");
     }
