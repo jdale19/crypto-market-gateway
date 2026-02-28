@@ -1,9 +1,15 @@
 // /api/alert.js
 // Crypto Market Gateway — mode-aware alerts (scalp strict, swing realistic)
+//
 // CHANGE (minimal rework):
-// - SCALP: unchanged (strict breakout/sweep + strict OI confirmation + B1 required)
+// - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
 // - SWING/BUILD: add "B1 reversal" entry option (bounce/reject near 1h extremes)
-//   so you get real trader-style entries in range/chop days, not only breakout days.
+// - DM COPY: replace engineering-y triggerLine text with trader-readable one-liners (matching library)
+//
+// Notes:
+// - No requirements doc changes here.
+// - No behavior changes to SCALP besides wording.
+// - SWING/BUILD gets one additional entry path (B1 reversal) with micro-confirm (5m move away from extreme).
 
 import { Redis } from "@upstash/redis";
 
@@ -74,7 +80,7 @@ const CFG = {
     expansionOiPctMin: Number(process.env.ALERT_REGIME_EXPANSION_4H_OI_PCT_MIN || 1.0),
 
     contractionAbsPricePctMax: Number(process.env.ALERT_REGIME_CONTRACTION_4H_ABS_PRICE_PCT_MAX || 1.0),
-    contractionOiPctMax: Number(process.env.ALERT_REGIME_CONTRACTION_4H_OI_PCT_MAX || -1.0),
+    contractionOiPctMax: Number(process.env.ALERT_REGIME_CONTRACTION_OI_4H_PCT_MAX || -1.0),
 
     contractionUpgradeEnabled: String(process.env.ALERT_REGIME_CONTRACTION_UPGRADE_ENABLED || "1") === "1",
     contractionUpgradeEdgeMult: Number(process.env.ALERT_REGIME_CONTRACTION_UPGRADE_EDGE_MULT || 1.5),
@@ -345,7 +351,7 @@ function computeBtcMacro(results) {
 }
 
 /**
- * STRICT ENTRY (SCALP) — unchanged
+ * STRICT ENTRY (SCALP) — unchanged logic, UPDATED COPY
  */
 async function scalpExecutionGate({ instId, item, bias, levels }) {
   const l1h = levels?.["1h"];
@@ -372,16 +378,18 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "long_breakout",
-        triggerLine: `Entry: breakout > 1h high (${fmtPrice(hi)}) + OI confirm (15m ≥ ${CFG.shockOi15mPct.toFixed(2)}%)`,
+        triggerLine: `SCALP LONG: broke 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
+          2
+        )}%) → momentum entry`,
       };
     }
     if (sweepReclaim) {
       return {
         ok: true,
         reason: "long_sweep_reclaim",
-        triggerLine: `Entry: sweep below 1h low (${fmtPrice(lo)}) then reclaim + OI confirm (15m ≥ ${CFG.shockOi15mPct.toFixed(
+        triggerLine: `SCALP LONG: swept 1h low (${fmtPrice(lo)}) then reclaimed + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
           2
-        )}%)`,
+        )}%) → reversal scalp`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -396,16 +404,18 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "short_breakdown",
-        triggerLine: `Entry: breakdown < 1h low (${fmtPrice(lo)}) + OI confirm (15m ≥ ${CFG.shockOi15mPct.toFixed(2)}%)`,
+        triggerLine: `SCALP SHORT: broke 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
+          2
+        )}%) → momentum entry`,
       };
     }
     if (sweepReject) {
       return {
         ok: true,
         reason: "short_sweep_reject",
-        triggerLine: `Entry: sweep above 1h high (${fmtPrice(hi)}) then reject + OI confirm (15m ≥ ${CFG.shockOi15mPct.toFixed(
+        triggerLine: `SCALP SHORT: swept 1h high (${fmtPrice(hi)}) then rejected + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
           2
-        )}%)`,
+        )}%) → fade scalp`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -419,6 +429,8 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
  * Two ways to be actionable:
  *  A) BREAK: price beyond 1h high/low (existing behavior)
  *  B) REVERSAL: price at 1h extreme (B1 zone) + small 5m push away from the extreme (NEW)
+ *
+ * UPDATED COPY: trader-readable one-liners
  */
 function swingExecutionGate({ bias, levels, item }) {
   const l1h = levels?.["1h"];
@@ -445,29 +457,26 @@ function swingExecutionGate({ bias, levels, item }) {
   const nearLow = p <= lo + edge;
   const nearHigh = p >= hi - edge;
 
-  // A) Breakout/breakdown (existing)
+  // A) Breakout/breakdown
   if (bias === "long") {
     if (p > hi) {
       return {
         ok: true,
         reason: "swing_break_above_1h_high",
-        triggerLine: `Entry: break above 1h high (${fmtPrice(hi)})`,
+        triggerLine: `SWING LONG: clean break above 1h high (${fmtPrice(hi)}) → trend continuation`,
       };
     }
 
     // B) Reversal (NEW)
-    const reversalOk =
-      nearLow &&
-      Number.isFinite(p5) &&
-      p5 >= CFG.swingReversalMin5mMovePct;
+    const reversalOk = nearLow && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
 
     if (reversalOk) {
       return {
         ok: true,
         reason: "swing_b1_reversal_long",
-        triggerLine: `Entry: bounce at 1h low zone (≤ ${fmtPrice(lo + edge)}) + 5m turn up (≥ ${CFG.swingReversalMin5mMovePct.toFixed(
+        triggerLine: `SWING LONG: tagged 1h low zone (≤ ${fmtPrice(lo + edge)}) + 5m turned up (≥ ${CFG.swingReversalMin5mMovePct.toFixed(
           2
-        )}%)`,
+        )}%) → bounce setup`,
       };
     }
 
@@ -479,23 +488,20 @@ function swingExecutionGate({ bias, levels, item }) {
       return {
         ok: true,
         reason: "swing_break_below_1h_low",
-        triggerLine: `Entry: break below 1h low (${fmtPrice(lo)})`,
+        triggerLine: `SWING SHORT: clean break below 1h low (${fmtPrice(lo)}) → trend continuation`,
       };
     }
 
     // B) Reversal (NEW)
-    const reversalOk =
-      nearHigh &&
-      Number.isFinite(p5) &&
-      p5 <= -CFG.swingReversalMin5mMovePct;
+    const reversalOk = nearHigh && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
 
     if (reversalOk) {
       return {
         ok: true,
         reason: "swing_b1_reversal_short",
-        triggerLine: `Entry: rejection at 1h high zone (≥ ${fmtPrice(hi - edge)}) + 5m turn down (≤ -${CFG.swingReversalMin5mMovePct.toFixed(
+        triggerLine: `SWING SHORT: tagged 1h high zone (≥ ${fmtPrice(hi - edge)}) + 5m turned down (≤ -${CFG.swingReversalMin5mMovePct.toFixed(
           2
-        )}%)`,
+        )}%) → rejection setup`,
       };
     }
 
@@ -661,7 +667,13 @@ export default async function handler(req, res) {
 
           const g = await scalpExecutionGate({ instId, item, bias, levels });
           if (!g.ok) {
-            if (debug) skipped.push({ symbol, reason: `scalp_exec:${g.reason}`, bias, oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null });
+            if (debug)
+              skipped.push({
+                symbol,
+                reason: `scalp_exec:${g.reason}`,
+                bias,
+                oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
+              });
             if (!dry && curState) await redis.set(CFG.keys.lastState(mode, instId), curState);
             continue;
           }
@@ -709,7 +721,17 @@ export default async function handler(req, res) {
 
     if (!force && !triggered.length) {
       await writeHeartbeat(
-        { ts: now, iso: new Date(now).toISOString(), ok: true, mode, risk_profile, sent: false, triggered_count: 0, itemErrors, topSkips },
+        {
+          ts: now,
+          iso: new Date(now).toISOString(),
+          ok: true,
+          mode,
+          risk_profile,
+          sent: false,
+          triggered_count: 0,
+          itemErrors,
+          topSkips,
+        },
         { dry }
       );
 
@@ -730,7 +752,10 @@ export default async function handler(req, res) {
     for (const t of triggered) {
       const l1h = t.levels?.["1h"];
       const lvl = l1h && !l1h.warmup ? ` | 1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)}` : "";
-      lines.push(`${t.symbol} $${fmtPrice(t.price)} | bias=${t.bias}${lvl}`);
+
+      // Cleaner, trader-readable headline (small copy change only)
+      lines.push(`${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl}`);
+
       if (t.triggerLine) lines.push(t.triggerLine);
       lines.push("");
     }
@@ -742,9 +767,9 @@ export default async function handler(req, res) {
       ])
     );
 
-    const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
-      drillSyms.join(",")
-    )}&driver_tf=${encodeURIComponent(driver_tf)}`;
+    const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(drillSyms.join(","))}&driver_tf=${encodeURIComponent(
+      driver_tf
+    )}`;
 
     lines.push(drillUrl);
 
@@ -754,7 +779,19 @@ export default async function handler(req, res) {
       const tg = await sendTelegram(message);
       if (!tg.ok) {
         await writeHeartbeat(
-          { ts: now, iso: new Date(now).toISOString(), ok: false, stage: "telegram_failed", mode, risk_profile, sent: false, triggered_count: triggered.length, itemErrors, topSkips, telegram_error: tg.detail || null },
+          {
+            ts: now,
+            iso: new Date(now).toISOString(),
+            ok: false,
+            stage: "telegram_failed",
+            mode,
+            risk_profile,
+            sent: false,
+            triggered_count: triggered.length,
+            itemErrors,
+            topSkips,
+            telegram_error: tg.detail || null,
+          },
           { dry }
         );
         return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
@@ -762,7 +799,17 @@ export default async function handler(req, res) {
     }
 
     await writeHeartbeat(
-      { ts: now, iso: new Date(now).toISOString(), ok: true, mode, risk_profile, sent: !dry, triggered_count: triggered.length, itemErrors, topSkips },
+      {
+        ts: now,
+        iso: new Date(now).toISOString(),
+        ok: true,
+        mode,
+        risk_profile,
+        sent: !dry,
+        triggered_count: triggered.length,
+        itemErrors,
+        topSkips,
+      },
       { dry }
     );
 
@@ -773,13 +820,33 @@ export default async function handler(req, res) {
       sent: !dry,
       triggered_count: triggered.length,
       ...(debug
-        ? { deploy: getDeployInfo(), multiUrl, macro, skipped, triggered, mode, risk_profile, renderedMessage: message, heartbeat_last_run }
+        ? {
+            deploy: getDeployInfo(),
+            multiUrl,
+            macro,
+            skipped,
+            triggered,
+            mode,
+            risk_profile,
+            renderedMessage: message,
+            heartbeat_last_run,
+          }
         : {}),
     });
   } catch (e) {
     const now = Date.now();
     await writeHeartbeat(
-      { ts: now, iso: new Date(now).toISOString(), ok: false, stage: "handler_exception", mode, risk_profile, sent: false, triggered_count: 0, error: String(e?.message || e) },
+      {
+        ts: now,
+        iso: new Date(now).toISOString(),
+        ok: false,
+        stage: "handler_exception",
+        mode,
+        risk_profile,
+        sent: false,
+        triggered_count: 0,
+        error: String(e?.message || e),
+      },
       { dry }
     );
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
