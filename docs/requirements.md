@@ -1,387 +1,334 @@
-Crypto Market Gateway — Requirements (v2.6)
-Last updated: 2026-02-27
-Owner: jdale19
+Crypto Market Gateway — Requirements (v2.7)
+Source of Truth: Repository Audit
+Date: 2026-02-28
 
 ------------------------------------------------------------
-SYSTEM GOAL (MODE-AWARE, STATE-BASED)
+1) SYSTEM GOAL
 
-The Crypto Market Gateway sends low-noise Telegram DMs only when an entry is
-currently actionable under the active user-specified mode and risk profile.
+The Crypto Market Gateway sends low-noise Telegram DMs
+only when an entry is actionable at the time of evaluation
+under the active mode logic.
 
-“Actionable” is defined by deterministic, mode-specific entry validity rules
-evaluated at the time of the alert run using:
+Binary contract:
 
-- Structure derived from stored 5m series (1h levels required)
-- Participation (OI) used as confirmation or context (mode-dependent)
-- Mode-aware bias selection (timeframe depends on mode)
-- BTC macro gate (risk-control filter)
-- B1 structural proximity (1h “edge” zone)
-- Mode-specific entry trigger logic (breakout/sweep/scalp; break/reversal/swing)
-- Cooldown + state gating
-- Snapshot-sourced data only (for alerts), for rate-limit safety
+• Entry valid now → Send DM
+• Entry not valid → No DM
 
-If entry validity rules are not satisfied now → no DM.
-
-The system does not send “heads up” alerts in automatic mode.
-It sends alerts only when the entry condition is active according to the mode rules.
+No “heads up” alerts.
 
 ------------------------------------------------------------
-1) ARCHITECTURE (FROZEN)
+2) ARCHITECTURE
 
-1.1 /api/snapshot — ONLY OKX Caller (data authority)
-Purpose:
-Populate Upstash with bucket-aligned snapshots so downstream endpoints can run
-without hitting OKX.
+2.1 /api/snapshot — Data Authority
 
-Responsibilities:
-- Fetch OKX perps data (SWAP only)
-- Resolve instId via cached instrument map
-- Write 5m bucket snapshots:
-  snap5m:{instId}:{bucket}
-- TTL: 24h (or equivalent retention)
-
-Must:
-- Be the ONLY endpoint that calls OKX
-- Be safe to run every 5 minutes
+• Only endpoint that calls OKX
+• Writes 5m bucket snapshots:
+    snap5m:{instId}:{bucket}
+• TTL retention applied
+• Safe to run every 5 minutes
 
 Must NOT:
-- Send Telegram
-- Evaluate alert criteria
-- Write alert state (cooldown/lastSent/lastState)
+• Send Telegram
+• Evaluate alert criteria
+• Write alert state
 
 ------------------------------------------------------------
 
-1.2 /api/multi — Snapshot Reader + Derivation Engine (data only)
-Purpose:
-Return a structured multi-symbol view of derived deltas/structure for analysis
-and for /api/alert consumption.
+2.2 /api/multi — Derivation Engine (Snapshot Reader)
 
-Responsibilities:
-- In snapshot mode: read current values from Upstash snapshots (NO OKX calls)
-- Maintain rolling 5m series:
-  series5m:{instId}  (24h window derived from 5m points)
-- Compute multi-timeframe deltas derived from the stored 5m series:
-  5m, 15m, 30m, 1h, 4h
-- Provide driver_tf output and per-tf deltas
-
-Must:
-- Support snapshot-only mode via:
-  ?source=snapshot OR ?snapshot=1 OR env MULTI_DATA_SOURCE=snapshot
-- Update series once per bucket using lastBucket:{instId} gate
-- Derive deltas from the 5m series only (no direct OKX usage in snapshot mode)
+• Must run in snapshot-only mode for alerts
+• Reads snapshot data from Upstash
+• Maintains rolling:
+    series5m:{instId}
+• Computes derived deltas:
+    5m
+    15m
+    30m
+    1h
+    4h
+• Computes 1h levels (hi/lo/mid)
+• Supports driver_tf override
 
 Must NOT:
-- Send Telegram
-- Enforce cooldown
-- Evaluate alert criteria
-- Write alert state (except maintaining series + lastBucket)
-
-Alert pipeline MUST call:
-  /api/multi?...&source=snapshot
+• Send Telegram
+• Enforce cooldown
+• Write alert state
 
 ------------------------------------------------------------
 
-1.3 /api/alert — ONLY Telegram Sender (state + delivery)
-Purpose:
-Evaluate entry validity and send Telegram DMs only when actionable.
+2.3 /api/alert — Alert Engine (Only Telegram Sender)
 
 Responsibilities:
-- Authenticate requests (ALERT_SECRET via bearer or query key)
-- Call /api/multi in snapshot mode
-- Apply detection filters (mode-aware)
-- Apply macro risk gate
-- Apply warmup gate (structure availability)
-- Apply entry validity rules (mode-specific)
-- Enforce cooldown
-- Write alert state (lastSentAt, lastState)
-- Write heartbeat (run visibility)
-- Send Telegram DM
 
-Only this endpoint may send Telegram.
-
-------------------------------------------------------------
-2) SCHEDULING CONTRACT (QStash)
-
-Job A — Snapshot Writer
-URL:
-  /api/snapshot?symbols=...
-Cron:
-  */5 * * * *
-Goal:
-  Keep snapshot keys fresh for the current 5m bucket.
-
-Job B — Alert Evaluator
-URL:
-  /api/alert?key=...&driver_tf=5m
-Cron:
-  1-59/5 * * * *
-Goal:
-  Run alert evaluation shortly after snapshots update.
+• Authenticate via ALERT_SECRET
+• Call /api/multi in snapshot mode
+• Apply detection filters
+• Apply macro gate
+• Apply regime adjustments (if enabled)
+• Apply entry validity rules
+• Enforce cooldown
+• Write:
+    alert:lastSentAt:{instId}
+    alert:lastState:{mode}:{instId}
+    alert:lastState15m:{instId} (legacy mirror)
+• Write heartbeat
+• Send Telegram DM
 
 ------------------------------------------------------------
-4) USER CONFIGURABLE DEFAULTS
+3) SCHEDULING CONTRACT
 
-Supported query parameters:
-- mode=scalp|swing|build
-- risk_profile=conservative|normal|aggressive
-- driver_tf=5m|15m|30m|1h|4h
-- force=1
-- dry=1
-- debug=1
-- symbols=...
+Snapshot Job:
+Cron: */5 * * * *
+Endpoint:
+    /api/snapshot?symbols=...
 
-Precedence:
-1) Explicit query param
-2) Env defaults
+Alert Job:
+Cron: 1-59/5 * * * *
+Endpoint:
+    /api/alert?key=...&driver_tf=5m
 
-Env defaults:
-- DEFAULT_MODE
-- DEFAULT_RISK_PROFILE=normal
+Alert must always call:
+    /api/multi?...&source=snapshot
 
 ------------------------------------------------------------
-5) MODE CONTRACT (ALIGNED WITH CODE)
+4) MODE SYSTEM
 
-Mode determines:
-- Which lean drives bias
-- Which timeframe drives setup_flip detection
-- How strict OI confirmation is
-- What constitutes an actionable entry trigger
+Modes supported:
+• scalp
+• swing
+• build
 
-BIAS SOURCE (CURRENT IMPLEMENTATION):
-- scalp → bias uses 5m lean
-- swing → bias uses 1h lean
-- build → bias uses 4h lean
+Mode priority:
+SCALP > SWING > BUILD
+
+Mode resolution precedence:
+1) query ?mode=
+2) DEFAULT_MODES (comma list)
+3) DEFAULT_MODE
+4) fallback "scalp"
 
 ------------------------------------------------------------
-7) STRUCTURE & LEVELS
+5) BIAS SOURCE BY MODE
 
-Required:
-- 1h high / low / mid  (12 × 5m points)
+scalp → 5m lean
+swing → 1h lean
+build → 4h lean
+
+------------------------------------------------------------
+6) STRUCTURE REQUIREMENT
+
+1h levels required:
+• hi
+• lo
+• mid
 
 Warmup gate:
-levels["1h"].warmup must be false for non-force alerts.
+If 1h levels not ready → no alert (unless force=1)
 
 ------------------------------------------------------------
-9) DETECTION LAYER (MODE-AWARE PRE-FILTER)
+7) DETECTION LAYER (PRE-FILTER)
 
-Purpose:
-Determine whether a symbol is worth evaluating for entry validity on this run.
-This reduces noise and state churn.
-
-If no detection triggers fire AND force != 1 → symbol is skipped.
-
-9.1 Trigger Types
+Triggers:
 
 A) setup_flip
-- State changed vs stored last state
-- Scalp uses 5m state
-- Swing/build uses 15m state
+    State changed vs lastState
 
 B) momentum_confirm
-- abs(5m price_change_pct) ≥ ALERT_MOMENTUM_ABS_5M_PRICE_PCT (default 0.10%)
-- NOTE: lean alignment is NOT required (loosened)
+    abs(5m price_change_pct) >= ALERT_MOMENTUM_ABS_5M_PRICE_PCT
 
 C) positioning_shock
-- Trigger if EITHER OI shock OR price shock (loosened):
-  - OI shock: (5m OR 15m) oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT (default 0.50%)
-  - Price shock: abs(5m OR 15m price_change_pct) ≥ ALERT_SHOCK_ABS_15M_PRICE_PCT (default 0.20%)
+    OI shock OR price shock (5m or 15m)
 
-9.2 State Seeding Rule (IMPORTANT)
-Even when a symbol is skipped due to no detection triggers, /api/alert MUST seed/refresh
-lastState so that a future setup_flip can fire in quiet regimes:
+If no triggers AND force != 1 → skip symbol
 
-- If dry != 1 and curState != "unknown":
-  write lastState for this mode:
-    alert:lastState:{mode}:{instId} = curState
-  and for swing/build also mirror legacy:
-    alert:lastState15m:{instId} = curState
+State seeding:
+Even when skipped, lastState must be updated.
 
 ------------------------------------------------------------
-10) MACRO GATE (BTC RISK FILTER)
+8) MACRO GATE
 
-If enabled, compute BTC “bull expansion” regime using BTC 4h delta:
+If enabled:
 
-btcBullExpansion4h = (
-  BTC 4h lean == "long" AND
-  BTC 4h price_change_pct >= ALERT_MACRO_BTC_4H_PRICE_PCT_MIN (default 2.0) AND
-  BTC 4h oi_change_pct    >= ALERT_MACRO_BTC_4H_OI_PCT_MIN    (default 0.5)
-)
+Compute BTC 4h bull expansion:
 
-If ALERT_MACRO_BLOCK_SHORTS_ON_ALTS=1 AND btcBullExpansion4h=true:
-- Block short signals on non-BTC symbols (unless force=1)
+BTC 4h lean == long
+AND price_change_pct >= ALERT_MACRO_BTC_4H_PRICE_PCT_MIN
+AND oi_change_pct >= ALERT_MACRO_BTC_4H_OI_PCT_MIN
+
+If true AND ALERT_MACRO_BLOCK_SHORTS_ON_ALTS=1:
+Block short signals on alts.
 
 ------------------------------------------------------------
-11) B1 STRUCTURAL PROXIMITY (1h EDGE ZONE)
+9) B1 STRUCTURAL PROXIMITY
 
-Edge:
 edge = ALERT_STRONG_EDGE_PCT_1H × (1h high − 1h low)
-Default: 0.15
 
-B1 zone boundaries:
-- Near Low (B1 long zone): price ≤ lo + edge
-- Near High (B1 short zone): price ≥ hi − edge
+Long B1 zone:
+price ≤ lo + edge
 
-Mode usage:
-- scalp → B1 REQUIRED (must be in the correct B1 zone before entry trigger evaluation)
-- swing/build → B1 is used by REVERSAL entry path (not required for BREAK path)
+Short B1 zone:
+price ≥ hi − edge
 
-------------------------------------------------------------
-12) ENTRY VALIDITY RULES (ACTIONABLE NOW)
-
-12.1 SCALP (STRICT)
-
-Requirements (non-force):
-
-1) Detection triggers present
-2) Warmup passed (1h levels ready)
-3) Macro gate passed (or not applicable)
-4) B1 strong (must be in correct B1 zone)
-5) Entry trigger active (NOW):
-   Long:
-   - current price > 1h high
-     OR
-   - sweep below 1h low AND current price reclaimed above 1h low
-   Short:
-   - current price < 1h low
-     OR
-   - sweep above 1h high AND current price rejected below 1h high
-
-6) Strict OI confirmation (scalp):
-   - 15m oi_change_pct ≥ ALERT_SHOCK_OI_15M_PCT
-
-Notes:
-- Sweep logic is approximated from the stored 5m series lookback points:
-  - use recent min/max from series5m:{instId} over ALERT_SCALP_SWEEP_LOOKBACK_POINTS (default 3)
+Usage:
+scalp → B1 required
+swing/build → required only for reversal path
 
 ------------------------------------------------------------
-12.2 SWING / BUILD (REALISTIC)
+10) ENTRY RULES
 
-Goal:
-Provide “professional trader” entries even on range/chop days.
-Two valid entry paths:
+10.1 SCALP (STRICT)
 
-A) BREAK (existing)
-- Long: current price > 1h high
-- Short: current price < 1h low
+Requires:
 
-B) REVERSAL (NEW)
-- Requires:
-  1) price is in the correct B1 zone (near 1h extreme), AND
-  2) small 5m push away from the extreme (micro-confirm)
+• Detection trigger
+• 1h warmup passed
+• Macro gate passed
+• B1 zone valid
+• Entry trigger active:
+    Long:
+        price > 1h high
+        OR sweep below 1h low and reclaim
+    Short:
+        price < 1h low
+        OR sweep above 1h high and reject
+• Strict OI confirmation:
+    15m oi_change_pct >= ALERT_SHOCK_OI_15M_PCT
 
-Reversal micro-confirm threshold:
-- ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT (default 0.05%)
+------------------------------------------------------------
 
-Long reversal valid if:
-- price ≤ (1h low + edge)
-- AND 5m price_change_pct ≥ ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT
+10.2 SWING / BUILD
 
-Short reversal valid if:
-- price ≥ (1h high − edge)
-- AND 5m price_change_pct ≤ -ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT
+Two paths:
 
-OI context rule (swing/build):
-- 15m oi_change_pct must NOT be sharply negative against direction:
-  - if 15m oi_change_pct < ALERT_SWING_MIN_OI_PCT (default -0.50%) → no entry
+A) BREAK
+    Long: price > 1h high
+    Short: price < 1h low
+
+B) REVERSAL
+    Must be in B1 zone
+    AND 5m move away from extreme >= ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT
+
+OI context rule:
+If 15m oi_change_pct < ALERT_SWING_MIN_OI_PCT → block entry
+
+------------------------------------------------------------
+11) LEVERAGE MODEL (ADVISORY ONLY)
+
+Enabled via ALERT_LEVERAGE_ENABLED.
+
+Per-mode risk budget:
+• ALERT_LEVERAGE_RISK_BUDGET_PCT_SCALP
+• ALERT_LEVERAGE_RISK_BUDGET_PCT_SWING
+• ALERT_LEVERAGE_RISK_BUDGET_PCT_BUILD
+
+Base leverage:
+riskBudgetPct / structureDistancePct
+
+Adjusted down if:
+• OI volatility exceeds thresholds
+• Funding exceeds thresholds
+
+Hard cap:
+ALERT_LEVERAGE_MAX_CAP
+
+This does NOT affect gating.
+It only affects DM text.
+
+------------------------------------------------------------
+12) REGIME ADJUST (OPTIONAL)
+
+If ALERT_REGIME_ENABLED=1:
+
+Expansion regime:
+    Upgrade strength thresholds.
+
+Contraction regime:
+    Allow B1 upgrade multiplier:
+        ALERT_REGIME_CONTRACTION_UPGRADE_EDGE_MULT
+
+Regime does not override entry validity.
+It modifies structural strength behavior only.
 
 ------------------------------------------------------------
 13) COOLDOWN
 
-Default:
-ALERT_COOLDOWN_MINUTES = 20
-
-Blocks repeat sends for a given instId unless force=1.
-
-State key:
-- alert:lastSentAt:{instId}
-
-------------------------------------------------------------
-14) DRY MODE
-
-dry=1:
-- No Telegram send
-- No state writes (lastSentAt / lastState)
-- No heartbeat writes
-
-------------------------------------------------------------
-15) HEARTBEAT (RUN VISIBILITY)
-
-Unless dry=1, /api/alert writes a heartbeat record every run to Upstash so it’s easy
-to prove the scheduler is calling the endpoint even when no alerts are sent.
+ALERT_COOLDOWN_MINUTES
 
 Key:
-- ALERT_HEARTBEAT_KEY (default "alert:lastRun")
+alert:lastSentAt:{instId}
+
+Blocks repeat sends unless force=1.
+
+------------------------------------------------------------
+14) HEARTBEAT
+
+Key:
+ALERT_HEARTBEAT_KEY
 TTL:
-- ALERT_HEARTBEAT_TTL_SECONDS (default 24h)
+ALERT_HEARTBEAT_TTL_SECONDS
 
-Heartbeat includes:
-- ok, mode, risk_profile
-- sent boolean
-- triggered_count
-- itemErrors
-- a small topSkips sample for debugging
-
-When debug=1, response includes heartbeat_last_run.
+Written on every run unless dry=1.
 
 ------------------------------------------------------------
-16) TELEGRAM DELIVERY (MESSAGE CONTRACT)
-
-Send DM only if entry validity is true for ≥1 symbol after all gates.
-
-Message includes:
-- header: “⚡️ OKX perps alert (driver_tf)” + flags ([FORCE], [DRY] when applicable)
-- ISO timestamp
-- for each triggered symbol:
-  - symbol + price
-  - bias
-  - 1h H/L
-  - one-line “Entry:” reason (human readable, trader-style)
-- drilldown link to /api/multi with:
-  - alerted symbols + BTCUSDT
-
-“Matching one-liner” policy:
-- Trigger line must read like a trading call, not engineering telemetry.
-  Examples:
-  - “Entry: bounce at 1h low zone … + 5m turn up …”
-  - “Entry: break above 1h high …”
-
-------------------------------------------------------------
-18) SYSTEM INVARIANTS
-
-- Only /api/snapshot calls OKX
-- /api/alert consumes /api/multi in snapshot mode only
-- Binary send contract:
-  Entry valid now → DM
-  Entry not valid now → silent
-- /api/alert is the only Telegram sender
-
-------------------------------------------------------------
-20) CONFIGURABLE ENV VARS (CURRENTLY IMPLEMENTED)
+15) ENV VARIABLES (FULL LIST FROM CODE)
 
 Core:
-- DEFAULT_MODE
-- DEFAULT_RISK_PROFILE
-- ALERT_COOLDOWN_MINUTES
+UPSTASH_REDIS_REST_URL
+UPSTASH_REDIS_REST_TOKEN
+ALERT_SECRET
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+
+Defaults:
+DEFAULT_SYMBOLS
+DEFAULT_MODE
+DEFAULT_MODES
+DEFAULT_RISK_PROFILE
 
 Detection:
-- ALERT_MOMENTUM_ABS_5M_PRICE_PCT
-- ALERT_SHOCK_OI_15M_PCT
-- ALERT_SHOCK_ABS_15M_PRICE_PCT
+ALERT_MOMENTUM_ABS_5M_PRICE_PCT
+ALERT_SHOCK_OI_15M_PCT
+ALERT_SHOCK_ABS_15M_PRICE_PCT
 
 Structure:
-- ALERT_STRONG_EDGE_PCT_1H
-
-Swing/build:
-- ALERT_SWING_MIN_OI_PCT
-- ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT  (NEW in v2.6)
+ALERT_STRONG_EDGE_PCT_1H
+ALERT_SCALP_SWEEP_LOOKBACK_POINTS
+ALERT_SWING_MIN_OI_PCT
+ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT
 
 Macro:
-- ALERT_MACRO_GATE_ENABLED
-- ALERT_MACRO_BTC_SYMBOL
-- ALERT_MACRO_BTC_4H_PRICE_PCT_MIN
-- ALERT_MACRO_BTC_4H_OI_PCT_MIN
-- ALERT_MACRO_BLOCK_SHORTS_ON_ALTS
+ALERT_MACRO_GATE_ENABLED
+ALERT_MACRO_BTC_SYMBOL
+ALERT_MACRO_BTC_4H_PRICE_PCT_MIN
+ALERT_MACRO_BTC_4H_OI_PCT_MIN
+ALERT_MACRO_BLOCK_SHORTS_ON_ALTS
 
-Heartbeat:
-- ALERT_HEARTBEAT_KEY
-- ALERT_HEARTBEAT_TTL_SECONDS
+Regime:
+ALERT_REGIME_ENABLED
+ALERT_REGIME_EXPANSION_4H_PRICE_PCT_MIN
+ALERT_REGIME_EXPANSION_4H_OI_PCT_MIN
+ALERT_REGIME_CONTRACTION_4H_ABS_PRICE_PCT_MAX
+ALERT_REGIME_CONTRACTION_OI_4H_PCT_MAX
+ALERT_REGIME_CONTRACTION_UPGRADE_ENABLED
+ALERT_REGIME_CONTRACTION_UPGRADE_EDGE_MULT
+
+Leverage:
+ALERT_LEVERAGE_ENABLED
+ALERT_LEVERAGE_RISK_BUDGET_PCT_SCALP
+ALERT_LEVERAGE_RISK_BUDGET_PCT_SWING
+ALERT_LEVERAGE_RISK_BUDGET_PCT_BUILD
+ALERT_LEVERAGE_MAX_CAP
+ALERT_LEVERAGE_OI_REDUCE1
+ALERT_LEVERAGE_OI_REDUCE2
+ALERT_LEVERAGE_FUNDING_REDUCE1
+ALERT_LEVERAGE_FUNDING_REDUCE2
+
+Snapshot/Multi:
+MULTI_DATA_SOURCE
+SNAPSHOT_KEY_PREFIX
+SNAPSHOT_SYMBOL_FALLBACK_PREFIX
+SERIES_TTL_MINUTES
+DEFAULT_TFS
+
+------------------------------------------------------------
+END OF DOCUMENT
