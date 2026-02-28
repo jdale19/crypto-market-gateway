@@ -832,7 +832,6 @@ if (!winner) continue;
 
       if (!dry) {
         await redis.set(CFG.keys.lastSentAt(instId), String(now));
-        await writeLastState(winner.mode, instId, winner.curState, { dry });
       }
     }
 
