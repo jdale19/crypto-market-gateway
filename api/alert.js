@@ -162,7 +162,18 @@ function normalizeSymbols(raw) {
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
 }
+function normalizeMacroTf(raw) {
+  const tf = String(raw || "").toLowerCase();
+  return ["1h", "4h"].includes(tf) ? tf : null;
+}
 
+function macroTfForMode(mode) {
+  const m = String(mode || "scalp").toLowerCase();
+  if (m === "scalp") return normalizeMacroTf(process.env.ALERT_MACRO_TF_SCALP) || "1h";
+  if (m === "swing") return normalizeMacroTf(process.env.ALERT_MACRO_TF_SWING) || "4h";
+  if (m === "build") return normalizeMacroTf(process.env.ALERT_MACRO_TF_BUILD) || "4h";
+  return "4h";
+}
 function normalizeDriverTf(raw) {
   const tf = String(raw || "5m").toLowerCase();
   return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
