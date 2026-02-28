@@ -879,17 +879,19 @@ if (!winner) continue;
 
       if (t.entryLine) lines.push(`Entry: ${t.entryLine}`);
 
-      // Leverage advisory (single compact line to keep DM clean)
       if (t.leverage) {
-  lines.push(`Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`);
-  lines.push(`Based on invalidation distance ${fmtPct(t.leverage.distancePct)}`);
+  lines.push(
+    `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
+  );
+  lines.push(
+    `Based on invalidation distance ${fmtPct(t.leverage.distancePct)}`
+  );
 
-  if (t.leverage.oi5 > CFG.leverage.oiReduce1 || t.leverage.oi15 > CFG.leverage.oiReduce1) {
+  if (t.leverage.flags?.oiReduced)
     lines.push(`OI elevated → size reduced`);
-  }
-  if (t.leverage.funding > CFG.leverage.fundingReduce1) {
+
+  if (t.leverage.flags?.fundingReduced)
     lines.push(`Funding stretched → size reduced`);
-  }
 }
 
       lines.push("");
