@@ -4,7 +4,7 @@
 // CHANGE (minimal rework):
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
 // - SWING/BUILD: add "B1 reversal" entry option (bounce/reject near 1h extremes)
-// - DM COPY: replace engineering-y triggerLine text with trader-readable one-liners (matching library)
+// - DM COPY: replace vague “high zone/low zone” with explicit numeric zone ranges (ex: 1.594–1.597)
 //
 // Notes:
 // - No requirements doc changes here.
@@ -56,9 +56,7 @@ const CFG = {
   // B1 edge (structural proximity)
   strongEdgePct1h: Number(process.env.ALERT_STRONG_EDGE_PCT_1H || 0.15),
 
-  // NEW (swing reversal micro-confirm):
-  // If we are at a 1h extreme, require a small 5m push away from the extreme.
-  // This avoids firing on "catching the knife".
+  // Swing reversal micro-confirm (5m push away from extreme)
   swingReversalMin5mMovePct: Number(process.env.ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT || 0.05),
 
   telegramMaxChars: 3900,
@@ -80,6 +78,7 @@ const CFG = {
     expansionOiPctMin: Number(process.env.ALERT_REGIME_EXPANSION_4H_OI_PCT_MIN || 1.0),
 
     contractionAbsPricePctMax: Number(process.env.ALERT_REGIME_CONTRACTION_4H_ABS_PRICE_PCT_MAX || 1.0),
+    // NOTE: keeping your env name as provided (even if it’s a bit inconsistent)
     contractionOiPctMax: Number(process.env.ALERT_REGIME_CONTRACTION_OI_4H_PCT_MAX || -1.0),
 
     contractionUpgradeEnabled: String(process.env.ALERT_REGIME_CONTRACTION_UPGRADE_ENABLED || "1") === "1",
@@ -91,7 +90,6 @@ const CFG = {
   },
 
   // Swing/build OI context rule
-  // "Must not be sharply negative against direction"
   swing: {
     minOiPct: Number(process.env.ALERT_SWING_MIN_OI_PCT || -0.5),
   },
@@ -141,6 +139,12 @@ const fmtPrice = (x) => {
   if (n >= 1000) return n.toFixed(2);
   if (n >= 1) return n.toFixed(3);
   return n.toFixed(4);
+};
+
+const fmtPct = (x, digits = 2) => {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "n/a";
+  return `${n.toFixed(digits)}%`;
 };
 
 function safeJsonParse(v) {
@@ -378,18 +382,16 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "long_breakout",
-        triggerLine: `SCALP LONG: broke 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
-          2
-        )}%) → momentum entry`,
+        triggerLine: `SCALP LONG: broke 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)}) → momentum entry`,
       };
     }
     if (sweepReclaim) {
       return {
         ok: true,
         reason: "long_sweep_reclaim",
-        triggerLine: `SCALP LONG: swept 1h low (${fmtPrice(lo)}) then reclaimed + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
-          2
-        )}%) → reversal scalp`,
+        triggerLine: `SCALP LONG: swept 1h low (${fmtPrice(lo)}) then reclaimed + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )}) → reversal scalp`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -404,18 +406,16 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "short_breakdown",
-        triggerLine: `SCALP SHORT: broke 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
-          2
-        )}%) → momentum entry`,
+        triggerLine: `SCALP SHORT: broke 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)}) → momentum entry`,
       };
     }
     if (sweepReject) {
       return {
         ok: true,
         reason: "short_sweep_reject",
-        triggerLine: `SCALP SHORT: swept 1h high (${fmtPrice(hi)}) then rejected + OI confirms (15m ≥ ${CFG.shockOi15mPct.toFixed(
-          2
-        )}%) → fade scalp`,
+        triggerLine: `SCALP SHORT: swept 1h high (${fmtPrice(hi)}) then rejected + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )}) → fade scalp`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -427,10 +427,12 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
 /**
  * SWING/BUILD ENTRY
  * Two ways to be actionable:
- *  A) BREAK: price beyond 1h high/low (existing behavior)
- *  B) REVERSAL: price at 1h extreme (B1 zone) + small 5m push away from the extreme (NEW)
+ *  A) BREAK: price beyond 1h high/low
+ *  B) REVERSAL: tag B1 band + 5m push away from extreme
  *
- * UPDATED COPY: trader-readable one-liners
+ * UPDATED COPY:
+ * - No “high zone/low zone” without numbers
+ * - Always prints the actual B1 band range (ex: 1.594–1.597)
  */
 function swingExecutionGate({ bias, levels, item }) {
   const l1h = levels?.["1h"];
@@ -449,13 +451,23 @@ function swingExecutionGate({ bias, levels, item }) {
   const d5 = item?.deltas?.["5m"];
   const p5 = asNum(d5?.price_change_pct);
 
-  // Build the B1 band using the same edge math
   const range = hi - lo;
   if (!(range > 0)) return { ok: false, reason: "bad_range" };
+
   const edge = CFG.strongEdgePct1h * range;
 
-  const nearLow = p <= lo + edge;
-  const nearHigh = p >= hi - edge;
+  // Explicit band boundaries
+  const lowBandLo = lo;
+  const lowBandHi = lo + edge;
+
+  const highBandLo = hi - edge;
+  const highBandHi = hi;
+
+  const inLowBand = p <= lowBandHi;
+  const inHighBand = p >= highBandLo;
+
+  const lowBandTxt = `${fmtPrice(lowBandLo)}–${fmtPrice(lowBandHi)}`;
+  const highBandTxt = `${fmtPrice(highBandLo)}–${fmtPrice(highBandHi)}`;
 
   // A) Breakout/breakdown
   if (bias === "long") {
@@ -463,24 +475,24 @@ function swingExecutionGate({ bias, levels, item }) {
       return {
         ok: true,
         reason: "swing_break_above_1h_high",
-        triggerLine: `SWING LONG: clean break above 1h high (${fmtPrice(hi)}) → trend continuation`,
+        triggerLine: `SWING LONG: broke above 1h high (${fmtPrice(hi)}) → continuation setup`,
       };
     }
 
     // B) Reversal (NEW)
-    const reversalOk = nearLow && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
+    const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
 
     if (reversalOk) {
       return {
         ok: true,
         reason: "swing_b1_reversal_long",
-        triggerLine: `SWING LONG: tagged 1h low zone (≤ ${fmtPrice(lo + edge)}) + 5m turned up (≥ ${CFG.swingReversalMin5mMovePct.toFixed(
-          2
-        )}%) → bounce setup`,
+        triggerLine: `SWING LONG: tagged B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(
+          CFG.swingReversalMin5mMovePct
+        )}) → bounce setup`,
       };
     }
 
-    return { ok: false, reason: "swing_no_entry_trigger", detail: { p, hi, lo, nearLow, p5 } };
+    return { ok: false, reason: "swing_no_entry_trigger", detail: { p, hi, lo, inLowBand, p5 } };
   }
 
   if (bias === "short") {
@@ -488,24 +500,24 @@ function swingExecutionGate({ bias, levels, item }) {
       return {
         ok: true,
         reason: "swing_break_below_1h_low",
-        triggerLine: `SWING SHORT: clean break below 1h low (${fmtPrice(lo)}) → trend continuation`,
+        triggerLine: `SWING SHORT: broke below 1h low (${fmtPrice(lo)}) → continuation setup`,
       };
     }
 
     // B) Reversal (NEW)
-    const reversalOk = nearHigh && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
+    const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
 
     if (reversalOk) {
       return {
         ok: true,
         reason: "swing_b1_reversal_short",
-        triggerLine: `SWING SHORT: tagged 1h high zone (≥ ${fmtPrice(hi - edge)}) + 5m turned down (≤ -${CFG.swingReversalMin5mMovePct.toFixed(
-          2
-        )}%) → rejection setup`,
+        triggerLine: `SWING SHORT: tagged B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(
+          CFG.swingReversalMin5mMovePct
+        )}) → rejection setup`,
       };
     }
 
-    return { ok: false, reason: "swing_no_entry_trigger", detail: { p, hi, lo, nearHigh, p5 } };
+    return { ok: false, reason: "swing_no_entry_trigger", detail: { p, hi, lo, inHighBand, p5 } };
   }
 
   return { ok: false, reason: "neutral_bias" };
@@ -683,7 +695,13 @@ export default async function handler(req, res) {
         } else {
           const g = swingExecutionGate({ bias, levels, item });
           if (!g.ok) {
-            if (debug) skipped.push({ symbol, reason: `${String(mode)}_exec:${g.reason}`, bias, detail: g.detail || null });
+            if (debug)
+              skipped.push({
+                symbol,
+                reason: `${String(mode)}_exec:${g.reason}`,
+                bias,
+                detail: g.detail || null,
+              });
             if (!dry && curState) {
               await redis.set(CFG.keys.lastState(mode, instId), curState);
               await redis.set(CFG.keys.last15mState(instId), curState);
@@ -753,7 +771,7 @@ export default async function handler(req, res) {
       const l1h = t.levels?.["1h"];
       const lvl = l1h && !l1h.warmup ? ` | 1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)}` : "";
 
-      // Cleaner, trader-readable headline (small copy change only)
+      // Cleaner, trader-readable headline
       lines.push(`${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl}`);
 
       if (t.triggerLine) lines.push(t.triggerLine);
@@ -767,9 +785,9 @@ export default async function handler(req, res) {
       ])
     );
 
-    const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(drillSyms.join(","))}&driver_tf=${encodeURIComponent(
-      driver_tf
-    )}`;
+    const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
+      drillSyms.join(",")
+    )}&driver_tf=${encodeURIComponent(driver_tf)}`;
 
     lines.push(drillUrl);
 
