@@ -183,20 +183,6 @@ function normalizeModes(raw) {
     .filter((m) => allowed.has(m));
 }
 
-function parseModeMults(raw) {
-  const out = { scalp: 1, swing: 1, build: 1 }; // defaults
-  String(raw || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .forEach((pair) => {
-      const [k, v] = pair.split(":").map((x) => x.trim().toLowerCase());
-      const n = Number(v);
-      if (k in out && Number.isFinite(n) && n > 0) out[k] = n;
-    });
-  return out;
-}
-
 function prioritizeModes(modes) {
   const set = new Set(modes);
   return MODE_PRIORITY.filter((m) => set.has(m));
@@ -442,6 +428,77 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item, mode }) {
 }
 
 /**
+ * CONFIDENCE ENGINE (rule-based, mechanical)
+ *
+ * A:
+ *  - B1 zone strong
+ *  - 5m reversal confirmed
+ *  - 15m OI aligned (we interpret this mechanically as 15m "lean" aligned)
+ *  - 1h lean aligned
+ *
+ * B:
+ *  - B1 zone strong
+ *  - 5m reversal confirmed
+ *  - OI neutral
+ *
+ * C:
+ *  - Breakout-only entry
+ *  - Weak OI
+ *  - Counter 1h lean
+ *
+ * No subjective scoring.
+ * No string-parsing vibes.
+ * Only execReason + ctx fields.
+ */
+function computeConfidence(t) {
+  const bias = String(t?.bias || "").toLowerCase(); // "long" | "short"
+  const b1Strong = !!t?.b1?.strong;
+
+  const execReason = String(t?.execReason || "").toLowerCase();
+
+  // 5m reversal confirmed = reversal path (not break path)
+  const reversalConfirmed = execReason.includes("b1_reversal");
+
+  // breakout-only = break path
+  const breakoutOnly =
+    execReason.includes("break_above") ||
+    execReason.includes("break_below") ||
+    execReason.includes("breakout") ||
+    execReason.includes("breakdown");
+
+  // 15m OI aligned (mechanical proxy) = 15m lean matches bias
+  const lean15m = String(t?.ctx?.lean15m || "").toLowerCase();
+  const oiAligned = lean15m === bias;
+
+  // OI neutral = 15m lean is neutral/unknown OR abs OI small vs shock threshold
+  const oi15 = asNum(t?.ctx?.oi15);
+  const oiNeutral =
+    lean15m === "neutral" ||
+    lean15m === "" ||
+    (Number.isFinite(oi15) && Math.abs(oi15) < CFG.shockOi15mPct);
+
+  // weak OI = not aligned and not neutral
+  const oiWeak = !oiAligned && !oiNeutral;
+
+  // 1h lean aligned = 1h lean matches bias
+  const lean1h = String(t?.ctx?.lean1h || "").toLowerCase();
+  const oneHourAligned = lean1h === bias;
+  const counter1hLean = lean1h && lean1h !== "neutral" && !oneHourAligned;
+
+  // A: B1 strong + reversalConfirmed + oiAligned + 1h aligned
+  if (b1Strong && reversalConfirmed && oiAligned && oneHourAligned) return "A";
+
+  // B: B1 strong + reversalConfirmed + oiNeutral
+  if (b1Strong && reversalConfirmed && oiNeutral) return "B";
+
+  // C: only breakout trigger OR weak OI OR counter 1h lean
+  if (breakoutOnly || oiWeak || counter1hLean) return "C";
+
+  // conservative fallback
+  return "C";
+}
+
+/**
  * DETECTION (mode-aware; loosened)
  */
 function evaluateCriteria(item, lastState, mode) {
@@ -602,7 +659,11 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
 
   const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
   if (Number.isFinite(oi15) && oi15 < CFG.swing.minOiPct) {
-    return { ok: false, reason: "oi15_too_negative_for_swing", detail: { oi15, min: CFG.swing.minOiPct } };
+    return {
+      ok: false,
+      reason: "oi15_too_negative_for_swing",
+      detail: { oi15, min: CFG.swing.minOiPct },
+    };
   }
 
   const d5 = item?.deltas?.["5m"];
@@ -752,7 +813,9 @@ export default async function handler(req, res) {
         },
         { dry }
       );
-      return res.status(500).json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
+      return res
+        .status(500)
+        .json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
     }
 
     const macro = computeBtcMacro(j.results || []);
@@ -765,7 +828,12 @@ export default async function handler(req, res) {
 
     for (const item of j.results || []) {
       if (!item?.ok) {
-        if (debug) skipped.push({ symbol: item?.symbol || "?", reason: "item_not_ok", detail: item?.error || null });
+        if (debug)
+          skipped.push({
+            symbol: item?.symbol || "?",
+            reason: "item_not_ok",
+            detail: item?.error || null,
+          });
         continue;
       }
 
@@ -886,6 +954,13 @@ export default async function handler(req, res) {
           entryLine,
           execReason,
           curState,
+
+          // Confidence context (mechanical inputs)
+          ctx: {
+            oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
+            lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
+            lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
+          },
         };
 
         winner.leverage = computeLeverageSuggestion({
@@ -909,7 +984,11 @@ export default async function handler(req, res) {
     }
 
     const itemErrors = (skipped || []).filter((s) => String(s?.reason || "") === "item_not_ok").length;
-    const topSkips = (skipped || []).slice(0, 12).map((s) => ({ symbol: s.symbol, mode: s.mode, reason: s.reason }));
+    const topSkips = (skipped || []).slice(0, 12).map((s) => ({
+      symbol: s.symbol,
+      mode: s.mode,
+      reason: s.reason,
+    }));
 
     if (!force && !triggered.length) {
       await writeHeartbeat(
@@ -932,71 +1011,82 @@ export default async function handler(req, res) {
       return res.json({
         ok: true,
         sent: false,
-        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, modes, risk_profile, heartbeat_last_run } : {}),
+        ...(debug
+          ? { deploy: getDeployInfo(), multiUrl, macro, skipped, modes, risk_profile, heartbeat_last_run }
+          : {}),
       });
     }
 
+    // ---- Render DM ----
     const lines = [];
-lines.push("⚡️ PERP TRADE ENTRY");
-lines.push("");
+    lines.push("⚡️ PERP TRADE ENTRY");
+    lines.push("");
 
-for (const t of triggered) {
-  const l1h = t.levels?.["1h"];
+    for (const t of triggered) {
+      const l1h = t.levels?.["1h"];
+      const hi = l1h && !l1h.warmup ? asNum(l1h.hi) : null;
+      const lo = l1h && !l1h.warmup ? asNum(l1h.lo) : null;
+      const mid = hi != null && lo != null ? (hi + lo) / 2 : null;
 
-  const hi = l1h && !l1h.warmup ? Number(l1h.hi) : null;
-  const lo = l1h && !l1h.warmup ? Number(l1h.lo) : null;
-  const mid = hi != null && lo != null ? (hi + lo) / 2 : null;
+      const price = asNum(t.price);
+      const biasUp = String(t.bias).toUpperCase();
 
-  const price = Number(t.price);
-  const bias = String(t.bias).toUpperCase();
+      const confidence = computeConfidence(t);
 
-  lines.push(`${t.symbol} $${fmtPrice(price)} | ${bias}`);
-  lines.push(`Confidence: B`);
-  lines.push("");
+      lines.push(`${t.symbol} $${fmtPrice(price)} | ${biasUp}`);
+      lines.push(`Confidence: ${confidence}`);
 
-  // Entry Zone (use B1 band derived from 1h range + strongEdgePct1h)
-  if (hi != null && lo != null) {
-    const range = hi - lo;
-    const edge = CFG.strongEdgePct1h * range;
+      // Message contract: include Entry: one-liner (if available)
+      if (t.entryLine) {
+        lines.push(`Entry: ${biasUp} — ${t.entryLine}`);
+      }
+      lines.push("");
 
-    if (bias === "LONG") {
-      lines.push(`Entry Zone: ${fmtPrice(lo)}–${fmtPrice(lo + edge)}`);
-    } else if (bias === "SHORT") {
-      lines.push(`Entry Zone: ${fmtPrice(hi - edge)}–${fmtPrice(hi)}`);
+      // Entry Zone = B1 band based on 1h range + strongEdgePct1h
+      if (hi != null && lo != null) {
+        const range = hi - lo;
+        const edge = CFG.strongEdgePct1h * range;
+
+        if (String(t.bias).toLowerCase() === "long") {
+          lines.push(`Entry Zone: ${fmtPrice(lo)}–${fmtPrice(lo + edge)}`);
+        } else if (String(t.bias).toLowerCase() === "short") {
+          lines.push(`Entry Zone: ${fmtPrice(hi - edge)}–${fmtPrice(hi)}`);
+        }
+      }
+
+      // Avoid chasing = 0.25% buffer from current price (mechanical)
+      if (price != null) {
+        const chaseBuffer = price * 0.0025;
+        if (String(t.bias).toLowerCase() === "long") {
+          lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
+        } else {
+          lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
+        }
+      }
+
+      if (t.leverage) {
+        lines.push(
+          `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
+        );
+      }
+
+      lines.push("");
+
+      // Stop Loss = opposite 1h extreme (structure proxy)
+      if (hi != null && lo != null) {
+        const stop = String(t.bias).toLowerCase() === "long" ? lo : hi;
+        lines.push(`Stop Loss: ${fmtPrice(stop)}`);
+      }
+
+      if (hi != null && lo != null) {
+        lines.push("Take Profit:");
+        if (mid != null) lines.push(`• ${fmtPrice(mid)} (range mid)`);
+        if (String(t.bias).toLowerCase() === "long") lines.push(`• ${fmtPrice(hi)} (1h high)`);
+        else lines.push(`• ${fmtPrice(lo)} (1h low)`);
+      }
+
+      lines.push("");
     }
-  }
-
-  // Avoid chasing (simple 0.25% buffer)
-  const chaseBuffer = price * 0.0025;
-  if (bias === "LONG") {
-    lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
-  } else {
-    lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
-  }
-
-  if (t.leverage) {
-    lines.push(
-      `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
-    );
-  }
-
-  lines.push("");
-
-  // Stop Loss = opposite 1h extreme (structure proxy)
-  if (hi != null && lo != null) {
-    const stop = bias === "LONG" ? lo : hi;
-    lines.push(`Stop Loss: ${fmtPrice(stop)}`);
-  }
-
-  if (hi != null && lo != null) {
-    lines.push(`Take Profit:`);
-    if (mid != null) lines.push(`• ${fmtPrice(mid)} (range mid)`);
-    if (bias === "LONG") lines.push(`• ${fmtPrice(hi)} (1h high)`);
-    else lines.push(`• ${fmtPrice(lo)} (1h low)`);
-  }
-
-  lines.push("");
-}
 
     const drillSyms = Array.from(
       new Set([
