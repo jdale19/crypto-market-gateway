@@ -2,14 +2,15 @@
 // Crypto Market Gateway — mode-aware alerts (scalp strict, swing realistic)
 //
 // CHANGE (minimal rework):
+// - MULTI MODE SELECTION: support mode=scalp,swing,build and DEFAULT_MODES env var
+// - PRIORITY: faster mode always wins (SCALP > SWING > BUILD)
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
-// - SWING/BUILD: add "B1 reversal" entry option (bounce/reject near 1h extremes)
-// - DM COPY: replace vague “high zone/low zone” with explicit numeric zone ranges (ex: 1.594–1.597)
+// - SWING/BUILD: "B1 reversal" entry option (bounce/reject near 1h extremes)
+// - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
 //
 // Notes:
-// - No requirements doc changes here.
-// - No behavior changes to SCALP besides wording.
-// - SWING/BUILD gets one additional entry path (B1 reversal) with micro-confirm (5m move away from extreme).
+// - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
+// - Default modes now use DEFAULT_MODES env var (comma list). DEFAULT_MODE is still honored as fallback.
 
 import { Redis } from "@upstash/redis";
 
@@ -17,6 +18,9 @@ const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
+
+// Faster always wins
+const MODE_PRIORITY = ["scalp", "swing", "build"]; // fastest -> slowest
 
 function getDeployInfo() {
   return {
@@ -39,7 +43,10 @@ const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
 
   // Defaults
-  defaultMode: String(process.env.DEFAULT_MODE || "scalp").toLowerCase(),
+  // NEW: DEFAULT_MODES="scalp,swing" (comma list)
+  // Fallbacks: DEFAULT_MODE then "scalp"
+  defaultModesRaw: String(process.env.DEFAULT_MODES || "").toLowerCase(),
+  defaultMode: String(process.env.DEFAULT_MODE || "scalp").toLowerCase(), // legacy fallback
   defaultRisk: String(process.env.DEFAULT_RISK_PROFILE || "normal").toLowerCase(),
 
   // Detection thresholds
@@ -102,7 +109,7 @@ const CFG = {
 
   keys: {
     lastState: (mode, id) => `alert:lastState:${String(mode || "unknown")}:${id}`,
-    last15mState: (id) => `alert:lastState15m:${id}`,
+    last15mState: (id) => `alert:lastState15m:${id}`, // legacy
     lastSentAt: (id) => `alert:lastSentAt:${id}`,
     series5m: (id) => `series5m:${id}`,
   },
@@ -120,14 +127,24 @@ function normalizeDriverTf(raw) {
   return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
 }
 
-function normalizeMode(raw) {
-  const m = String(raw || "").toLowerCase();
-  return ["scalp", "swing", "build"].includes(m) ? m : null;
-}
-
 function normalizeRisk(raw) {
   const r = String(raw || "").toLowerCase();
   return ["conservative", "normal", "aggressive"].includes(r) ? r : null;
+}
+
+// NEW: multi-mode parsing
+function normalizeModes(raw) {
+  const allowed = new Set(MODE_PRIORITY);
+  return String(raw || "")
+    .toLowerCase()
+    .split(",")
+    .map((m) => m.trim())
+    .filter((m) => allowed.has(m));
+}
+
+function prioritizeModes(modes) {
+  const set = new Set(modes);
+  return MODE_PRIORITY.filter((m) => set.has(m));
 }
 
 const asNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
@@ -382,7 +399,9 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "long_breakout",
-        triggerLine: `SCALP LONG: broke 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)}) → momentum entry`,
+        triggerLine: `SCALP LONG: broke 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )}) → momentum entry`,
       };
     }
     if (sweepReclaim) {
@@ -406,7 +425,9 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "short_breakdown",
-        triggerLine: `SCALP SHORT: broke 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)}) → momentum entry`,
+        triggerLine: `SCALP SHORT: broke 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )}) → momentum entry`,
       };
     }
     if (sweepReject) {
@@ -434,7 +455,7 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
  * - No “high zone/low zone” without numbers
  * - Always prints the actual B1 band range (ex: 1.594–1.597)
  */
-function swingExecutionGate({ bias, levels, item }) {
+function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { ok: false, reason: "1h_warmup" };
 
@@ -474,50 +495,52 @@ function swingExecutionGate({ bias, levels, item }) {
     if (p > hi) {
       return {
         ok: true,
-        reason: "swing_break_above_1h_high",
-        triggerLine: `SWING LONG: broke above 1h high (${fmtPrice(hi)}) → continuation setup`,
+        reason: `${modeLabel.toLowerCase()}_break_above_1h_high`,
+        triggerLine: `${modeLabel} LONG: broke above 1h high (${fmtPrice(hi)}) → continuation setup`,
       };
     }
 
-    // B) Reversal (NEW)
+    // B) Reversal
     const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
 
     if (reversalOk) {
       return {
         ok: true,
-        reason: "swing_b1_reversal_long",
-        triggerLine: `SWING LONG: tagged B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(
+        reason: `${modeLabel.toLowerCase()}_b1_reversal_long`,
+        triggerLine: `${modeLabel} LONG: tagged B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(
           CFG.swingReversalMin5mMovePct
         )}) → bounce setup`,
+        bands: { lowBandTxt, highBandTxt },
       };
     }
 
-    return { ok: false, reason: "swing_no_entry_trigger", detail: { p, hi, lo, inLowBand, p5 } };
+    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inLowBand, p5 } };
   }
 
   if (bias === "short") {
     if (p < lo) {
       return {
         ok: true,
-        reason: "swing_break_below_1h_low",
-        triggerLine: `SWING SHORT: broke below 1h low (${fmtPrice(lo)}) → continuation setup`,
+        reason: `${modeLabel.toLowerCase()}_break_below_1h_low`,
+        triggerLine: `${modeLabel} SHORT: broke below 1h low (${fmtPrice(lo)}) → continuation setup`,
       };
     }
 
-    // B) Reversal (NEW)
+    // B) Reversal
     const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
 
     if (reversalOk) {
       return {
         ok: true,
-        reason: "swing_b1_reversal_short",
-        triggerLine: `SWING SHORT: tagged B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(
+        reason: `${modeLabel.toLowerCase()}_b1_reversal_short`,
+        triggerLine: `${modeLabel} SHORT: tagged B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(
           CFG.swingReversalMin5mMovePct
         )}) → rejection setup`,
+        bands: { lowBandTxt, highBandTxt },
       };
     }
 
-    return { ok: false, reason: "swing_no_entry_trigger", detail: { p, hi, lo, inHighBand, p5 } };
+    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inHighBand, p5 } };
   }
 
   return { ok: false, reason: "neutral_bias" };
@@ -526,8 +549,10 @@ function swingExecutionGate({ bias, levels, item }) {
 export default async function handler(req, res) {
   let dry = false;
   let debug = false;
-  let mode = CFG.defaultMode;
   let risk_profile = CFG.defaultRisk;
+
+  // NEW: we will evaluate potentially multiple modes in priority order
+  let modes = ["scalp"];
 
   try {
     const secret = process.env.ALERT_SECRET || "";
@@ -547,7 +572,14 @@ export default async function handler(req, res) {
     dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
-    mode = normalizeMode(req.query.mode) || CFG.defaultMode;
+    // --- Modes: query overrides env, env overrides legacy defaultMode ---
+    const queryModes = normalizeModes(req.query.mode);
+    const envModes = normalizeModes(CFG.defaultModesRaw);
+    const legacyMode = normalizeModes(CFG.defaultMode).length ? normalizeModes(CFG.defaultMode) : ["scalp"];
+
+    const baseModes = queryModes.length ? queryModes : envModes.length ? envModes : legacyMode.length ? legacyMode : ["scalp"];
+    modes = prioritizeModes(baseModes);
+
     risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
 
     const querySyms = normalizeSymbols(req.query.symbols);
@@ -571,7 +603,7 @@ export default async function handler(req, res) {
           iso: new Date(nowFail).toISOString(),
           ok: false,
           stage: "multi_fetch_failed",
-          mode,
+          modes,
           risk_profile,
           sent: false,
           triggered_count: 0,
@@ -599,55 +631,12 @@ export default async function handler(req, res) {
       const instId = String(item.instId || "");
       const symbol = String(item.symbol || "?");
 
-      const [lastStateModeRaw, lastStateLegacyRaw, lastSentRaw] = await Promise.all([
-        redis.get(CFG.keys.lastState(mode, instId)),
-        mode !== "scalp" ? redis.get(CFG.keys.last15mState(instId)) : Promise.resolve(null),
-        redis.get(CFG.keys.lastSentAt(instId)),
-      ]);
-
-      const lastState = lastStateModeRaw
-        ? String(lastStateModeRaw)
-        : mode !== "scalp" && lastStateLegacyRaw
-        ? String(lastStateLegacyRaw)
-        : null;
-
+      // cooldown is per-instId (shared across modes) so you don't spam
+      const lastSentRaw = await redis.get(CFG.keys.lastSentAt(instId));
       const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
-
-      const { triggers, curState } = evaluateCriteria(item, lastState, mode);
-
-      if (!force && !triggers.length) {
-        if (debug) skipped.push({ symbol, reason: "no_triggers" });
-
-        // Seed/refresh lastState even when skipping
-        if (!dry && curState && curState !== "unknown") {
-          await redis.set(CFG.keys.lastState(mode, instId), curState);
-          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState);
-        }
-        continue;
-      }
 
       if (!force && Number.isFinite(lastSent) && lastSent != null && now - lastSent < cooldownMs) {
         if (debug) skipped.push({ symbol, reason: "cooldown" });
-        continue;
-      }
-
-      const bias = biasFromItem(item, mode);
-
-      if (
-        !force &&
-        CFG.macro.enabled &&
-        CFG.macro.blockShortsOnAltsWhenBtcBull &&
-        macro?.ok &&
-        macro?.btcBullExpansion4h &&
-        symbol.toUpperCase() !== CFG.macro.btcSymbol &&
-        bias === "short"
-      ) {
-        if (debug) skipped.push({ symbol, reason: "macro_block_btc_bull_expansion", btc4h: macro?.btc || null });
-
-        if (!dry && curState) {
-          await redis.set(CFG.keys.lastState(mode, instId), curState);
-          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState);
-        }
         continue;
       }
 
@@ -655,87 +644,122 @@ export default async function handler(req, res) {
 
       if (!force && levels?.["1h"]?.warmup) {
         if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
-
-        if (!dry && curState) {
-          await redis.set(CFG.keys.lastState(mode, instId), curState);
-          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState);
-        }
         continue;
       }
 
-      // B1 evaluation (scalp requires it; swing uses it via reversal trigger)
-      const b1 = strongRecoB1({ bias, levels, price: item.price });
+      // Evaluate modes in priority order; first mode that passes wins.
+      let winner = null;
 
-      let triggerLine = null;
-      let execReason = null;
+      for (const mode of modes) {
+        const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
+        const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
 
-      if (!force) {
-        if (String(mode) === "scalp") {
-          if (!b1.strong) {
-            if (debug) skipped.push({ symbol, reason: `weak_reco:${b1.reason}` });
-            if (!dry && curState) await redis.set(CFG.keys.lastState(mode, instId), curState);
-            continue;
+        const { triggers, curState } = evaluateCriteria(item, lastState, mode);
+
+        if (!force && !triggers.length) {
+          if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
+
+          // Seed/refresh lastState even when skipping
+          if (!dry && curState && curState !== "unknown") {
+            await redis.set(CFG.keys.lastState(mode, instId), curState);
           }
-
-          const g = await scalpExecutionGate({ instId, item, bias, levels });
-          if (!g.ok) {
-            if (debug)
-              skipped.push({
-                symbol,
-                reason: `scalp_exec:${g.reason}`,
-                bias,
-                oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
-              });
-            if (!dry && curState) await redis.set(CFG.keys.lastState(mode, instId), curState);
-            continue;
-          }
-
-          triggerLine = g.triggerLine || null;
-          execReason = g.reason || null;
-        } else {
-          const g = swingExecutionGate({ bias, levels, item });
-          if (!g.ok) {
-            if (debug)
-              skipped.push({
-                symbol,
-                reason: `${String(mode)}_exec:${g.reason}`,
-                bias,
-                detail: g.detail || null,
-              });
-            if (!dry && curState) {
-              await redis.set(CFG.keys.lastState(mode, instId), curState);
-              await redis.set(CFG.keys.last15mState(instId), curState);
-            }
-            continue;
-          }
-
-          triggerLine = g.triggerLine || null;
-          execReason = g.reason || null;
+          continue;
         }
+
+        const bias = biasFromItem(item, mode);
+
+        // Macro block (mode-aware)
+        if (
+          !force &&
+          CFG.macro.enabled &&
+          CFG.macro.blockShortsOnAltsWhenBtcBull &&
+          macro?.ok &&
+          macro?.btcBullExpansion4h &&
+          symbol.toUpperCase() !== CFG.macro.btcSymbol &&
+          bias === "short"
+        ) {
+          if (debug) skipped.push({ symbol, mode, reason: "macro_block_btc_bull_expansion", btc4h: macro?.btc || null });
+
+          if (!dry && curState && curState !== "unknown") {
+            await redis.set(CFG.keys.lastState(mode, instId), curState);
+          }
+          continue;
+        }
+
+        // SCALP requires strong B1 before execution gate
+        const b1 = strongRecoB1({ bias, levels, price: item.price });
+
+        let triggerLine = null;
+        let execReason = null;
+
+        if (!force) {
+          if (mode === "scalp") {
+            if (!b1.strong) {
+              if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
+              if (!dry && curState && curState !== "unknown") await redis.set(CFG.keys.lastState(mode, instId), curState);
+              continue;
+            }
+
+            const g = await scalpExecutionGate({ instId, item, bias, levels });
+            if (!g.ok) {
+              if (debug)
+                skipped.push({
+                  symbol,
+                  mode,
+                  reason: `scalp_exec:${g.reason}`,
+                  bias,
+                  oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
+                });
+              if (!dry && curState && curState !== "unknown") await redis.set(CFG.keys.lastState(mode, instId), curState);
+              continue;
+            }
+
+            triggerLine = g.triggerLine || null;
+            execReason = g.reason || null;
+          } else {
+            const modeLabel = mode === "build" ? "BUILD" : "SWING";
+            const g = swingExecutionGate({ bias, levels, item, modeLabel });
+            if (!g.ok) {
+              if (debug) skipped.push({ symbol, mode, reason: `${mode}_exec:${g.reason}`, bias, detail: g.detail || null });
+              if (!dry && curState && curState !== "unknown") await redis.set(CFG.keys.lastState(mode, instId), curState);
+              continue;
+            }
+
+            triggerLine = g.triggerLine || null;
+            execReason = g.reason || null;
+          }
+        }
+
+        // Winner found
+        winner = {
+          mode,
+          symbol,
+          price: item.price,
+          bias,
+          triggers,
+          levels,
+          b1,
+          triggerLine,
+          execReason,
+          curState,
+        };
+        break;
       }
 
-      triggered.push({
-        symbol,
-        price: item.price,
-        bias,
-        triggers,
-        levels,
-        b1,
-        triggerLine,
-        execReason,
-      });
+      if (!winner) continue;
+
+      triggered.push(winner);
 
       if (!dry) {
         await redis.set(CFG.keys.lastSentAt(instId), String(now));
-        if (curState) {
-          await redis.set(CFG.keys.lastState(mode, instId), curState);
-          if (mode !== "scalp") await redis.set(CFG.keys.last15mState(instId), curState);
+        if (winner.curState && winner.curState !== "unknown") {
+          await redis.set(CFG.keys.lastState(winner.mode, instId), winner.curState);
         }
       }
     }
 
     const itemErrors = (skipped || []).filter((s) => String(s?.reason || "") === "item_not_ok").length;
-    const topSkips = (skipped || []).slice(0, 12).map((s) => ({ symbol: s.symbol, reason: s.reason }));
+    const topSkips = (skipped || []).slice(0, 12).map((s) => ({ symbol: s.symbol, mode: s.mode, reason: s.reason }));
 
     if (!force && !triggered.length) {
       await writeHeartbeat(
@@ -743,7 +767,7 @@ export default async function handler(req, res) {
           ts: now,
           iso: new Date(now).toISOString(),
           ok: true,
-          mode,
+          modes,
           risk_profile,
           sent: false,
           triggered_count: 0,
@@ -758,7 +782,7 @@ export default async function handler(req, res) {
       return res.json({
         ok: true,
         sent: false,
-        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, mode, risk_profile, heartbeat_last_run } : {}),
+        ...(debug ? { deploy: getDeployInfo(), multiUrl, macro, skipped, modes, risk_profile, heartbeat_last_run } : {}),
       });
     }
 
@@ -771,8 +795,8 @@ export default async function handler(req, res) {
       const l1h = t.levels?.["1h"];
       const lvl = l1h && !l1h.warmup ? ` | 1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)}` : "";
 
-      // Cleaner, trader-readable headline
-      lines.push(`${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl}`);
+      // Headline: include winner mode too
+      lines.push(`${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl} | mode=${String(t.mode).toUpperCase()}`);
 
       if (t.triggerLine) lines.push(t.triggerLine);
       lines.push("");
@@ -802,7 +826,7 @@ export default async function handler(req, res) {
             iso: new Date(now).toISOString(),
             ok: false,
             stage: "telegram_failed",
-            mode,
+            modes,
             risk_profile,
             sent: false,
             triggered_count: triggered.length,
@@ -821,7 +845,7 @@ export default async function handler(req, res) {
         ts: now,
         iso: new Date(now).toISOString(),
         ok: true,
-        mode,
+        modes,
         risk_profile,
         sent: !dry,
         triggered_count: triggered.length,
@@ -844,7 +868,7 @@ export default async function handler(req, res) {
             macro,
             skipped,
             triggered,
-            mode,
+            modes,
             risk_profile,
             renderedMessage: message,
             heartbeat_last_run,
@@ -859,7 +883,7 @@ export default async function handler(req, res) {
         iso: new Date(now).toISOString(),
         ok: false,
         stage: "handler_exception",
-        mode,
+        modes,
         risk_profile,
         sent: false,
         triggered_count: 0,
