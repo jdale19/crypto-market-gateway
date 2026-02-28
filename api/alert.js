@@ -107,7 +107,6 @@ const CFG = {
 
   // --- Leverage Model (advisory copy only) ---
   leverage: {
-    enabled: String(process.env.ALERT_LEVERAGE_ENABLED || "1") === "1",
 
     // % of account willing to risk if invalidated (structure-based sizing proxy)
     riskBudgetPct: Number(process.env.ALERT_RISK_BUDGET_PCT || 1.0),
@@ -164,7 +163,19 @@ function normalizeModes(raw) {
     .map((m) => m.trim())
     .filter((m) => allowed.has(m));
 }
-
+function parseModeMults(raw) {
+  const out = { scalp: 1, swing: 1, build: 1 }; // defaults
+  String(raw || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .forEach((pair) => {
+      const [k, v] = pair.split(":").map((x) => x.trim().toLowerCase());
+      const n = Number(v);
+      if (k in out && Number.isFinite(n) && n > 0) out[k] = n;
+    });
+  return out;
+}
 function prioritizeModes(modes) {
   const set = new Set(modes);
   return MODE_PRIORITY.filter((m) => set.has(m));
@@ -342,7 +353,6 @@ function strongRecoB1({ bias, levels, price }) {
 // Base = floor(riskBudgetPct / distance_to_invalidation_pct)
 // Then reduce if OI is jumpy or funding is stretched.
 function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
-  if (!CFG.leverage.enabled) return null;
 
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return null;
@@ -359,7 +369,7 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
 
   if (!Number.isFinite(distancePct) || distancePct <= 0) return null;
 
-  const baseMax = Math.floor(CFG.leverage.riskBudgetPct / distancePct);
+  const baseMax = Math.floor(Math.max(0, CFG.leverage.riskBudgetPct) / Math.max(0.01, distancePct));
 
   // OI adjustment (use abs, because instability is instability)
   const oi5 = Math.abs(asNum(item?.deltas?.["5m"]?.oi_change_pct) ?? 0);
