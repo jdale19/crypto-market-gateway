@@ -107,9 +107,28 @@ const CFG = {
 
   // --- Leverage Model (advisory copy only) ---
   leverage: {
+    // master switch (optional)
+    enabled: String(process.env.ALERT_LEVERAGE_ENABLED || "1") === "1",
 
-    // % of account willing to risk if invalidated (structure-based sizing proxy)
-    riskBudgetPct: Number(process.env.ALERT_RISK_BUDGET_PCT || 1.0),
+    // MODE-AWARE risk budget (% of account) used for the STRUCTURE proxy sizing calc
+    // Legacy fallback: ALERT_RISK_BUDGET_PCT if you don’t set per-mode vars.
+    riskBudgetPctByMode: {
+      scalp: Number(
+        process.env.ALERT_LEVERAGE_RISK_BUDGET_PCT_SCALP ||
+          process.env.ALERT_RISK_BUDGET_PCT ||
+          0.5
+      ),
+      swing: Number(
+        process.env.ALERT_LEVERAGE_RISK_BUDGET_PCT_SWING ||
+          process.env.ALERT_RISK_BUDGET_PCT ||
+          1.0
+      ),
+      build: Number(
+        process.env.ALERT_LEVERAGE_RISK_BUDGET_PCT_BUILD ||
+          process.env.ALERT_RISK_BUDGET_PCT ||
+          1.5
+      ),
+    },
 
     // Hard cap so we don’t suggest insanity
     maxCap: Number(process.env.ALERT_LEVERAGE_MAX_CAP || 15),
@@ -163,6 +182,7 @@ function normalizeModes(raw) {
     .map((m) => m.trim())
     .filter((m) => allowed.has(m));
 }
+
 function parseModeMults(raw) {
   const out = { scalp: 1, swing: 1, build: 1 }; // defaults
   String(raw || "")
@@ -176,6 +196,7 @@ function parseModeMults(raw) {
     });
   return out;
 }
+
 function prioritizeModes(modes) {
   const set = new Set(modes);
   return MODE_PRIORITY.filter((m) => set.has(m));
@@ -233,7 +254,8 @@ async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  if (!token || !chatId) return { ok: false, detail: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
+  if (!token || !chatId)
+    return { ok: false, detail: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
 
   const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -352,7 +374,14 @@ function strongRecoB1({ bias, levels, price }) {
 // --- Leverage suggestion (advisory) ---
 // Base = floor(riskBudgetPct / distance_to_invalidation_pct)
 // Then reduce if OI is jumpy or funding is stretched.
-function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
+function computeLeverageSuggestion({ bias, entryPrice, levels, item, mode }) {
+  if (!CFG.leverage?.enabled) return null;
+
+  const m = String(mode || "scalp").toLowerCase();
+  const riskBudgetPct =
+    CFG.leverage?.riskBudgetPctByMode?.[m] ??
+    CFG.leverage?.riskBudgetPctByMode?.scalp ??
+    Number(process.env.ALERT_RISK_BUDGET_PCT || 1.0);
 
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return null;
@@ -369,7 +398,9 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
 
   if (!Number.isFinite(distancePct) || distancePct <= 0) return null;
 
-  const baseMax = Math.floor(Math.max(0, CFG.leverage.riskBudgetPct) / Math.max(0.01, distancePct));
+  const baseMax = Math.floor(
+    Math.max(0, Number(riskBudgetPct) || 0) / Math.max(0.01, distancePct)
+  );
 
   // OI adjustment (use abs, because instability is instability)
   const oi5 = Math.abs(asNum(item?.deltas?.["5m"]?.oi_change_pct) ?? 0);
@@ -386,7 +417,10 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
   if (funding > CFG.leverage.fundingReduce2) fMult = 0.6;
   else if (funding > CFG.leverage.fundingReduce1) fMult = 0.8;
 
-  const adjustedMax = Math.max(1, Math.min(Math.floor(baseMax * oiMult * fMult), CFG.leverage.maxCap));
+  const adjustedMax = Math.max(
+    1,
+    Math.min(Math.floor(baseMax * oiMult * fMult), CFG.leverage.maxCap)
+  );
   const suggestedLow = Math.max(1, Math.floor(adjustedMax * 0.5));
   const suggestedHigh = adjustedMax;
 
@@ -398,6 +432,8 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
     oi5,
     oi15,
     funding,
+    riskBudgetPct,
+    mode: m,
     flags: {
       oiReduced: oiMult < 1,
       fundingReduced: fMult < 1,
@@ -481,10 +517,12 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
   const hi = asNum(l1h.hi);
   const lo = asNum(l1h.lo);
   const priceNow = asNum(item?.price);
-  if (hi == null || lo == null || priceNow == null) return { ok: false, reason: "missing_levels_or_price" };
+  if (hi == null || lo == null || priceNow == null)
+    return { ok: false, reason: "missing_levels_or_price" };
 
   const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
-  if (!Number.isFinite(oi15) || oi15 < CFG.shockOi15mPct) return { ok: false, reason: "oi15_not_confirming" };
+  if (!Number.isFinite(oi15) || oi15 < CFG.shockOi15mPct)
+    return { ok: false, reason: "oi15_not_confirming" };
 
   const recent = await getRecentPricesFromSeries(instId, CFG.scalp.sweepLookbackPoints);
   const minRecent = recent.length ? Math.min(...recent) : null;
@@ -499,14 +537,18 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "long_breakout",
-        entryLine: `broke above 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
+        entryLine: `broke above 1h high (${fmtPrice(hi)}) + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )})`,
       };
     }
     if (sweepReclaim) {
       return {
         ok: true,
         reason: "long_sweep_reclaim",
-        entryLine: `swept 1h low (${fmtPrice(lo)}) then reclaimed + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
+        entryLine: `swept 1h low (${fmtPrice(lo)}) then reclaimed + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )})`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -521,14 +563,18 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
       return {
         ok: true,
         reason: "short_breakdown",
-        entryLine: `broke below 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
+        entryLine: `broke below 1h low (${fmtPrice(lo)}) + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )})`,
       };
     }
     if (sweepReject) {
       return {
         ok: true,
         reason: "short_sweep_reject",
-        entryLine: `swept 1h high (${fmtPrice(hi)}) then rejected + OI confirms (15m ≥ ${fmtPct(CFG.shockOi15mPct)})`,
+        entryLine: `swept 1h high (${fmtPrice(hi)}) then rejected + OI confirms (15m ≥ ${fmtPct(
+          CFG.shockOi15mPct
+        )})`,
       };
     }
     return { ok: false, reason: "price_trigger_not_active" };
@@ -594,7 +640,9 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_long`,
-        entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(CFG.swingReversalMin5mMovePct)})`,
+        entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(
+          CFG.swingReversalMin5mMovePct
+        )})`,
       };
     }
 
@@ -615,7 +663,9 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_short`,
-        entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(CFG.swingReversalMin5mMovePct)})`,
+        entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(
+          CFG.swingReversalMin5mMovePct
+        )})`,
       };
     }
 
@@ -637,7 +687,9 @@ export default async function handler(req, res) {
     const secret = process.env.ALERT_SECRET || "";
 
     const authHeader = String(req.headers.authorization || "");
-    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
+    const bearer = authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice(7).trim()
+      : "";
 
     const key = String(req.query.key || "");
     const provided = bearer || key;
@@ -659,7 +711,14 @@ export default async function handler(req, res) {
     const legacyAsList = normalizeModes(CFG.defaultMode);
     const legacyMode = legacyAsList.length ? legacyAsList : ["scalp"];
 
-    const baseModes = queryModes.length ? queryModes : envModes.length ? envModes : legacyMode.length ? legacyMode : ["scalp"];
+    const baseModes = queryModes.length
+      ? queryModes
+      : envModes.length
+      ? envModes
+      : legacyMode.length
+      ? legacyMode
+      : ["scalp"];
+
     modes = prioritizeModes(baseModes);
 
     risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
@@ -730,114 +789,118 @@ export default async function handler(req, res) {
       }
 
       // Evaluate modes in priority order; first mode that passes wins.
-let winner = null;
+      let winner = null;
 
-for (const mode of modes) {
-  const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
-  const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
+      for (const mode of modes) {
+        const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
+        const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
 
-  const { triggers, curState } = evaluateCriteria(item, lastState, mode);
+        const { triggers, curState } = evaluateCriteria(item, lastState, mode);
 
-  // ✅ MEMORY ISOLATED — ALWAYS WRITE IMMEDIATELY
-  await writeLastState(mode, instId, curState, { dry });
+        // ✅ MEMORY ISOLATED — ALWAYS WRITE IMMEDIATELY
+        await writeLastState(mode, instId, curState, { dry });
 
-  if (!force && !triggers.length) {
-    if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
-    continue;
-  }
+        if (!force && !triggers.length) {
+          if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
+          continue;
+        }
 
-  const bias = biasFromItem(item, mode);
+        const bias = biasFromItem(item, mode);
 
-  // Macro block
-  if (
-    !force &&
-    CFG.macro.enabled &&
-    CFG.macro.blockShortsOnAltsWhenBtcBull &&
-    macro?.ok &&
-    macro?.btcBullExpansion4h &&
-    symbol.toUpperCase() !== CFG.macro.btcSymbol &&
-    bias === "short"
-  ) {
-    if (debug) skipped.push({
-      symbol,
-      mode,
-      reason: "macro_block_btc_bull_expansion",
-      btc4h: macro?.btc || null,
-    });
-    continue;
-  }
+        // Macro block
+        if (
+          !force &&
+          CFG.macro.enabled &&
+          CFG.macro.blockShortsOnAltsWhenBtcBull &&
+          macro?.ok &&
+          macro?.btcBullExpansion4h &&
+          symbol.toUpperCase() !== CFG.macro.btcSymbol &&
+          bias === "short"
+        ) {
+          if (debug)
+            skipped.push({
+              symbol,
+              mode,
+              reason: "macro_block_btc_bull_expansion",
+              btc4h: macro?.btc || null,
+            });
+          continue;
+        }
 
-  const b1 = strongRecoB1({ bias, levels, price: item.price });
+        const b1 = strongRecoB1({ bias, levels, price: item.price });
 
-  let entryLine = null;
-  let execReason = null;
+        let entryLine = null;
+        let execReason = null;
 
-  if (!force) {
-    if (mode === "scalp") {
-      if (!b1.strong) {
-        if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
-        continue;
+        if (!force) {
+          if (mode === "scalp") {
+            if (!b1.strong) {
+              if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
+              continue;
+            }
+
+            const g = await scalpExecutionGate({ instId, item, bias, levels });
+            if (!g.ok) {
+              if (debug)
+                skipped.push({
+                  symbol,
+                  mode,
+                  reason: `scalp_exec:${g.reason}`,
+                  bias,
+                  oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
+                });
+              continue;
+            }
+
+            entryLine = g.entryLine || null;
+            execReason = g.reason || null;
+          } else {
+            const modeLabel = mode === "build" ? "BUILD" : "SWING";
+            const g = swingExecutionGate({ bias, levels, item, modeLabel });
+
+            if (!g.ok) {
+              if (debug)
+                skipped.push({
+                  symbol,
+                  mode,
+                  reason: `${mode}_exec:${g.reason}`,
+                  bias,
+                  detail: g.detail || null,
+                });
+              continue;
+            }
+
+            entryLine = g.entryLine || null;
+            execReason = g.reason || null;
+          }
+        }
+
+        winner = {
+          mode,
+          symbol,
+          price: item.price,
+          bias,
+          triggers,
+          levels,
+          b1,
+          entryLine,
+          execReason,
+          curState,
+        };
+
+        winner.leverage = computeLeverageSuggestion({
+          bias: winner.bias,
+          entryPrice: winner.price,
+          levels: winner.levels,
+          item,
+          mode,
+        });
+
+        break;
       }
 
-      const g = await scalpExecutionGate({ instId, item, bias, levels });
-      if (!g.ok) {
-        if (debug)
-          skipped.push({
-            symbol,
-            mode,
-            reason: `scalp_exec:${g.reason}`,
-            bias,
-            oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
-          });
-        continue;
-      }
+      if (!winner) continue;
 
-      entryLine = g.entryLine || null;
-      execReason = g.reason || null;
-    } else {
-      const modeLabel = mode === "build" ? "BUILD" : "SWING";
-      const g = swingExecutionGate({ bias, levels, item, modeLabel });
-
-      if (!g.ok) {
-        if (debug)
-          skipped.push({
-            symbol,
-            mode,
-            reason: `${mode}_exec:${g.reason}`,
-            bias,
-            detail: g.detail || null,
-          });
-        continue;
-      }
-
-      entryLine = g.entryLine || null;
-      execReason = g.reason || null;
-    }
-  }
-
-  winner = {
-    mode,
-    symbol,
-    price: item.price,
-    bias,
-    triggers,
-    levels,
-    b1,
-    entryLine,
-    execReason,
-    curState,
-  };
-
-  winner.leverage = computeLeverageSuggestion({
-    bias: winner.bias,
-    entryPrice: winner.price,
-    levels: winner.levels,
-    item,
-  });
-
-  break;
-}
-if (!winner) continue;
       triggered.push(winner);
 
       if (!dry) {
@@ -884,25 +947,22 @@ if (!winner) continue;
 
       // Headline: include winner mode too
       lines.push(
-        `${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl} | mode=${String(t.mode).toUpperCase()}`
+        `${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl} | mode=${String(
+          t.mode
+        ).toUpperCase()}`
       );
 
       if (t.entryLine) lines.push(`Entry: ${t.entryLine}`);
 
       if (t.leverage) {
-  lines.push(
-    `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
-  );
-  lines.push(
-    `Based on invalidation distance ${fmtPct(t.leverage.distancePct)}`
-  );
+        lines.push(
+          `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
+        );
+        lines.push(`Based on invalidation distance ${fmtPct(t.leverage.distancePct)}`);
 
-  if (t.leverage.flags?.oiReduced)
-    lines.push(`OI elevated → size reduced`);
-
-  if (t.leverage.flags?.fundingReduced)
-    lines.push(`Funding stretched → size reduced`);
-}
+        if (t.leverage.flags?.oiReduced) lines.push(`OI elevated → size reduced`);
+        if (t.leverage.flags?.fundingReduced) lines.push(`Funding stretched → size reduced`);
+      }
 
       lines.push("");
     }
