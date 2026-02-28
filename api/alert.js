@@ -720,109 +720,113 @@ export default async function handler(req, res) {
       }
 
       // Evaluate modes in priority order; first mode that passes wins.
-      let winner = null;
+let winner = null;
 
-      for (const mode of modes) {
-        const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
-        const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
+for (const mode of modes) {
+  const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
+  const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
 
-        const { triggers, curState } = evaluateCriteria(item, lastState, mode);
+  const { triggers, curState } = evaluateCriteria(item, lastState, mode);
 
-        if (!force && !triggers.length) {
-          if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
+  // ✅ MEMORY ISOLATED — ALWAYS WRITE IMMEDIATELY
+  await writeLastState(mode, instId, curState, { dry });
 
-          // v2.6 seeding rule (incl legacy mirror for swing/build)
-          await writeLastState(mode, instId, curState, { dry });
-          continue;
-        }
+  if (!force && !triggers.length) {
+    if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
+    continue;
+  }
 
-        const bias = biasFromItem(item, mode);
+  const bias = biasFromItem(item, mode);
 
-        // Macro block
-        if (
-          !force &&
-          CFG.macro.enabled &&
-          CFG.macro.blockShortsOnAltsWhenBtcBull &&
-          macro?.ok &&
-          macro?.btcBullExpansion4h &&
-          symbol.toUpperCase() !== CFG.macro.btcSymbol &&
-          bias === "short"
-        ) {
-          if (debug) skipped.push({ symbol, mode, reason: "macro_block_btc_bull_expansion", btc4h: macro?.btc || null });
+  // Macro block
+  if (
+    !force &&
+    CFG.macro.enabled &&
+    CFG.macro.blockShortsOnAltsWhenBtcBull &&
+    macro?.ok &&
+    macro?.btcBullExpansion4h &&
+    symbol.toUpperCase() !== CFG.macro.btcSymbol &&
+    bias === "short"
+  ) {
+    if (debug) skipped.push({
+      symbol,
+      mode,
+      reason: "macro_block_btc_bull_expansion",
+      btc4h: macro?.btc || null,
+    });
+    continue;
+  }
 
-          await writeLastState(mode, instId, curState, { dry });
-          continue;
-        }
+  const b1 = strongRecoB1({ bias, levels, price: item.price });
 
-        const b1 = strongRecoB1({ bias, levels, price: item.price });
+  let entryLine = null;
+  let execReason = null;
 
-        let entryLine = null;
-        let execReason = null;
-
-        if (!force) {
-          if (mode === "scalp") {
-            // scalp requires B1 strong
-            if (!b1.strong) {
-              if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
-              await writeLastState(mode, instId, curState, { dry });
-              continue;
-            }
-
-            const g = await scalpExecutionGate({ instId, item, bias, levels });
-            if (!g.ok) {
-              if (debug)
-                skipped.push({
-                  symbol,
-                  mode,
-                  reason: `scalp_exec:${g.reason}`,
-                  bias,
-                  oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
-                });
-              await writeLastState(mode, instId, curState, { dry });
-              continue;
-            }
-
-            entryLine = g.entryLine || null;
-            execReason = g.reason || null;
-          } else {
-            const modeLabel = mode === "build" ? "BUILD" : "SWING";
-            const g = swingExecutionGate({ bias, levels, item, modeLabel });
-            if (!g.ok) {
-              if (debug) skipped.push({ symbol, mode, reason: `${mode}_exec:${g.reason}`, bias, detail: g.detail || null });
-              await writeLastState(mode, instId, curState, { dry });
-              continue;
-            }
-
-            entryLine = g.entryLine || null;
-            execReason = g.reason || null;
-          }
-        }
-
-        winner = {
-          mode,
-          symbol,
-          price: item.price,
-          bias,
-          triggers,
-          levels,
-          b1,
-          entryLine,
-          execReason,
-          curState,
-        };
-
-        // Leverage advisory (compact)
-        winner.leverage = computeLeverageSuggestion({
-          bias: winner.bias,
-          entryPrice: winner.price,
-          levels: winner.levels,
-          item,
-        });
-
-        break;
+  if (!force) {
+    if (mode === "scalp") {
+      if (!b1.strong) {
+        if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
+        continue;
       }
 
-      if (!winner) continue;
+      const g = await scalpExecutionGate({ instId, item, bias, levels });
+      if (!g.ok) {
+        if (debug)
+          skipped.push({
+            symbol,
+            mode,
+            reason: `scalp_exec:${g.reason}`,
+            bias,
+            oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
+          });
+        continue;
+      }
+
+      entryLine = g.entryLine || null;
+      execReason = g.reason || null;
+    } else {
+      const modeLabel = mode === "build" ? "BUILD" : "SWING";
+      const g = swingExecutionGate({ bias, levels, item, modeLabel });
+
+      if (!g.ok) {
+        if (debug)
+          skipped.push({
+            symbol,
+            mode,
+            reason: `${mode}_exec:${g.reason}`,
+            bias,
+            detail: g.detail || null,
+          });
+        continue;
+      }
+
+      entryLine = g.entryLine || null;
+      execReason = g.reason || null;
+    }
+  }
+
+  winner = {
+    mode,
+    symbol,
+    price: item.price,
+    bias,
+    triggers,
+    levels,
+    b1,
+    entryLine,
+    execReason,
+    curState,
+  };
+
+  winner.leverage = computeLeverageSuggestion({
+    bias: winner.bias,
+    entryPrice: winner.price,
+    levels: winner.levels,
+    item,
+  });
+
+  break;
+}
 
       triggered.push(winner);
 
