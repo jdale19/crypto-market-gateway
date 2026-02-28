@@ -827,7 +827,7 @@ for (const mode of modes) {
 
   break;
 }
-
+if (!winner) continue;
       triggered.push(winner);
 
       if (!dry) {
