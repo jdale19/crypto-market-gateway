@@ -7,10 +7,12 @@
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
 // - SWING/BUILD: "B1 reversal" entry option (bounce/reject near 1h extremes)
 // - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
+// - LEVERAGE RECO: structure-based base leverage + OI/funding adjustments + printed in DM
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
 // - Default modes now use DEFAULT_MODES env var (comma list). DEFAULT_MODE is still honored as fallback.
+// - Leverage reco is advisory text only; does not change gating.
 
 import { Redis } from "@upstash/redis";
 
@@ -99,6 +101,25 @@ const CFG = {
   // Swing/build OI context rule
   swing: {
     minOiPct: Number(process.env.ALERT_SWING_MIN_OI_PCT || -0.5),
+  },
+
+  // --- Leverage Model (advisory copy only) ---
+  leverage: {
+    enabled: String(process.env.ALERT_LEVERAGE_ENABLED || "1") === "1",
+
+    // % of account willing to risk if invalidated (structure-based sizing proxy)
+    riskBudgetPct: Number(process.env.ALERT_RISK_BUDGET_PCT || 1.0),
+
+    // Hard cap so we don’t suggest insanity
+    maxCap: Number(process.env.ALERT_LEVERAGE_MAX_CAP || 15),
+
+    // OI instability thresholds (abs %)
+    oiReduce1: Number(process.env.ALERT_LEVERAGE_OI_REDUCE1 || 1.0),
+    oiReduce2: Number(process.env.ALERT_LEVERAGE_OI_REDUCE2 || 2.5),
+
+    // Funding stretch thresholds (abs)
+    fundingReduce1: Number(process.env.ALERT_LEVERAGE_FUNDING_REDUCE1 || 0.0004),
+    fundingReduce2: Number(process.env.ALERT_LEVERAGE_FUNDING_REDUCE2 || 0.0008),
   },
 
   // Heartbeat (debug/run visibility)
@@ -303,6 +324,62 @@ function edgeRecoCheck({ bias, levels, price, edgePct }) {
 
 function strongRecoB1({ bias, levels, price }) {
   return edgeRecoCheck({ bias, levels, price, edgePct: CFG.strongEdgePct1h });
+}
+
+// --- Leverage suggestion (advisory) ---
+// Base = floor(riskBudgetPct / distance_to_invalidation_pct)
+// Then reduce if OI is jumpy or funding is stretched.
+function computeLeverageSuggestion({ bias, entryPrice, levels, item }) {
+  if (!CFG.leverage.enabled) return null;
+
+  const l1h = levels?.["1h"];
+  if (!l1h || l1h.warmup) return null;
+
+  const hi = asNum(l1h.hi);
+  const lo = asNum(l1h.lo);
+  const price = asNum(entryPrice);
+  if (hi == null || lo == null || price == null) return null;
+
+  // Invalidation = opposite 1h extreme (simple structure proxy)
+  const invalidation = bias === "long" ? lo : hi;
+  const distancePct = Math.abs((price - invalidation) / price) * 100;
+
+  if (!Number.isFinite(distancePct) || distancePct <= 0) return null;
+
+  const baseMax = Math.floor(CFG.leverage.riskBudgetPct / distancePct);
+
+  // OI adjustment (use abs, because instability is instability)
+  const oi5 = Math.abs(asNum(item?.deltas?.["5m"]?.oi_change_pct) ?? 0);
+  const oi15 = Math.abs(asNum(item?.deltas?.["15m"]?.oi_change_pct) ?? 0);
+
+  let oiMult = 1;
+  if (oi5 > CFG.leverage.oiReduce2 || oi15 > CFG.leverage.oiReduce2) oiMult = 0.6;
+  else if (oi5 > CFG.leverage.oiReduce1 || oi15 > CFG.leverage.oiReduce1) oiMult = 0.75;
+
+  // Funding adjustment (abs)
+  const funding = Math.abs(asNum(item?.funding_rate) ?? 0);
+
+  let fMult = 1;
+  if (funding > CFG.leverage.fundingReduce2) fMult = 0.6;
+  else if (funding > CFG.leverage.fundingReduce1) fMult = 0.8;
+
+  const adjustedMax = Math.max(1, Math.min(Math.floor(baseMax * oiMult * fMult), CFG.leverage.maxCap));
+  const suggestedLow = Math.max(1, Math.floor(adjustedMax * 0.5));
+  const suggestedHigh = adjustedMax;
+
+  return {
+    suggestedLow,
+    suggestedHigh,
+    adjustedMax,
+    distancePct,
+    oi5,
+    oi15,
+    funding,
+    flags: {
+      oiReduced: oiMult < 1,
+      fundingReduced: fMult < 1,
+    },
+  };
 }
 
 /**
@@ -577,7 +654,13 @@ export default async function handler(req, res) {
     const envModes = normalizeModes(CFG.defaultModesRaw);
     const legacyMode = normalizeModes(CFG.defaultMode).length ? normalizeModes(CFG.defaultMode) : ["scalp"];
 
-    const baseModes = queryModes.length ? queryModes : envModes.length ? envModes : legacyMode.length ? legacyMode : ["scalp"];
+    const baseModes = queryModes.length
+      ? queryModes
+      : envModes.length
+      ? envModes
+      : legacyMode.length
+      ? legacyMode
+      : ["scalp"];
     modes = prioritizeModes(baseModes);
 
     risk_profile = normalizeRisk(req.query.risk_profile) || CFG.defaultRisk;
@@ -743,6 +826,15 @@ export default async function handler(req, res) {
           execReason,
           curState,
         };
+
+        // Attach leverage suggestion (advisory)
+        winner.leverage = computeLeverageSuggestion({
+          bias: winner.bias,
+          entryPrice: winner.price,
+          levels: winner.levels,
+          item,
+        });
+
         break;
       }
 
@@ -796,9 +888,20 @@ export default async function handler(req, res) {
       const lvl = l1h && !l1h.warmup ? ` | 1h H/L=${fmtPrice(l1h.hi)}/${fmtPrice(l1h.lo)}` : "";
 
       // Headline: include winner mode too
-      lines.push(`${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl} | mode=${String(t.mode).toUpperCase()}`);
+      lines.push(
+        `${t.symbol} $${fmtPrice(t.price)} | ${String(t.bias).toUpperCase()}${lvl} | mode=${String(t.mode).toUpperCase()}`
+      );
 
       if (t.triggerLine) lines.push(t.triggerLine);
+
+      // Leverage advisory block (compact)
+      if (t.leverage) {
+        lines.push(`Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`);
+        lines.push(`Based on invalidation distance ${fmtPct(t.leverage.distancePct)}`);
+        if (t.leverage.flags?.oiReduced) lines.push(`OI elevated → size reduced`);
+        if (t.leverage.flags?.fundingReduced) lines.push(`Funding stretched → size reduced`);
+      }
+
       lines.push("");
     }
 
