@@ -46,6 +46,14 @@ function getDeployInfo() {
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
 
+  stop: {
+  // candle flip method for reversals
+  reversalUseWick: String(process.env.ALERT_STOP_REVERSAL_USE_WICK || "0") === "1", // 0=body, 1=wick
+  reversalBodyPct: Number(process.env.ALERT_STOP_REVERSAL_BODY_PCT || 1.0), // 0..1 (1 = full flipped body)
+  reversalPadPct: Number(process.env.ALERT_STOP_REVERSAL_PAD_PCT || 0.05), // percent (0.05 = 0.05%)
+  contPadPct: Number(process.env.ALERT_STOP_CONT_PAD_PCT || 0.03),          // percent
+},
+  
   // Defaults
   // NEW: DEFAULT_MODES="scalp,swing" (comma list)
   // Fallbacks: DEFAULT_MODE then "scalp"
@@ -174,6 +182,81 @@ function normalizeSymbols(raw) {
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
 }
+async function getPrevClosePair(instId) {
+  const raw = await redis.lrange(CFG.keys.series5m(instId), -3, -1);
+  const pts = (raw || []).map(safeJsonParse).filter(Boolean);
+  const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
+  if (closes.length < 2) return null;
+  return { prev: closes[closes.length - 2], last: closes[closes.length - 1] };
+}
+
+function stopTfForMode(mode) {
+  const m = String(mode || "scalp").toLowerCase();
+  if (m === "scalp") return "15m"; // tighter structure for scalps
+  if (m === "swing") return "1h";
+  if (m === "build") return "4h";
+  return "1h";
+}
+
+async function computeStopLossPx({ instId, mode, bias, price, levels, execReason }) {
+  const px = asNum(price);
+  if (px == null) return null;
+  const isReversal = String(execReason || "").toLowerCase().includes("b1_reversal");
+  const b = String(bias || "neutral").toLowerCase();
+  const px = asNum(price);
+  if (px == null) return null;
+  if (b !== "long" && b !== "short") return null;
+
+  // ---- REVERSAL STOP (flip the prior candle/body using close-close fallback) ----
+  if (isReversal) {
+    const pair = await getPrevClosePair(instId);
+    if (!pair) return null;
+
+    const prev = pair.prev;
+    const last = pair.last;
+
+    // "body" size from prev close to last close
+    const body = Math.abs(last - prev);
+    if (!Number.isFinite(body) || body <= 0) return null;
+
+    // flipped distance: full body by default, configurable
+    const dist = body * Math.max(0, Math.min(1, CFG.stop.reversalBodyPct));
+
+    let sl = null;
+    if (b === "long") sl = px - dist;
+    if (b === "short") sl = px + dist;
+
+    // pad (percent)
+    const pad = Math.abs(Number(CFG.stop.reversalPadPct) || 0) / 100;
+    if (pad > 0) {
+      if (b === "long") sl = sl * (1 - pad);
+      if (b === "short") sl = sl * (1 + pad);
+    }
+    return sl;
+  }
+
+  // ---- CONTINUATION STOP (structure on stop TF) ----
+  const tf = stopTfForMode(mode);
+  const lvl = levels?.[tf];
+  if (!lvl || lvl.warmup) return null;
+
+  const hi = asNum(lvl.hi);
+  const lo = asNum(lvl.lo);
+  if (hi == null || lo == null) return null;
+
+  const pad = Math.abs(Number(CFG.stop.contPadPct) || 0) / 100;
+
+  let sl = null;
+  if (b === "long") sl = lo;
+  if (b === "short") sl = hi;
+
+  if (pad > 0) {
+    if (b === "long") sl = sl * (1 - pad);
+    if (b === "short") sl = sl * (1 + pad);
+  }
+  return sl;
+}
+
 function normalizeMacroTf(raw) {
   const tf = String(raw || "").toLowerCase();
   return ["1h", "4h"].includes(tf) ? tf : null;
@@ -392,35 +475,25 @@ function strongRecoB1({ bias, levels, price }) {
 // --- Leverage suggestion (advisory) ---
 // Base = floor(riskBudgetPct / distance_to_invalidation_pct)
 // Then reduce if OI is jumpy or funding is stretched.
-function computeLeverageSuggestion({ bias, entryPrice, levels, item, mode }) {
+function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item }) {
   if (!CFG.leverage?.enabled) return null;
 
   const m = String(mode || "scalp").toLowerCase();
-  const riskBudgetPct =
-    CFG.leverage?.riskBudgetPctByMode?.[m] ??
-    CFG.leverage?.riskBudgetPctByMode?.scalp ??
-    Number(process.env.ALERT_RISK_BUDGET_PCT || 1.0);
+  const riskBudgetPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
 
-  const l1h = levels?.["1h"];
-  if (!l1h || l1h.warmup) return null;
+  const entry = asNum(entryPrice);
+  const sl = asNum(stopLossPx);
+  if (entry == null || sl == null) return null;
 
-  const hi = asNum(l1h.hi);
-  const lo = asNum(l1h.lo);
-  const price = asNum(entryPrice);
-  if (hi == null || lo == null || price == null) return null;
+  const stopDistPct = Math.abs((entry - sl) / entry) * 100;
+  if (!Number.isFinite(stopDistPct) || stopDistPct <= 0) return null;
 
-  // NOTE: this is a STRUCTURE proxy only (advisory) — not your actual invalidation rule.
-  // We use the opposite 1h extreme as a "worst case" structure stop distance.
-  const invalidation = bias === "long" ? lo : hi;
-  const distancePct = Math.abs((price - invalidation) / price) * 100;
-
-  if (!Number.isFinite(distancePct) || distancePct <= 0) return null;
-
+  // base leverage proxy (same model as before, but using stop distance)
   const baseMax = Math.floor(
-    Math.max(0, Number(riskBudgetPct) || 0) / Math.max(0.01, distancePct)
+    Math.max(0, Number(riskBudgetPct) || 0) / Math.max(0.01, stopDistPct)
   );
 
-  // OI adjustment (use abs, because instability is instability)
+  // OI adjustment
   const oi5 = Math.abs(asNum(item?.deltas?.["5m"]?.oi_change_pct) ?? 0);
   const oi15 = Math.abs(asNum(item?.deltas?.["15m"]?.oi_change_pct) ?? 0);
 
@@ -428,7 +501,7 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item, mode }) {
   if (oi5 > CFG.leverage.oiReduce2 || oi15 > CFG.leverage.oiReduce2) oiMult = 0.6;
   else if (oi5 > CFG.leverage.oiReduce1 || oi15 > CFG.leverage.oiReduce1) oiMult = 0.75;
 
-  // Funding adjustment (abs)
+  // Funding adjustment
   const funding = Math.abs(asNum(item?.funding_rate) ?? 0);
 
   let fMult = 1;
@@ -439,23 +512,14 @@ function computeLeverageSuggestion({ bias, entryPrice, levels, item, mode }) {
     1,
     Math.min(Math.floor(baseMax * oiMult * fMult), CFG.leverage.maxCap)
   );
-  const suggestedLow = Math.max(1, Math.floor(adjustedMax * 0.5));
-  const suggestedHigh = adjustedMax;
 
   return {
-    suggestedLow,
-    suggestedHigh,
+    suggestedLow: Math.max(1, Math.floor(adjustedMax * 0.5)),
+    suggestedHigh: adjustedMax,
     adjustedMax,
-    distancePct,
-    oi5,
-    oi15,
-    funding,
+    stopDistPct,
     riskBudgetPct,
-    mode: m,
-    flags: {
-      oiReduced: oiMult < 1,
-      fundingReduced: fMult < 1,
-    },
+    flags: { oiReduced: oiMult < 1, fundingReduced: fMult < 1 },
   };
 }
 
@@ -985,6 +1049,8 @@ export default async function handler(req, res) {
 
         winner = {
           mode,
+          instId,
+          _rawItem: item,
           symbol,
           price: item.price,
           bias,
@@ -1002,14 +1068,6 @@ export default async function handler(req, res) {
             lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
           },
         };
-
-        winner.leverage = computeLeverageSuggestion({
-          bias: winner.bias,
-          entryPrice: winner.price,
-          levels: winner.levels,
-          item,
-          mode,
-        });
 
         break;
       }
@@ -1058,6 +1116,7 @@ export default async function handler(req, res) {
     }
     
 // ---- Render DM ----
+
 const lines = [];
 
 const uniqueModes = Array.from(
@@ -1092,7 +1151,6 @@ for (const t of triggered) {
 
   // Padding knobs (defaults 0 until you decide)
   const invPadPct = Number(process.env.ALERT_INVALIDATION_PAD_PCT || 0); // ex: 0.05 = 0.05% (NOT 5%)
-  const slPadPct = Number(process.env.ALERT_STOP_PAD_PCT || 0);          // ex: 0.05 = 0.05%
 
   // Compute invalidation (PRE-trade structure bail line)
   let invalidationPx = null;
@@ -1100,9 +1158,21 @@ for (const t of triggered) {
   if (bias === "short" && invHi != null) invalidationPx = invHi * (1 + invPadPct / 100);
 
   // Compute stop loss (POST-trade risk line) — currently anchored to 1h extremes w/ padding
-  let stopLossPx = null;
-  if (bias === "long" && lo1h != null) stopLossPx = lo1h * (1 - slPadPct / 100);
-  if (bias === "short" && hi1h != null) stopLossPx = hi1h * (1 + slPadPct / 100);
+  const stopLossPx = await computeStopLossPx({
+  instId: t.instId,
+  mode,
+  bias,
+  price,
+  levels: t.levels,
+  execReason: t.execReason,
+});
+
+const lev = computeLeverageFromStop({
+  mode,
+  entryPrice: price,
+  stopLossPx,
+  item: t._rawItem,
+});
 
   // ---- Block ----
   // If you want the mode header per-trade instead of once at top, uncomment:
@@ -1112,11 +1182,6 @@ for (const t of triggered) {
   lines.push(`${t.symbol} $${fmtPrice(price)} | ${biasUp}`);
   lines.push(`Confidence = ${confidence}`);
   lines.push("");
-
-  if (t.entryLine) {
-    lines.push(`Entry: ${biasUp} — ${t.entryLine}`);
-    lines.push("");
-  }
 
   // Entry Zone (1h B1 band)
   if (hi1h != null && lo1h != null) {
@@ -1138,12 +1203,10 @@ for (const t of triggered) {
     else if (bias === "short") lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
   }
 
-  // Leverage (unchanged)
-  if (t.leverage) {
-    lines.push(
-      `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
-    );
-  }
+  // Leverage (from stop distance)
+if (lev) {
+  lines.push(`Leverage: ${lev.suggestedLow}–${lev.suggestedHigh}x (max ${lev.adjustedMax}x)`);
+}
 
   lines.push("");
 
