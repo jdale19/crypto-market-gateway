@@ -843,7 +843,7 @@ export default async function handler(req, res) {
         .json({ ok: false, error: "multi fetch failed", multiUrl, detail: j || null });
     }
 
-    const macro = computeBtcMacro(j.results || []);
+    
 
     const now = Date.now();
     const cooldownMs = CFG.cooldownMinutes * 60000;
@@ -899,14 +899,14 @@ export default async function handler(req, res) {
         }
 
         const bias = biasFromItem(item, mode);
-
+        const macro = computeBtcMacro(j.results || [], mode);
         // Macro block
         if (
           !force &&
           CFG.macro.enabled &&
           CFG.macro.blockShortsOnAltsWhenBtcBull &&
           macro?.ok &&
-          macro?.btcBullExpansion4h &&
+          macro?.btcBullExpansion &&
           symbol.toUpperCase() !== CFG.macro.btcSymbol &&
           bias === "short"
         ) {
