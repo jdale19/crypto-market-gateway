@@ -7,7 +7,7 @@
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
 // - SWING/BUILD: "B1 reversal" entry option (bounce/reject near 1h extremes)
 // - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
-// - MESSAGE CONTRACT: include "Entry:" one-liner (trader style)
+// - MESSAGE CONTRACT: header includes MODE; uses Entry Zone format (no Entry: line)
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: advisory only (compact line) + OI/funding adjustments
 //
@@ -1046,93 +1046,81 @@ export default async function handler(req, res) {
           : {}),
       });
     }
+    
+// ---- Render DM ----
+const lines = [];
 
-    // ---- Render DM ----
-    const lines = [];
-    lines.push("⚡️ PERP TRADE ENTRY");
-    lines.push("");
+const uniqueModes = Array.from(
+  new Set(triggered.map((t) => String(t.mode || "").toUpperCase()).filter(Boolean))
+);
+const headerMode = uniqueModes.length === 1 ? uniqueModes[0] : "MIXED";
 
-    for (const t of triggered) {
-      const l1h = t.levels?.["1h"];
-      const hi = l1h && !l1h.warmup ? asNum(l1h.hi) : null;
-      const lo = l1h && !l1h.warmup ? asNum(l1h.lo) : null;
-      const mid = hi != null && lo != null ? (hi + lo) / 2 : null;
+lines.push(`⚡️ ${headerMode} TRADE ENTRY`);
+lines.push("");
 
-      const price = asNum(t.price);
-      const biasUp = String(t.bias).toUpperCase();
+for (const t of triggered) {
+  const l1h = t.levels?.["1h"];
+  const hi = l1h && !l1h.warmup ? asNum(l1h.hi) : null;
+  const lo = l1h && !l1h.warmup ? asNum(l1h.lo) : null;
+  const mid = hi != null && lo != null ? (hi + lo) / 2 : null;
 
-      const confidence = computeConfidence(t);
+  const price = asNum(t.price);
+  const biasUp = String(t.bias).toUpperCase();
+  const confidence = computeConfidence(t);
 
-      lines.push(`${t.symbol} $${fmtPrice(price)} | ${biasUp}`);
-      lines.push(`Confidence: ${confidence}`);
+  lines.push(`${t.symbol} $${fmtPrice(price)} | ${biasUp}`);
+  lines.push(`Confidence = ${confidence}`);
+  lines.push("");
 
-      // Message contract: include Entry: one-liner (if available)
-      if (t.entryLine) {
-        lines.push(`Entry: ${biasUp} — ${t.entryLine}`);
-      }
-      lines.push("");
+  if (hi != null && lo != null) {
+    const range = hi - lo;
+    const edge = CFG.strongEdgePct1h * range;
 
-      // Entry Zone = B1 band based on 1h range + strongEdgePct1h
-      if (hi != null && lo != null) {
-        const range = hi - lo;
-        const edge = CFG.strongEdgePct1h * range;
-
-        if (String(t.bias).toLowerCase() === "long") {
-          lines.push(`Entry Zone: ${fmtPrice(lo)}–${fmtPrice(lo + edge)}`);
-        } else if (String(t.bias).toLowerCase() === "short") {
-          lines.push(`Entry Zone: ${fmtPrice(hi - edge)}–${fmtPrice(hi)}`);
-        }
-      }
-
-      // Avoid chasing = 0.25% buffer from current price (mechanical)
-      if (price != null) {
-        const chaseBuffer = price * 0.0025;
-        if (String(t.bias).toLowerCase() === "long") {
-          lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
-        } else {
-          lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
-        }
-      }
-
-      if (t.leverage) {
-        lines.push(
-          `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
-        );
-      }
-
-      lines.push("");
-
-      // Stop Loss = opposite 1h extreme (structure proxy)
-      if (hi != null && lo != null) {
-        const stop = String(t.bias).toLowerCase() === "long" ? lo : hi;
-        lines.push(`Stop Loss: ${fmtPrice(stop)}`);
-      }
-
-      if (hi != null && lo != null) {
-        lines.push("Take Profit:");
-        if (mid != null) lines.push(`• ${fmtPrice(mid)} (range mid)`);
-        if (String(t.bias).toLowerCase() === "long") lines.push(`• ${fmtPrice(hi)} (1h high)`);
-        else lines.push(`• ${fmtPrice(lo)} (1h low)`);
-      }
-
-      lines.push("");
+    if (String(t.bias).toLowerCase() === "long") {
+      lines.push(`Entry Zone: ${fmtPrice(lo)}–${fmtPrice(lo + edge)}`);
+    } else {
+      lines.push(`Entry Zone: ${fmtPrice(hi - edge)}–${fmtPrice(hi)}`);
     }
+  }
 
-    const drillSyms = Array.from(
-      new Set([
-        ...triggered.map((x) => String(x.symbol || "").toUpperCase()).filter(Boolean),
-        CFG.macro.btcSymbol,
-      ])
+  let stop = null;
+  if (hi != null && lo != null) {
+    stop = String(t.bias).toLowerCase() === "long" ? lo : hi;
+    lines.push(`Invalidation: ${fmtPrice(stop)}`);
+  } else {
+    lines.push("Invalidation:");
+  }
+
+  if (price != null) {
+    const chaseBuffer = price * 0.0025;
+    if (String(t.bias).toLowerCase() === "long") {
+      lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
+    } else {
+      lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
+    }
+  }
+
+  if (t.leverage) {
+    lines.push(
+      `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
     );
+  }
 
-    const drillUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
-      drillSyms.join(",")
-    )}&driver_tf=${encodeURIComponent(driver_tf)}`;
+  lines.push("");
 
-    lines.push(drillUrl);
+  if (stop != null) lines.push(`Stop Loss: ${fmtPrice(stop)}`);
 
-    const message = lines.join("\n");
+  if (hi != null && lo != null) {
+    lines.push("Take Profit:");
+    if (mid != null) lines.push(`• ${fmtPrice(mid)} (range mid)`);
+    if (String(t.bias).toLowerCase() === "long") lines.push(`• ${fmtPrice(hi)} (1h high)`);
+    else lines.push(`• ${fmtPrice(lo)} (1h low)`);
+  }
 
+  lines.push("");
+}
+
+const message = lines.join("\n");
     if (!dry) {
       const tg = await sendTelegram(message);
       if (!tg.ok) {
