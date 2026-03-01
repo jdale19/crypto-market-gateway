@@ -72,14 +72,25 @@ const CFG = {
 
   telegramMaxChars: 3900,
 
-  // Macro gate
-  macro: {
-    enabled: String(process.env.ALERT_MACRO_GATE_ENABLED || "1") === "1",
-    btcSymbol: String(process.env.ALERT_MACRO_BTC_SYMBOL || "BTCUSDT").toUpperCase(),
-    btc4hPricePctMin: Number(process.env.ALERT_MACRO_BTC_4H_PRICE_PCT_MIN || 2.0),
-    btc4hOiPctMin: Number(process.env.ALERT_MACRO_BTC_4H_OI_PCT_MIN || 0.5),
-    blockShortsOnAltsWhenBtcBull: String(process.env.ALERT_MACRO_BLOCK_SHORTS_ON_ALTS || "1") === "1",
+  // Macro gate (mode-aware timeframe)
+macro: {
+  enabled: String(process.env.ALERT_MACRO_GATE_ENABLED || "1") === "1",
+  btcSymbol: String(process.env.ALERT_MACRO_BTC_SYMBOL || "BTCUSDT").toUpperCase(),
+
+  // Mode -> BTC delta timeframe used for macro
+  // Defaults: scalp=1h, swing=4h, build=4h
+  btcTfByMode: {
+    scalp: String(process.env.ALERT_MACRO_BTC_TF_SCALP || "1h").toLowerCase(),
+    swing: String(process.env.ALERT_MACRO_BTC_TF_SWING || "4h").toLowerCase(),
+    build: String(process.env.ALERT_MACRO_BTC_TF_BUILD || "4h").toLowerCase(),
   },
+
+  // Thresholds apply to the selected BTC timeframe
+  btcPricePctMin: Number(process.env.ALERT_MACRO_BTC_PRICE_PCT_MIN || 2.0),
+  btcOiPctMin: Number(process.env.ALERT_MACRO_BTC_OI_PCT_MIN || 0.5),
+
+  blockShortsOnAltsWhenBtcBull: String(process.env.ALERT_MACRO_BLOCK_SHORTS_ON_ALTS || "1") === "1",
+},
 
   // Optional regime adjust (kept; does not bypass entry rules)
   regime: {
@@ -543,34 +554,37 @@ function evaluateCriteria(item, lastState, mode) {
 }
 
 // Macro gate
-function computeBtcMacro(results) {
-  if (!CFG.macro.enabled) return { ok: false, reason: "macro_disabled", btcBullExpansion4h: false };
+function computeBtcMacro(results, mode) {
+  if (!CFG.macro.enabled) return { ok: false, reason: "macro_disabled", btcBullExpansion: false };
 
   const btcSym = CFG.macro.btcSymbol;
   const btcItem = (results || []).find((x) => String(x?.symbol || "").toUpperCase() === btcSym);
+  if (!btcItem?.ok) return { ok: false, reason: "btc_missing", btcBullExpansion: false };
 
-  if (!btcItem?.ok) return { ok: false, reason: "btc_missing", btcBullExpansion4h: false };
+  const m = String(mode || "swing").toLowerCase();
+  const tf = CFG.macro.btcTfByMode?.[m] || "4h";
 
-  const d4 = btcItem?.deltas?.["4h"];
-  const pricePct = asNum(d4?.price_change_pct);
-  const oiPct = asNum(d4?.oi_change_pct);
-  const lean = String(d4?.lean || "").toLowerCase();
+  const d = btcItem?.deltas?.[tf];
+  const pricePct = asNum(d?.price_change_pct);
+  const oiPct = asNum(d?.oi_change_pct);
+  const lean = String(d?.lean || "").toLowerCase();
 
   const bull =
     lean === "long" &&
     Number.isFinite(pricePct) &&
     Number.isFinite(oiPct) &&
-    pricePct >= CFG.macro.btc4hPricePctMin &&
-    oiPct >= CFG.macro.btc4hOiPctMin;
+    pricePct >= CFG.macro.btcPricePctMin &&
+    oiPct >= CFG.macro.btcOiPctMin;
 
   return {
     ok: true,
     reason: "ok",
-    btcBullExpansion4h: bull,
+    btcBullExpansion: bull,
+    tf,
     btc: {
-      lean4h: lean || null,
-      pricePct4h: Number.isFinite(pricePct) ? pricePct : null,
-      oiPct4h: Number.isFinite(oiPct) ? oiPct : null,
+      lean: lean || null,
+      pricePct: Number.isFinite(pricePct) ? pricePct : null,
+      oiPct: Number.isFinite(oiPct) ? oiPct : null,
     },
   };
 }
