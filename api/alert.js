@@ -200,12 +200,11 @@ function stopTfForMode(mode) {
 
 async function computeStopLossPx({ instId, mode, bias, price, levels, execReason }) {
   const px = asNum(price);
-  if (px == null) return null;
-  const isReversal = String(execReason || "").toLowerCase().includes("b1_reversal");
-  const b = String(bias || "neutral").toLowerCase();
-  const px = asNum(price);
-  if (px == null) return null;
-  if (b !== "long" && b !== "short") return null;
+if (px == null) return null;
+
+const isReversal = String(execReason || "").toLowerCase().includes("b1_reversal");
+const b = String(bias || "neutral").toLowerCase();
+if (b !== "long" && b !== "short") return null;
 
   // ---- REVERSAL STOP (flip the prior candle/body using close-close fallback) ----
   if (isReversal) {
