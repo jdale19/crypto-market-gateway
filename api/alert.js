@@ -60,9 +60,10 @@ const CFG = {
 
   // Levels windows (from stored 5m series)
   levelWindows: {
-    "1h": 12,
-    "4h": 48,
-  },
+  "15m": 3,   // NEW (scalp invalidation)
+  "1h": 12,
+  "4h": 48,
+},
 
   // B1 edge (structural proximity)
   strongEdgePct1h: Number(process.env.ALERT_STRONG_EDGE_PCT_1H || 0.15),
@@ -185,6 +186,15 @@ function macroTfForMode(mode) {
   if (m === "build") return normalizeMacroTf(process.env.ALERT_MACRO_TF_BUILD) || "4h";
   return "4h";
 }
+
+function invalidationTfForMode(mode) {
+  const m = String(mode || "scalp").toLowerCase();
+  if (m === "scalp") return "15m";
+  if (m === "swing") return "1h";
+  if (m === "build") return "4h";
+  return "1h";
+}
+
 function normalizeDriverTf(raw) {
   const tf = String(raw || "5m").toLowerCase();
   return ["5m", "15m", "30m", "1h", "4h"].includes(tf) ? tf : "5m";
@@ -1059,47 +1069,76 @@ lines.push(`⚡️ ${headerMode} TRADE ENTRY`);
 lines.push("");
 
 for (const t of triggered) {
+  const mode = String(t.mode || "swing").toLowerCase();
+  const modeUp = mode.toUpperCase();
+
+  // ENTRY ZONE stays 1h B1 band (per your current spec)
   const l1h = t.levels?.["1h"];
-  const hi = l1h && !l1h.warmup ? asNum(l1h.hi) : null;
-  const lo = l1h && !l1h.warmup ? asNum(l1h.lo) : null;
-  const mid = hi != null && lo != null ? (hi + lo) / 2 : null;
+  const hi1h = l1h && !l1h.warmup ? asNum(l1h.hi) : null;
+  const lo1h = l1h && !l1h.warmup ? asNum(l1h.lo) : null;
+  const mid1h = hi1h != null && lo1h != null ? (hi1h + lo1h) / 2 : null;
 
   const price = asNum(t.price);
-  const biasUp = String(t.bias).toUpperCase();
+  const bias = String(t.bias || "neutral").toLowerCase();
+  const biasUp = bias.toUpperCase();
   const confidence = computeConfidence(t);
+
+  // MODE-AWARE INVALIDATION TF (fallback-safe)
+  const invTfRaw = invalidationTfForMode(mode); // you added this helper
+  const invTf = t.levels?.[invTfRaw] && !t.levels?.[invTfRaw]?.warmup ? invTfRaw : "1h";
+  const invLvl = t.levels?.[invTf];
+  const invHi = invLvl && !invLvl.warmup ? asNum(invLvl.hi) : null;
+  const invLo = invLvl && !invLvl.warmup ? asNum(invLvl.lo) : null;
+
+  // Padding knobs (defaults 0 until you decide)
+  const invPadPct = Number(process.env.ALERT_INVALIDATION_PAD_PCT || 0); // ex: 0.05 = 0.05% (NOT 5%)
+  const slPadPct = Number(process.env.ALERT_STOP_PAD_PCT || 0);          // ex: 0.05 = 0.05%
+
+  // Compute invalidation (PRE-trade structure bail line)
+  let invalidationPx = null;
+  if (bias === "long" && invLo != null) invalidationPx = invLo * (1 - invPadPct / 100);
+  if (bias === "short" && invHi != null) invalidationPx = invHi * (1 + invPadPct / 100);
+
+  // Compute stop loss (POST-trade risk line) — currently anchored to 1h extremes w/ padding
+  let stopLossPx = null;
+  if (bias === "long" && lo1h != null) stopLossPx = lo1h * (1 - slPadPct / 100);
+  if (bias === "short" && hi1h != null) stopLossPx = hi1h * (1 + slPadPct / 100);
+
+  // ---- Block ----
+  // If you want the mode header per-trade instead of once at top, uncomment:
+  // lines.push(`⚡️ ${modeUp} TRADE ENTRY`);
+  // lines.push("");
 
   lines.push(`${t.symbol} $${fmtPrice(price)} | ${biasUp}`);
   lines.push(`Confidence = ${confidence}`);
   lines.push("");
 
-  if (hi != null && lo != null) {
-    const range = hi - lo;
-    const edge = CFG.strongEdgePct1h * range;
-
-    if (String(t.bias).toLowerCase() === "long") {
-      lines.push(`Entry Zone: ${fmtPrice(lo)}–${fmtPrice(lo + edge)}`);
-    } else {
-      lines.push(`Entry Zone: ${fmtPrice(hi - edge)}–${fmtPrice(hi)}`);
-    }
+  if (t.entryLine) {
+    lines.push(`Entry: ${biasUp} — ${t.entryLine}`);
+    lines.push("");
   }
 
-  let stop = null;
-  if (hi != null && lo != null) {
-    stop = String(t.bias).toLowerCase() === "long" ? lo : hi;
-    lines.push(`Invalidation: ${fmtPrice(stop)}`);
-  } else {
-    lines.push("Invalidation:");
+  // Entry Zone (1h B1 band)
+  if (hi1h != null && lo1h != null) {
+    const range1h = hi1h - lo1h;
+    const edge1h = CFG.strongEdgePct1h * range1h;
+
+    if (bias === "long") lines.push(`Entry Zone: ${fmtPrice(lo1h)}–${fmtPrice(lo1h + edge1h)}`);
+    else if (bias === "short") lines.push(`Entry Zone: ${fmtPrice(hi1h - edge1h)}–${fmtPrice(hi1h)}`);
   }
 
+  // Invalidation (mode-aware TF)
+  if (invalidationPx != null) lines.push(`Invalidation (${invTf}): ${fmtPrice(invalidationPx)}`);
+  else lines.push("Invalidation:");
+
+  // Avoid chasing (unchanged)
   if (price != null) {
     const chaseBuffer = price * 0.0025;
-    if (String(t.bias).toLowerCase() === "long") {
-      lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
-    } else {
-      lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
-    }
+    if (bias === "long") lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
+    else if (bias === "short") lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
   }
 
+  // Leverage (unchanged)
   if (t.leverage) {
     lines.push(
       `Leverage: ${t.leverage.suggestedLow}–${t.leverage.suggestedHigh}x (max ${t.leverage.adjustedMax}x)`
@@ -1108,19 +1147,23 @@ for (const t of triggered) {
 
   lines.push("");
 
-  if (stop != null) lines.push(`Stop Loss: ${fmtPrice(stop)}`);
+  // Stop Loss (separate from invalidation now)
+  if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
+  else lines.push("Stop Loss:");
 
-  if (hi != null && lo != null) {
+  // Take Profit (still 1h structure for now)
+  if (hi1h != null && lo1h != null) {
     lines.push("Take Profit:");
-    if (mid != null) lines.push(`• ${fmtPrice(mid)} (range mid)`);
-    if (String(t.bias).toLowerCase() === "long") lines.push(`• ${fmtPrice(hi)} (1h high)`);
-    else lines.push(`• ${fmtPrice(lo)} (1h low)`);
+    if (mid1h != null) lines.push(`• ${fmtPrice(mid1h)} (range mid)`);
+    if (bias === "long") lines.push(`• ${fmtPrice(hi1h)} (1h high)`);
+    else if (bias === "short") lines.push(`• ${fmtPrice(lo1h)} (1h low)`);
   }
 
   lines.push("");
 }
 
 const message = lines.join("\n");
+
     if (!dry) {
       const tg = await sendTelegram(message);
       if (!tg.ok) {
