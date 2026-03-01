@@ -845,7 +845,9 @@ export default async function handler(req, res) {
 
     
     // Macro snapshot for debug/response (use highest-priority mode as representative)
-    const macro = computeBtcMacro(j.results || [], modes?.[0] || "swing");
+    const macroByMode = Object.fromEntries(
+  (modes || ["scalp"]).map((m) => [m, computeBtcMacro(j.results || [], m)])
+);
     
     const now = Date.now();
     const cooldownMs = CFG.cooldownMinutes * 60000;
@@ -1040,7 +1042,7 @@ export default async function handler(req, res) {
         ok: true,
         sent: false,
         ...(debug
-          ? { deploy: getDeployInfo(), multiUrl, macro, skipped, modes, risk_profile, heartbeat_last_run }
+          ? { deploy: getDeployInfo(), multiUrl, macro: macroByMode, skipped, modes, risk_profile, heartbeat_last_run }
           : {}),
       });
     }
@@ -1179,7 +1181,7 @@ export default async function handler(req, res) {
         ? {
             deploy: getDeployInfo(),
             multiUrl,
-            macro,
+            macro: macroByMode,
             skipped,
             triggered,
             modes,
