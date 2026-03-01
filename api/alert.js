@@ -844,7 +844,9 @@ export default async function handler(req, res) {
     }
 
     
-
+    // Macro snapshot for debug/response (use highest-priority mode as representative)
+    const macro = computeBtcMacro(j.results || [], modes?.[0] || "swing");
+    
     const now = Date.now();
     const cooldownMs = CFG.cooldownMinutes * 60000;
 
@@ -899,14 +901,14 @@ export default async function handler(req, res) {
         }
 
         const bias = biasFromItem(item, mode);
-        const macro = computeBtcMacro(j.results || [], mode);
+        const macroMode = computeBtcMacro(j.results || [], mode);
         // Macro block
         if (
           !force &&
           CFG.macro.enabled &&
           CFG.macro.blockShortsOnAltsWhenBtcBull &&
-          macro?.ok &&
-          macro?.btcBullExpansion &&
+          macroMode?.ok &&
+          macroMode?.btcBullExpansion &&
           symbol.toUpperCase() !== CFG.macro.btcSymbol &&
           bias === "short"
         ) {
@@ -915,7 +917,8 @@ export default async function handler(req, res) {
               symbol,
               mode,
               reason: "macro_block_btc_bull_expansion",
-              btc4h: macro?.btc || null,
+              btc: macroMode?.btc || null,
+              tf: macroMode?.tf || null,
             });
           continue;
         }
