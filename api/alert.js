@@ -183,39 +183,6 @@ function normalizeSymbols(raw) {
     .filter(Boolean);
 }
 
-function modeTpTfOrder(mode) {
-  mode = String(mode || "").toLowerCase();
-  if (mode === "scalp") return ["15m", "1h", "4h"];
-  if (mode === "swing") return ["1h", "4h"];
-  if (mode === "build") return ["4h"];
-  return ["1h"];
-}
-
-function tpCandidatesForBias(bias, lvl) {
-  if (!lvl || lvl.warmup) return [];
-  const mid = lvl.mid != null ? Number(lvl.mid) : null;
-  const hi  = lvl.hi  != null ? Number(lvl.hi)  : null;
-  const lo  = lvl.lo  != null ? Number(lvl.lo)  : null;
-
-  if (bias === "long") return [mid, hi].filter((x) => x != null);
-  if (bias === "short") return [mid, lo].filter((x) => x != null);
-  return [];
-}
-
-// chooses the FIRST TF that gives you “enough room”; if none do, picks farthest TF available
-function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
-  const order = modeTpTfOrder(mode);
-
-  const pctMove = (a, b) => (Math.abs(b - a) / a) * 100;
-
-  for (const tf of order) {
-    const lvl = levels?.[tf];
-    for (const tp of tpCandidatesForBias(bias, lvl)) {
-      const tpPct = pctMove(price, tp);
-      if (tpPct >= minTpPct) return { tf, tp, tpPct, forced: false };
-    }
-  }
-
   // fallback: farthest available
   for (let i = order.length - 1; i >= 0; i--) {
     const tf = order[i];
@@ -887,6 +854,40 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
 
   return { ok: false, reason: "neutral_bias" };
 }
+
+
+function modeTpTfOrder(mode) {
+  mode = String(mode || "").toLowerCase();
+  if (mode === "scalp") return ["15m", "1h", "4h"];
+  if (mode === "swing") return ["1h", "4h"];
+  if (mode === "build") return ["4h"];
+  return ["1h"];
+}
+
+function tpCandidatesForBias(bias, lvl) {
+  if (!lvl || lvl.warmup) return [];
+  const mid = lvl.mid != null ? Number(lvl.mid) : null;
+  const hi  = lvl.hi  != null ? Number(lvl.hi)  : null;
+  const lo  = lvl.lo  != null ? Number(lvl.lo)  : null;
+
+  if (bias === "long") return [mid, hi].filter((x) => x != null);
+  if (bias === "short") return [mid, lo].filter((x) => x != null);
+  return [];
+}
+
+// chooses the FIRST TF that gives you “enough room”; if none do, picks farthest TF available
+function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
+  const order = modeTpTfOrder(mode);
+
+  const pctMove = (a, b) => (Math.abs(b - a) / a) * 100;
+
+  for (const tf of order) {
+    const lvl = levels?.[tf];
+    for (const tp of tpCandidatesForBias(bias, lvl)) {
+      const tpPct = pctMove(price, tp);
+      if (tpPct >= minTpPct) return { tf, tp, tpPct, forced: false };
+    }
+  }
 
 export default async function handler(req, res) {
   let dry = false;
