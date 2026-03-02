@@ -395,18 +395,23 @@ async function computeLevelsFromSeries(instId) {
       continue;
     }
 
-    const slice = pts
+        const highs = pts
       .slice(-n)
-      .map((p) => asNum(p?.p))
+      .map((p) => asNum(p?.h ?? p?.p))
       .filter((x) => x != null);
 
-    if (!slice.length) {
+    const lows = pts
+      .slice(-n)
+      .map((p) => asNum(p?.l ?? p?.p))
+      .filter((x) => x != null);
+
+    if (!highs.length || !lows.length) {
       out[label] = { warmup: true };
       continue;
     }
 
-    const hi = Math.max(...slice);
-    const lo = Math.min(...slice);
+    const hi = Math.max(...highs);
+    const lo = Math.min(...lows);
     out[label] = {
       warmup: false,
       hi,
