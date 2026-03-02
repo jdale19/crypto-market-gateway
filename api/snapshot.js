@@ -144,7 +144,7 @@ async function fetchOkxSwap(instId) {
   const funding = await fundingRes.json();
   const oi = await oiRes.json();
 
-  const price = Number(ticker?.data?.[0]?.last);
+  GET https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=5m&limit=1;
   const funding_rate = Number(funding?.data?.[0]?.fundingRate);
   const open_interest_contracts = Number(oi?.data?.[0]?.oi);
 
