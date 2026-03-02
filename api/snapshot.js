@@ -131,27 +131,38 @@ async function resolveOkxSwapInstId(symbol, reqCache) {
 }
 
 async function fetchOkxSwap(instId) {
-  const [tickerRes, fundingRes, oiRes] = await Promise.all([
-    fetchWithTimeout(`https://www.okx.com/api/v5/market/ticker?instId=${instId}`),
+  const [ohlcRes, fundingRes, oiRes] = await Promise.all([
+    fetchWithTimeout(
+      `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=5m&limit=2`
+    ),
     fetchWithTimeout(`https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`),
-    fetchWithTimeout(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`),
+    fetchWithTimeout(
+      `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`
+    ),
   ]);
 
-  if (!tickerRes.ok || !fundingRes.ok || !oiRes.ok)
+  if (!ohlcRes.ok || !fundingRes.ok || !oiRes.ok)
     return { ok: false, error: "okx fetch failed" };
 
-  const ticker = await tickerRes.json();
-  const funding = await fundingRes.json();
-  const oi = await oiRes.json();
+  const ohlc = await ohlcRes.json().catch(() => null);
+  const funding = await fundingRes.json().catch(() => null);
+  const oi = await oiRes.json().catch(() => null);
 
-  GET https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=5m&limit=1;
+  const row = ohlc?.data?.[0];
+  // OKX candles: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+  const o = Number(row?.[1]);
+  const h = Number(row?.[2]);
+  const l = Number(row?.[3]);
+  const c = Number(row?.[4]);
+
+  const price = c; // treat close as "price" snapshot for the 5m bucket
   const funding_rate = Number(funding?.data?.[0]?.fundingRate);
   const open_interest_contracts = Number(oi?.data?.[0]?.oi);
 
   if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts))
     return { ok: false, error: "instrument missing data" };
 
-  return { ok: true, price, funding_rate, open_interest_contracts };
+  return { ok: true, price, o, h, l, c, funding_rate, open_interest_contracts };
 }
 
 async function processOne(symbol, reqCache) {
@@ -178,11 +189,19 @@ async function processOne(symbol, reqCache) {
 
   if (!snapNow) {
     snapNow = {
-      price: okx.price,
-      funding_rate: okx.funding_rate,
-      open_interest_contracts: okx.open_interest_contracts,
-      ts: now,
-    };
+  // existing fields
+  price: okx.price,
+  p: okx.price, // backward compatibility for any .p readers
+  funding_rate: okx.funding_rate,
+  open_interest_contracts: okx.open_interest_contracts,
+  ts: now,
+
+  // NEW: full candle data for wick-aware logic
+  o: okx.o,
+  h: okx.h,
+  l: okx.l,
+  c: okx.c,
+};
     await redis.set(keyNow, JSON.stringify(snapNow));
     await redis.expire(keyNow, SNAP_TTL_SECONDS);
   }
