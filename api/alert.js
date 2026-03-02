@@ -202,14 +202,12 @@ async function lrangeTail(redis, key, n) {
   return await redis.lrange(key, start, end);
 }
 
-async function getPrevClosePair(instId) {
   async function getPrevClosePair(instId) {
   const raw = await lrangeTail(redis, CFG.keys.series5m(instId), 3);
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
   if (closes.length < 2) return null;
   return { prev: closes[closes.length - 2], last: closes[closes.length - 1] };
-}
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
   if (closes.length < 2) return null;
@@ -410,12 +408,39 @@ async function writeLastState(mode, instId, curState, { dry }) {
 
 async function computeLevelsFromSeries(instId) {
   const need = Math.max(...Object.values(CFG.levelWindows));
-  async function getPrevClosePair(instId) {
-  const raw = await lrangeTail(redis, CFG.keys.series5m(instId), 3);
+  const raw = await lrangeTail(redis, CFG.keys.series5m(instId), need);
+
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
-  const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
-  if (closes.length < 2) return null;
-  return { prev: closes[closes.length - 2], last: closes[closes.length - 1] };
+  const out = {};
+
+  for (const [label, n] of Object.entries(CFG.levelWindows)) {
+    if (pts.length < n) {
+      out[label] = { warmup: true };
+      continue;
+    }
+
+    const highs = pts
+      .slice(-n)
+      .map((p) => asNum(p?.h ?? p?.p))
+      .filter((x) => x != null);
+
+    const lows = pts
+      .slice(-n)
+      .map((p) => asNum(p?.l ?? p?.p))
+      .filter((x) => x != null);
+
+    if (!highs.length || !lows.length) {
+      out[label] = { warmup: true };
+      continue;
+    }
+
+    const hi = Math.max(...highs);
+    const lo = Math.min(...lows);
+    out[label] = { warmup: false, hi, lo, mid: (hi + lo) / 2 };
+  }
+
+  return out;
+};
 }
 
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
@@ -456,12 +481,14 @@ async function computeLevelsFromSeries(instId) {
 }
 
 async function getRecentPricesFromSeries(instId, n) {
-  async function getPrevClosePair(instId) {
-  const raw = await lrangeTail(redis, CFG.keys.series5m(instId), 3);
-  const pts = (raw || []).map(safeJsonParse).filter(Boolean);
-  const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
-  if (closes.length < 2) return null;
-  return { prev: closes[closes.length - 2], last: closes[closes.length - 1] };
+  const raw = await lrangeTail(redis, CFG.keys.series5m(instId), n);
+  return (raw || [])
+    .map(safeJsonParse)
+    .filter(Boolean)
+    .map((p) => asNum(p?.p))
+    .filter((x) => x != null);
+};
+};
 }
   return (raw || [])
     .map(safeJsonParse)
