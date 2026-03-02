@@ -1233,7 +1233,7 @@ const lev = computeLeverageFromStop({
   // lines.push(`⚡️ ${modeUp} TRADE ENTRY`);
   // lines.push("");
 
-  lines.push(`${t.symbol} $${fmtPrice(price)} | ${biasUp}`);
+  lines.push(`${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
   lines.push(`Confidence = ${confidence}`);
   lines.push("");
 
@@ -1242,8 +1242,8 @@ const lev = computeLeverageFromStop({
     const range1h = hi1h - lo1h;
     const edge1h = CFG.strongEdgePct1h * range1h;
 
-    if (bias === "long") lines.push(`Entry Zone: ${fmtPrice(lo1h)}–${fmtPrice(lo1h + edge1h)}`);
-    else if (bias === "short") lines.push(`Entry Zone: ${fmtPrice(hi1h - edge1h)}–${fmtPrice(hi1h)}`);
+  if (bias === "long") lines.push(`Entry Zone: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
+  else if (bias === "short") lines.push(`Entry Zone: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
   }
 
   // Invalidation (mode-aware TF)
@@ -1269,24 +1269,30 @@ if (lev) {
   else lines.push("Stop Loss:");
 
   // Take Profit (DYNAMIC TF)
-{
-  const minTpPct = Number(process.env.ALERT_MIN_TP_PCT || 0); // optional; set 0 to disable gating
-  const pick = chooseDynamicTp({
+// dynamic TP
+const minTpPct = Number(process.env.ALERT_MIN_TP_PCT || 0);
+
+const tpPick = chooseDynamicTp({
   mode,
   bias,
   price,
-  levels, // correct
+  levels,
   minTpPct,
 });
 
-  if (pick) {
-    lines.push(`Take Profit (${pick.tf}${pick.forced ? ", forced" : ""}):`);
-    lines.push(`• ${pick.tp} (tpPct ${pick.tpPct.toFixed(2)}%)`);
-  } else {
-    lines.push("Take Profit:");
-  }
+if (!tpPick) {
+  topSkips.push({ symbol, mode, reason: "no_dynamic_tp" });
+  continue;
 }
 
+const tp = tpPick.tp;
+const tpTf = tpPick.tf;
+const tpPct = tpPick.tpPct;
+
+// MESSAGE
+lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
+lines.push(`• ${tp} (≈ ${tpPct.toFixed(2)}%)`);
+  
   lines.push("");
 }
 
