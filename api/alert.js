@@ -182,6 +182,55 @@ function normalizeSymbols(raw) {
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
 }
+
+function modeTpTfOrder(mode) {
+  mode = String(mode || "").toLowerCase();
+  if (mode === "scalp") return ["15m", "1h", "4h"];
+  if (mode === "swing") return ["1h", "4h"];
+  if (mode === "build") return ["4h"];
+  return ["1h"];
+}
+
+function tpCandidatesForBias(bias, lvl) {
+  if (!lvl || lvl.warmup) return [];
+  const mid = lvl.mid != null ? Number(lvl.mid) : null;
+  const hi  = lvl.hi  != null ? Number(lvl.hi)  : null;
+  const lo  = lvl.lo  != null ? Number(lvl.lo)  : null;
+
+  if (bias === "long") return [mid, hi].filter((x) => x != null);
+  if (bias === "short") return [mid, lo].filter((x) => x != null);
+  return [];
+}
+
+// chooses the FIRST TF that gives you “enough room”; if none do, picks farthest TF available
+function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
+  const order = modeTpTfOrder(mode);
+
+  const pctMove = (a, b) => (Math.abs(b - a) / a) * 100;
+
+  for (const tf of order) {
+    const lvl = levels?.[tf];
+    for (const tp of tpCandidatesForBias(bias, lvl)) {
+      const tpPct = pctMove(price, tp);
+      if (tpPct >= minTpPct) return { tf, tp, tpPct, forced: false };
+    }
+  }
+
+  // fallback: farthest available
+  for (let i = order.length - 1; i >= 0; i--) {
+    const tf = order[i];
+    const lvl = levels?.[tf];
+    const tps = tpCandidatesForBias(bias, lvl);
+    if (tps.length) {
+      const tp = tps[0];
+      const tpPct = pctMove(price, tp);
+      return { tf, tp, tpPct, forced: true };
+    }
+  }
+
+  return null;
+}
+
 async function getPrevClosePair(instId) {
   const raw = await redis.lrange(CFG.keys.series5m(instId), -3, -1);
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
@@ -1218,13 +1267,24 @@ if (lev) {
   if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
   else lines.push("Stop Loss:");
 
-  // Take Profit (still 1h structure for now)
-  if (hi1h != null && lo1h != null) {
+  // Take Profit (DYNAMIC TF)
+{
+  const minTpPct = Number(process.env.ALERT_MIN_TP_PCT || 0); // optional; set 0 to disable gating
+  const pick = chooseDynamicTp({
+    mode,
+    bias,
+    price,
+    levels: t.levels,
+    minTpPct,
+  });
+
+  if (pick) {
+    lines.push(`Take Profit (${pick.tf}${pick.forced ? ", forced" : ""}):`);
+    lines.push(`• ${fmtPrice(pick.tp)} (tpPct ${fmtPct(pick.tpPct)}%)`);
+  } else {
     lines.push("Take Profit:");
-    if (mid1h != null) lines.push(`• ${fmtPrice(mid1h)} (range mid)`);
-    if (bias === "long") lines.push(`• ${fmtPrice(hi1h)} (1h high)`);
-    else if (bias === "short") lines.push(`• ${fmtPrice(lo1h)} (1h low)`);
   }
+}
 
   lines.push("");
 }
