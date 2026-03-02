@@ -1186,6 +1186,7 @@ for (const t of triggered) {
   const modeUp = mode.toUpperCase();
 
   // ENTRY ZONE stays 1h B1 band (per your current spec)
+  const levels = t.levels;
   const l1h = t.levels?.["1h"];
   const hi1h = l1h && !l1h.warmup ? asNum(l1h.hi) : null;
   const lo1h = l1h && !l1h.warmup ? asNum(l1h.lo) : null;
@@ -1291,7 +1292,7 @@ const tpPct = tpPick.tpPct;
 
 // MESSAGE
 lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
-lines.push(`• ${tp} (≈ ${tpPct.toFixed(2)}%)`);
+lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
   
   lines.push("");
 }
