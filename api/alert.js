@@ -1271,16 +1271,16 @@ if (lev) {
 {
   const minTpPct = Number(process.env.ALERT_MIN_TP_PCT || 0); // optional; set 0 to disable gating
   const pick = chooseDynamicTp({
-    mode,
-    bias,
-    price,
-    levels: t.levels,
-    minTpPct,
-  });
+  mode,
+  bias,
+  price,
+  levels, // correct
+  minTpPct,
+});
 
   if (pick) {
     lines.push(`Take Profit (${pick.tf}${pick.forced ? ", forced" : ""}):`);
-    lines.push(`• ${fmtPrice(pick.tp)} (tpPct ${fmtPct(pick.tpPct)}%)`);
+    lines.push(`• ${pick.tp} (tpPct ${pick.tpPct.toFixed(2)}%)`);
   } else {
     lines.push("Take Profit:");
   }
