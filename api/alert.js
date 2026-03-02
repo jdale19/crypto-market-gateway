@@ -182,8 +182,28 @@ function normalizeSymbols(raw) {
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
 }
+
+/**
+ * SAFE TAIL READER FOR REDIS LISTS
+ *
+ * Why this exists:
+ * Upstash REST + negative LRANGE indices (-n, -1) can behave inconsistently.
+ * We intentionally avoid negative indices and compute positive bounds
+ * using LLEN to guarantee deterministic tail reads.
+ *
+ * DO NOT revert back to negative LRANGE.
+ */
+async function lrangeTail(redis, key, n) {
+  const need = Math.max(1, Number(n) || 1);
+  const len = await redis.llen(key);
+  if (!Number.isFinite(len) || len <= 0) return [];
+  const end = len - 1;
+  const start = Math.max(0, len - need);
+  return await redis.lrange(key, start, end);
+}
+
 async function getPrevClosePair(instId) {
-  const raw = await redis.lrange(CFG.keys.series5m(instId), -3, -1);
+  const raw = await redis.const raw = await lrangeTail(redis, CFG.keys.series5m(instId), need);
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
   if (closes.length < 2) return null;
@@ -384,7 +404,7 @@ async function writeLastState(mode, instId, curState, { dry }) {
 
 async function computeLevelsFromSeries(instId) {
   const need = Math.max(...Object.values(CFG.levelWindows));
-  const raw = await redis.lrange(CFG.keys.series5m(instId), -need, -1);
+  const raw = await redis.const raw = await lrangeTail(redis, CFG.keys.series5m(instId), need);
 
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const out = {};
@@ -424,7 +444,7 @@ async function computeLevelsFromSeries(instId) {
 }
 
 async function getRecentPricesFromSeries(instId, n) {
-  const raw = await redis.lrange(CFG.keys.series5m(instId), -Math.max(1, n), -1);
+  const raw = await redis.const raw = await lrangeTail(redis, CFG.keys.series5m(instId), need);
   return (raw || [])
     .map(safeJsonParse)
     .filter(Boolean)
