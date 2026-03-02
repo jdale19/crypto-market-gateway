@@ -203,7 +203,13 @@ async function lrangeTail(redis, key, n) {
 }
 
 async function getPrevClosePair(instId) {
-  const raw = await redis.const raw = await lrangeTail(redis, CFG.keys.series5m(instId), need);
+  async function getPrevClosePair(instId) {
+  const raw = await lrangeTail(redis, CFG.keys.series5m(instId), 3);
+  const pts = (raw || []).map(safeJsonParse).filter(Boolean);
+  const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
+  if (closes.length < 2) return null;
+  return { prev: closes[closes.length - 2], last: closes[closes.length - 1] };
+}
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
   if (closes.length < 2) return null;
@@ -404,7 +410,13 @@ async function writeLastState(mode, instId, curState, { dry }) {
 
 async function computeLevelsFromSeries(instId) {
   const need = Math.max(...Object.values(CFG.levelWindows));
-  const raw = await redis.const raw = await lrangeTail(redis, CFG.keys.series5m(instId), need);
+  async function getPrevClosePair(instId) {
+  const raw = await lrangeTail(redis, CFG.keys.series5m(instId), 3);
+  const pts = (raw || []).map(safeJsonParse).filter(Boolean);
+  const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
+  if (closes.length < 2) return null;
+  return { prev: closes[closes.length - 2], last: closes[closes.length - 1] };
+}
 
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
   const out = {};
@@ -444,7 +456,13 @@ async function computeLevelsFromSeries(instId) {
 }
 
 async function getRecentPricesFromSeries(instId, n) {
-  const raw = await redis.const raw = await lrangeTail(redis, CFG.keys.series5m(instId), need);
+  async function getPrevClosePair(instId) {
+  const raw = await lrangeTail(redis, CFG.keys.series5m(instId), 3);
+  const pts = (raw || []).map(safeJsonParse).filter(Boolean);
+  const closes = pts.map(p => asNum(p?.p)).filter(x => x != null);
+  if (closes.length < 2) return null;
+  return { prev: closes[closes.length - 2], last: closes[closes.length - 1] };
+}
   return (raw || [])
     .map(safeJsonParse)
     .filter(Boolean)
