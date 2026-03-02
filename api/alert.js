@@ -1234,7 +1234,7 @@ const lev = computeLeverageFromStop({
   // lines.push(`⚡️ ${modeUp} TRADE ENTRY`);
   // lines.push("");
 
-  lines.push(`${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
+  lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
   lines.push(`Confidence = ${confidence}`);
   lines.push("");
 
