@@ -889,7 +889,7 @@ function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
     }
   }
 }
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   let dry = false;
   let debug = false;
   let risk_profile = CFG.defaultRisk;
