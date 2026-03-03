@@ -76,6 +76,18 @@ const CFG = {
   // B1 edge (structural proximity)
   strongEdgePct1h: Number(process.env.ALERT_STRONG_EDGE_PCT_1H || 0.15),
 
+  minTpPctByMode: {
+  scalp: Number(process.env.ALERT_MIN_TP_PCT_SCALP || 0.25),
+  swing: Number(process.env.ALERT_MIN_TP_PCT_SWING || 1.0),
+  build: Number(process.env.ALERT_MIN_TP_PCT_BUILD || 3.0),
+},
+
+minRangePctByMode: {
+  scalp: Number(process.env.ALERT_MIN_RANGE_PCT_SCALP || 0.4),
+  swing: Number(process.env.ALERT_MIN_RANGE_PCT_SWING || 0.9),
+  build: Number(process.env.ALERT_MIN_RANGE_PCT_BUILD || 1.0),
+},
+  
   // Swing reversal micro-confirm (5m push away from extreme)
   swingReversalMin5mMovePct: Number(process.env.ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT || 0.05),
 
