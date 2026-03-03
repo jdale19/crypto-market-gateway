@@ -895,7 +895,7 @@ module.exports = async function handler(req, res) {
   let risk_profile = CFG.defaultRisk;
 
   // evaluate potentially multiple modes in priority order
-  let modes = ["scalp"];
+  let modes = ["scalp"];}
 
   try {
     const secret = process.env.ALERT_SECRET || "";
