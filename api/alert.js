@@ -183,21 +183,6 @@ function normalizeSymbols(raw) {
     .filter(Boolean);
 }
 
-  // fallback: farthest available
-  for (let i = order.length - 1; i >= 0; i--) {
-    const tf = order[i];
-    const lvl = levels?.[tf];
-    const tps = tpCandidatesForBias(bias, lvl);
-    if (tps.length) {
-      const tp = tps[0];
-      const tpPct = pctMove(price, tp);
-      return { tf, tp, tpPct, forced: true };
-    }
-  }
-
-  return null;
-}
-
 async function getPrevClosePair(instId) {
   const raw = await redis.lrange(CFG.keys.series5m(instId), -3, -1);
   const pts = (raw || []).map(safeJsonParse).filter(Boolean);
