@@ -888,6 +888,7 @@ function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
       if (tpPct >= minTpPct) return { tf, tp, tpPct, forced: false };
     }
   }
+  }
 
 module.exports = async function handler(req, res) {
   let dry = false;
