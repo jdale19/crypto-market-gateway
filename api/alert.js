@@ -351,6 +351,30 @@ async function readHeartbeat() {
   }
 }
 
+function getModeCfg(mode) {
+  const m = String(mode || "scalp").toLowerCase();
+  return {
+    minTpPct: Number(CFG.minTpPctByMode?.[m] ?? 0),
+    minRangePct: Number(CFG.minRangePctByMode?.[m] ?? 0),
+  };
+}
+
+// Uses 1h range as the structural “room to trade” proxy
+function rangePct1h({ levels, price }) {
+  const l1h = levels?.["1h"];
+  const p = asNum(price);
+  if (!l1h || l1h.warmup || p == null || p <= 0) return null;
+
+  const hi = asNum(l1h.hi);
+  const lo = asNum(l1h.lo);
+  if (hi == null || lo == null) return null;
+
+  const range = hi - lo;
+  if (!(range > 0)) return null;
+
+  return (range / p) * 100;
+}
+
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -378,6 +402,30 @@ async function sendTelegram(text) {
   const j = await r.json().catch(() => null);
   if (!r.ok || !j?.ok) return { ok: false, detail: j };
   return { ok: true };
+}
+
+function getModeCfg(mode) {
+  const m = String(mode || "scalp").toLowerCase();
+  return {
+    minTpPct: Number(CFG.minTpPctByMode?.[m] ?? 0),
+    minRangePct: Number(CFG.minRangePctByMode?.[m] ?? 0),
+  };
+}
+
+// Uses 1h range as the structural “room to trade” proxy
+function rangePct1h({ levels, price }) {
+  const l1h = levels?.["1h"];
+  const p = asNum(price);
+  if (!l1h || l1h.warmup || p == null || p <= 0) return null;
+
+  const hi = asNum(l1h.hi);
+  const lo = asNum(l1h.lo);
+  if (hi == null || lo == null) return null;
+
+  const range = hi - lo;
+  if (!(range > 0)) return null;
+
+  return (range / p) * 100;
 }
 
 // State write helper to satisfy v2.6 seeding rule (mirror legacy for swing/build)
@@ -675,6 +723,21 @@ function computeBtcMacro(results, mode) {
   };
 }
 
+const { minRangePct } = getModeCfg(mode);
+const rPct = rangePct1h({ levels, price: item.price });
+
+if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
+  if (!Number.isFinite(rPct) || rPct < minRangePct) {
+    if (debug) skipped.push({
+      symbol,
+      mode,
+      reason: "range_floor",
+      detail: { rangePct1h: rPct, minRangePct }
+    });
+    continue;
+  }
+}
+
 /**
  * STRICT ENTRY (SCALP) — unchanged logic, UPDATED COPY (message contract ready)
  */
@@ -921,7 +984,10 @@ module.exports = async function handler(req, res) {
 
     debug = String(req.query.debug || "") === "1";
     const force = String(req.query.force || "") === "1";
-    dry = String(req.query.dry || "") === "1";
+    if (force) {
+  console.log("⚠️ FORCE MODE ACTIVE");
+}
+     dry = String(req.query.dry || "") === "1";
     const driver_tf = normalizeDriverTf(req.query.driver_tf);
 
     // Modes: query overrides env, env overrides legacy defaultMode
@@ -1273,7 +1339,7 @@ if (lev) {
 
   // Take Profit (DYNAMIC TF)
 // dynamic TP
-const minTpPct = Number(process.env.ALERT_MIN_TP_PCT || 0);
+const { minTpPct } = getModeCfg(mode);
 
 const tpPick = chooseDynamicTp({
   mode,
