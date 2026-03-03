@@ -878,9 +878,9 @@ function tpCandidatesForBias(bias, lvl) {
 // chooses the FIRST TF that gives you “enough room”; if none do, picks farthest TF available
 function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
   const order = modeTpTfOrder(mode);
-
   const pctMove = (a, b) => (Math.abs(b - a) / a) * 100;
 
+  // First pass: find a TP with enough room
   for (const tf of order) {
     const lvl = levels?.[tf];
     for (const tp of tpCandidatesForBias(bias, lvl)) {
@@ -888,7 +888,21 @@ function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
       if (tpPct >= minTpPct) return { tf, tp, tpPct, forced: false };
     }
   }
+
+  // Fallback: farthest available
+  for (let i = order.length - 1; i >= 0; i--) {
+    const tf = order[i];
+    const lvl = levels?.[tf];
+    const tps = tpCandidatesForBias(bias, lvl);
+    if (tps.length) {
+      const tp = tps[0];
+      const tpPct = pctMove(price, tp);
+      return { tf, tp, tpPct, forced: true };
+    }
   }
+
+  return null;
+}
 
 module.exports = async function handler(req, res) {
   let dry = false;
