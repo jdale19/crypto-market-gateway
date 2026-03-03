@@ -1297,7 +1297,7 @@ const tpPick = chooseDynamicTp({
 });
 
 if (!tpPick) {
-  topSkips.push({ symbol, mode, reason: "no_dynamic_tp" });
+  topSkips.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
   continue;
 }
 
