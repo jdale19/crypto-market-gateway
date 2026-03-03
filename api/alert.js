@@ -892,7 +892,7 @@ function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
 module.exports = async function handler(req, res) {
   let dry = false;
   let debug = false;
-  let risk_profile = CFG.defaultRisk;
+  let risk_profile = CFG.defaultRisk;}
 
   // evaluate potentially multiple modes in priority order
   let modes = ["scalp"];
