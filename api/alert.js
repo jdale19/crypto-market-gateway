@@ -922,24 +922,35 @@ function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
   const order = modeTpTfOrder(mode);
   const pctMove = (a, b) => (Math.abs(b - a) / a) * 100;
 
+  const isValidDir = (entry, tp) => {
+    if (bias === "long") return tp > entry;
+    if (bias === "short") return tp < entry;
+    return false;
+  };
+
   // First pass: find a TP with enough room
   for (const tf of order) {
     const lvl = levels?.[tf];
     for (const tp of tpCandidatesForBias(bias, lvl)) {
+      if (!isValidDir(price, tp)) continue;          // ✅ direction guard
       const tpPct = pctMove(price, tp);
       if (tpPct >= minTpPct) return { tf, tp, tpPct, forced: false };
     }
   }
 
-  // Fallback: farthest available
+  // Fallback: farthest available (but still correct direction)
   for (let i = order.length - 1; i >= 0; i--) {
     const tf = order[i];
     const lvl = levels?.[tf];
-    const tps = tpCandidatesForBias(bias, lvl);
+    const tps = tpCandidatesForBias(bias, lvl).filter((tp) => isValidDir(price, tp)); // ✅
     if (tps.length) {
-      const tp = tps[0];
-      const tpPct = pctMove(price, tp);
-      return { tf, tp, tpPct, forced: true };
+      // pick FARTHER one, not tps[0]
+      let best = null;
+      for (const tp of tps) {
+        const tpPct = pctMove(price, tp);
+        if (!best || tpPct > best.tpPct) best = { tf, tp, tpPct, forced: true };
+      }
+      return best;
     }
   }
 
