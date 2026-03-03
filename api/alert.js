@@ -257,18 +257,6 @@ if (b !== "long" && b !== "short") return null;
   return sl;
 }
 
-function normalizeMacroTf(raw) {
-  const tf = String(raw || "").toLowerCase();
-  return ["1h", "4h"].includes(tf) ? tf : null;
-}
-
-function macroTfForMode(mode) {
-  const m = String(mode || "scalp").toLowerCase();
-  if (m === "scalp") return normalizeMacroTf(process.env.ALERT_MACRO_TF_SCALP) || "1h";
-  if (m === "swing") return normalizeMacroTf(process.env.ALERT_MACRO_TF_SWING) || "4h";
-  if (m === "build") return normalizeMacroTf(process.env.ALERT_MACRO_TF_BUILD) || "4h";
-  return "4h";
-}
 
 function invalidationTfForMode(mode) {
   const m = String(mode || "scalp").toLowerCase();
@@ -357,6 +345,13 @@ async function sendTelegram(text) {
 
   if (!token || !chatId)
     return { ok: false, detail: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
+
+  // Hard guard: Telegram limit is 4096 chars. Keep a safety margin.
+  const maxChars = Number(CFG.telegramMaxChars || 3800);
+  if (text && text.length > maxChars) {
+    const over = text.length - maxChars;
+    text = text.slice(0, Math.max(0, maxChars - 40)) + `\n\n…(truncated ${over} chars)`;
+  }
 
   const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -1172,11 +1167,6 @@ module.exports = async function handler(req, res) {
 // ---- Render DM ----
 
 const lines = [];
-
-const uniqueModes = Array.from(
-  new Set(triggered.map((t) => String(t.mode || "").toUpperCase()).filter(Boolean))
-);
-const headerMode = uniqueModes.length === 1 ? uniqueModes[0] : "MIXED";
 
 lines.push(`⚡️TRADE ENTRY`);
 lines.push("");
