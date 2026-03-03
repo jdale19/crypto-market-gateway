@@ -16,7 +16,7 @@
 // - Default modes now use DEFAULT_MODES env var (comma list). DEFAULT_MODE is still honored as fallback.
 // - Leverage reco is advisory text only; does not change gating.
 
-import { Redis } from "@upstash/redis";
+const { Redis } = require("@upstash/redis");
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
