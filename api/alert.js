@@ -723,20 +723,7 @@ function computeBtcMacro(results, mode) {
   };
 }
 
-const { minRangePct } = getModeCfg(mode);
-const rPct = rangePct1h({ levels, price: item.price });
 
-if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
-  if (!Number.isFinite(rPct) || rPct < minRangePct) {
-    if (debug) skipped.push({
-      symbol,
-      mode,
-      reason: "range_floor",
-      detail: { rangePct1h: rPct, minRangePct }
-    });
-    continue;
-  }
-}
 
 /**
  * STRICT ENTRY (SCALP) — unchanged logic, UPDATED COPY (message contract ready)
@@ -1104,6 +1091,23 @@ module.exports = async function handler(req, res) {
         }
 
         const bias = biasFromItem(item, mode);
+        
+        const { minRangePct } = getModeCfg(mode);
+const rPct = rangePct1h({ levels, price: item.price });
+
+if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
+  if (!Number.isFinite(rPct) || rPct < minRangePct) {
+    if (debug)
+      skipped.push({
+        symbol,
+        mode,
+        reason: "range_floor",
+        detail: { rangePct1h: rPct, minRangePct },
+      });
+    continue;
+  }
+}
+        
         const macroMode = computeBtcMacro(j.results || [], mode);
         // Macro block
         if (
