@@ -1178,7 +1178,7 @@ const uniqueModes = Array.from(
 );
 const headerMode = uniqueModes.length === 1 ? uniqueModes[0] : "MIXED";
 
-lines.push(`⚡️ TRADE ENTRY`);
+lines.push(`⚡️TRADE ENTRY`);
 lines.push("");
 
 for (const t of triggered) {
