@@ -1015,9 +1015,10 @@ module.exports = async function handler(req, res) {
     const host = req.headers["x-forwarded-host"] || req.headers.host;
     const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 
+    const wantRegime = modes.includes("build");
     const multiUrl = `${proto}://${host}/api/multi?symbols=${encodeURIComponent(
-      symbols.join(",")
-    )}&driver_tf=${encodeURIComponent(driver_tf)}&source=snapshot`;
+     symbols.join(",")
+    )}&driver_tf=${encodeURIComponent(driver_tf)}&source=snapshot${wantRegime ? "&regime=1" : ""}`;
 
     const r = await fetch(multiUrl, { headers: { "Cache-Control": "no-store" } });
     const j = await r.json().catch(() => null);
@@ -1169,6 +1170,14 @@ if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
             entryLine = g.entryLine || null;
             execReason = g.reason || null;
           } else {
+            // --- Build Regime Gate (soft) ---
+if (mode === "build") {
+  const br = item?.build_regime;
+  if (br?.regime === "avoid") {
+    if (debug) skipped.push({ symbol, mode, reason: "build_regime_avoid", detail: br });
+    continue;
+  }
+}
             const modeLabel = mode === "build" ? "BUILD" : "SWING";
             const g = swingExecutionGate({ bias, levels, item, modeLabel });
 
