@@ -463,7 +463,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
   // Get current snapshot (either from OKX or from Upstash snapshot keys)
   let cur;
   if (dataSource === "snapshot") {
-    cur = await fetchSnapshotForInstId(instId, symbol, counters);
+    cur = await fetchSnapshotForInstId(instId, counters);
   } else {
     cur = await fetchOkxSwap(instId, counters);
   }
