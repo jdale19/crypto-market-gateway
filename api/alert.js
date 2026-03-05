@@ -404,30 +404,6 @@ async function sendTelegram(text) {
   return { ok: true };
 }
 
-function getModeCfg(mode) {
-  const m = String(mode || "scalp").toLowerCase();
-  return {
-    minTpPct: Number(CFG.minTpPctByMode?.[m] ?? 0),
-    minRangePct: Number(CFG.minRangePctByMode?.[m] ?? 0),
-  };
-}
-
-// Uses 1h range as the structural “room to trade” proxy
-function rangePct1h({ levels, price }) {
-  const l1h = levels?.["1h"];
-  const p = asNum(price);
-  if (!l1h || l1h.warmup || p == null || p <= 0) return null;
-
-  const hi = asNum(l1h.hi);
-  const lo = asNum(l1h.lo);
-  if (hi == null || lo == null) return null;
-
-  const range = hi - lo;
-  if (!(range > 0)) return null;
-
-  return (range / p) * 100;
-}
-
 // State write helper to satisfy v2.6 seeding rule (mirror legacy for swing/build)
 async function writeLastState(mode, instId, curState, { dry }) {
   if (dry) return;
@@ -1055,6 +1031,19 @@ module.exports = async function handler(req, res) {
     const triggered = [];
     const skipped = [];
 
+    // Debug-only: show build regime per symbol (so you can confirm gate inputs)
+const debug_build_regimes =
+  debug && modes.includes("build")
+    ? (j.results || []).map((it) => ({
+        symbol: it?.symbol,
+        ok: it?.ok,
+        regime: it?.build_regime?.regime ?? null,
+        score: it?.build_regime?.score ?? null,
+        warmup: it?.build_regime?.warmup ?? null,
+        points: it?.build_regime?.inputs?.points72 ?? null,
+      }))
+    : undefined;
+
     for (const item of j.results || []) {
       if (!item?.ok) {
         if (debug)
@@ -1260,9 +1249,18 @@ if (mode === "build") {
       return res.json({
         ok: true,
         sent: false,
-        ...(debug
-          ? { deploy: getDeployInfo(), multiUrl, macro: macroByMode, skipped, modes, risk_profile, heartbeat_last_run }
-          : {}),
+      ...(debug
+  ? {
+      deploy: getDeployInfo(),
+      multiUrl,
+      macro: macroByMode,
+      skipped,
+      modes,
+      risk_profile,
+      debug_build_regimes,
+      heartbeat_last_run,
+    }
+  : {}),
       });
     }
     
@@ -1374,7 +1372,7 @@ const tpPick = chooseDynamicTp({
 });
 
 if (!tpPick) {
-  topSkips.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
+  if (debug) skipped.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
   continue;
 }
 
@@ -1443,6 +1441,7 @@ const message = lines.join("\n");
             skipped,
             triggered,
             modes,
+            debug_build_regimes,
             risk_profile,
             renderedMessage: message,
             heartbeat_last_run,
