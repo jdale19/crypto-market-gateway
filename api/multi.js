@@ -25,8 +25,8 @@ const redis = new Redis({
 });
 
 const BUCKET_MS = 5 * 60 * 1000;
-const SERIES_POINTS_24H = 864; // 24h / 5m
-const SERIES_TTL_SECONDS = 60 * 60 * 48; // 48h
+const SERIES_POINTS_CAP = 864; // 72h / 5m (12 points/hour * 72h)
+const SERIES_TTL_SECONDS = 60 * 60 * 96; // 96h
 const INST_MAP_TTL_SECONDS = 60 * 60 * 24; // 24h
 const INST_LIST_TTL_SECONDS = 60 * 60 * 12; // 12h
 
@@ -192,7 +192,7 @@ async function resolveOkxSwapInstId(symbol, { dataSource, counters }) {
 // --- Snapshot read (SNAPSHOT MODE only) ---
 // ✅ UPDATED: read the SAME keys written by /api/snapshot.js
 // /api/snapshot.js stores: `snap5m:${instId}:${bucket}`
-async function fetchSnapshotForInstId(instId, symbol, counters) {
+async function fetchSnapshotForInstId(instId, counters) {
   const now = Date.now();
   const bucket = Math.floor(now / BUCKET_MS);
 
@@ -296,7 +296,155 @@ function computeTfDeltas(points, tf, funding_rate) {
   };
 }
 
-async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, counters) {
+function median(nums) {
+  const a = (nums || []).filter((x) => Number.isFinite(x)).sort((x, y) => x - y);
+  if (!a.length) return null;
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function maxDrawdownPct(prices) {
+  const a = (prices || []).filter((x) => Number.isFinite(x));
+  if (a.length < 2) return null;
+  let peak = a[0];
+  let maxDD = 0; // negative
+  for (const p of a) {
+    if (p > peak) peak = p;
+    const dd = ((p - peak) / peak) * 100;
+    if (dd < maxDD) maxDD = dd;
+  }
+  return maxDD;
+}
+
+function pctChangeSimple(now, prev) {
+  if (!Number.isFinite(prev) || prev === 0) return null;
+  if (!Number.isFinite(now)) return null;
+  return ((now - prev) / prev) * 100;
+}
+
+function computeBuildRegime(points72) {
+  // points are {p, oi, fr}
+  const pts = (points72 || []).filter((x) => x && Number.isFinite(x.p));
+  const n = pts.length;
+
+  const out = {
+    ok: false,
+    warmup: true,
+    regime: "neutral",
+    score: 0,
+    inputs: {},
+    flags: {},
+    reasons: [],
+  };
+
+  if (n < 200) return out; // warmup until you have meaningful history
+
+  const W24 = pts.slice(Math.max(0, n - 288));
+  const W72 = pts; // expects ~864 if fully warmed
+
+  const p24_0 = W24[0]?.p, p24_1 = W24[W24.length - 1]?.p;
+  const p72_0 = W72[0]?.p, p72_1 = W72[W72.length - 1]?.p;
+
+  const oi24_0 = W24[0]?.oi, oi24_1 = W24[W24.length - 1]?.oi;
+  const oi72_0 = W72[0]?.oi, oi72_1 = W72[W72.length - 1]?.oi;
+
+  const ret24 = pctChangeSimple(p24_1, p24_0);
+  const ret72 = pctChangeSimple(p72_1, p72_0);
+  const oiChg24 = pctChangeSimple(oi24_1, oi24_0);
+  const oiChg72 = pctChangeSimple(oi72_1, oi72_0);
+
+  const frVals = W72.map((x) => x.fr).filter((x) => Number.isFinite(x));
+  const frNow = pts[n - 1]?.fr;
+  const frMed = median(frVals);
+  const absDevs = frVals.map((x) => Math.abs(x - frMed)).filter((x) => Number.isFinite(x));
+  const frMad = median(absDevs);
+  const eps = 1e-12;
+  const frZ = Number.isFinite(frNow) && Number.isFinite(frMed) && Number.isFinite(frMad)
+    ? (frNow - frMed) / (1.4826 * frMad + eps)
+    : null;
+
+  const prices72 = W72.map((x) => x.p);
+  const maxDD72 = maxDrawdownPct(prices72);
+
+  // Flags
+  const waterfallRisk =
+    Number.isFinite(ret24) && Number.isFinite(oiChg24) && ret24 <= -1.2 && oiChg24 >= 1.0;
+
+  const accumulationDiv =
+    Number.isFinite(ret72) &&
+    Number.isFinite(oiChg72) &&
+    Number.isFinite(maxDD72) &&
+    ret72 <= 0.3 &&
+    oiChg72 >= 2.0 &&
+    maxDD72 > -6.0;
+
+  // Score
+  let score = 0;
+
+  // Trend / stability
+  if (Number.isFinite(ret72)) {
+    if (ret72 >= 0.5) score += 25;
+    else if (ret72 >= -1.0) score += 15;
+    else score -= 15;
+  }
+
+  if (Number.isFinite(maxDD72)) {
+    if (maxDD72 > -6.0) score += 10;
+    else if (maxDD72 <= -10.0) score -= 15;
+  }
+
+  // OI behavior
+  if (Number.isFinite(oiChg72)) {
+    if (oiChg72 >= 1.0 && oiChg72 <= 8.0) score += 20;
+    else if (oiChg72 > 8.0) score += 10;
+  }
+
+  if (accumulationDiv) score += 10;
+  if (waterfallRisk) score -= 30;
+
+  // Funding crowding
+  if (Number.isFinite(frZ)) {
+    if (frZ <= -0.5) score += 20;
+    else if (frZ > -0.5 && frZ < 0.5) score += 10;
+    else if (frZ >= 0.5) score -= 10;
+    if (frZ >= 1.5) score -= 15;
+  }
+
+  // Regime mapping
+  let regime = "neutral";
+  if (score >= 30) regime = "accumulate";
+  else if (score <= -30) regime = "avoid";
+
+  // Reasons
+  const reasons = [];
+  if (accumulationDiv) reasons.push("OI rising 72h while price flat/down (accumulation divergence)");
+  if (waterfallRisk) reasons.push("Waterfall risk: price down 24h while OI rising (short pile-in risk)");
+  if (Number.isFinite(maxDD72) && maxDD72 > -6.0) reasons.push("72h drawdown contained (<6%)");
+  if (Number.isFinite(frZ) && frZ >= 1.5) reasons.push("Funding stretched positive (crowded longs)");
+  if (Number.isFinite(frZ) && frZ <= -0.5) reasons.push("Funding below baseline (less crowded)");
+
+  out.ok = true;
+  out.warmup = false;
+  out.regime = regime;
+  out.score = score;
+  out.inputs = {
+    ret24,
+    ret72,
+    oiChg24,
+    oiChg72,
+    fr_now: frNow ?? null,
+    fr_med72: frMed ?? null,
+    fr_z72: frZ ?? null,
+    maxDD72,
+    points72: n,
+  };
+  out.flags = { waterfall_risk: waterfallRisk, accumulation_divergence: accumulationDiv };
+  out.reasons = reasons;
+
+  return out;
+}
+
+async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRegime, counters) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) {
     return { ok: false, symbol, error: "unsupported symbol format (expected like ETHUSDT)" };
@@ -347,8 +495,8 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, counters)
 
     // Trim using POSITIVE indices (avoid negative-index quirks)
     const lenAfter = await redis.llen(seriesKey);
-    if (Number.isFinite(lenAfter) && lenAfter > SERIES_POINTS_24H) {
-      const startKeep = Math.max(0, lenAfter - SERIES_POINTS_24H);
+    if (Number.isFinite(lenAfter) && lenAfter > SERIES_POINTS_CAP) {
+      const startKeep = Math.max(0, lenAfter - SERIES_POINTS_CAP);
       await redis.ltrim(seriesKey, startKeep, lenAfter - 1);
     }
 
@@ -371,6 +519,16 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, counters)
     deltas[tf] = computeTfDeltas(points, tf, funding_rate);
   }
 
+  let build_regime = null;
+if (includeRegime) {
+  const seriesLenForRegime = seriesLen;
+  const endR = Math.max(0, (seriesLenForRegime || 0) - 1);
+  const startR = Math.max(0, (seriesLenForRegime || 0) - SERIES_POINTS_CAP);
+  const rawR = seriesLenForRegime > 0 ? await redis.lrange(seriesKey, startR, endR) : [];
+  const ptsR = (rawR || []).map(safeJsonParse).filter(Boolean);
+  build_regime = computeBuildRegime(ptsR);
+}
+
   // Driver summary
   const driver = deltas[driver_tf] || deltas["5m"];
   const lean = driver?.lean ?? "neutral";
@@ -378,23 +536,24 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, counters)
   const state = driver?.state ?? "unknown";
 
   const out = {
-    ok: true,
-    symbol,
-    instId,
+  ok: true,
+  symbol,
+  instId,
 
-    price,
-    funding_rate,
-    open_interest_contracts,
-    open_interest_usd,
+  price,
+  funding_rate,
+  open_interest_contracts,
+  open_interest_usd,
 
-    driver_tf,
-    state,
-    lean,
-    why,
-    deltas,
+  driver_tf,
+  state,
+  lean,
+  why,
+  deltas,
+  build_regime,
 
-    source: dataSource === "snapshot" ? "upstash_snapshot+upstash_series" : "okx_swap_public_api+upstash_series",
-  };
+  source: dataSource === "snapshot" ? "upstash_snapshot+upstash_series" : "okx_swap_public_api+upstash_series",
+};
 
   if (debugMode) {
     out.debug = {
@@ -446,8 +605,14 @@ export default async function handler(req, res) {
     };
 
     const now = Date.now();
-    const results = await Promise.all(symbols.map((sym) => fetchOne(sym, now, driver_tf, debugMode, dataSource, counters)));
+    const includeRegime = String(req.query.regime || "") === "1";
 
+    const results = await Promise.all(
+     symbols.map((sym) =>
+      fetchOne(sym, now, driver_tf, debugMode, dataSource, includeRegime, counters)
+  )
+);
+    
     res.setHeader("Cache-Control", "no-store");
 
     const payload = {
@@ -460,7 +625,7 @@ export default async function handler(req, res) {
       note:
         dataSource === "snapshot"
           ? "SNAPSHOT mode. NO OKX calls. Reads current snapshot from Upstash and updates rolling 5m series; deltas derived from stored points."
-          : "OKX perps-only. Rolling 5m series (24h). Each response includes deltas for 5m/15m/30m/1h/4h derived from 5m points.",
+          : "OKX perps-only. Rolling 5m series (72h). Each response includes deltas for 5m/15m/30m/1h/4h derived from 5m points.",
       tip: "Add &debug=1 to see per-symbol series_len / wrote_point plus request counters showing OKX calls (or none).",
     };
 
