@@ -10,7 +10,7 @@ const redis = new Redis({
 });
 
 const BUCKET_MS = 5 * 60 * 1000;
-const SNAP_TTL_SECONDS = 60 * 60 * 24;
+const SNAP_TTL_SECONDS = 60 * 60 * 72;
 const INST_MAP_TTL_SECONDS = 60 * 60 * 24;
 const INST_LIST_TTL_SECONDS = 60 * 60 * 12;
 const FETCH_TIMEOUT_MS = 8000;
