@@ -25,7 +25,7 @@ const redis = new Redis({
 });
 
 const BUCKET_MS = 5 * 60 * 1000;
-const SERIES_POINTS_24H = 288; // 24h / 5m
+const SERIES_POINTS_24H = 864; // 24h / 5m
 const SERIES_TTL_SECONDS = 60 * 60 * 48; // 48h
 const INST_MAP_TTL_SECONDS = 60 * 60 * 24; // 24h
 const INST_LIST_TTL_SECONDS = 60 * 60 * 12; // 12h
