@@ -6,7 +6,7 @@
 // - In snapshot mode, this endpoint will ONLY read snapshots from Upstash and update the rolling 5m series.
 // - Debug counters prove whether any OKX calls happened.
 //
-// Requires env vars:
+// Requires env variables:
 // - UPSTASH_REDIS_REST_URL
 // - UPSTASH_REDIS_REST_TOKEN
 // Optional:
