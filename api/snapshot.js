@@ -43,10 +43,11 @@ function baseFromSymbolUSDT(symbol) {
 }
 
 function normalizeSymbolsQuery(req) {
-  const raw =
-    (req?.query?.symbols != null ? String(req.query.symbols) : "") ||
-    (req?.query?.symbol != null ? String(req.query.symbol) : "") ||
-    "ETHUSDT";
+const raw =
+  (req?.query?.symbols != null ? String(req.query.symbols) : "") ||
+  (req?.query?.symbol != null ? String(req.query.symbol) : "") ||
+  process.env.DEFAULT_SYMBOLS ||
+  "ETHUSDT";
 
   return raw
     .split(",")
