@@ -132,7 +132,10 @@ macro: {
   scalp: {
     sweepLookbackPoints: Number(process.env.ALERT_SCALP_SWEEP_LOOKBACK_POINTS || 3),
   },
-
+  wick: {
+    minPct: Number(process.env.ALERT_WICK_MIN_PCT || 0.15),
+    sweepLookbackPoints: Number(process.env.ALERT_WICK_SWEEP_LOOKBACK_POINTS || 3),
+  },
   // Swing/build OI context rule
   swing: {
     minOiPct: Number(process.env.ALERT_SWING_MIN_OI_PCT || -0.5),
@@ -216,7 +219,12 @@ async function computeStopLossPx({ instId, mode, bias, price, levels, execReason
   const px = asNum(price);
 if (px == null) return null;
 
-const isReversal = String(execReason || "").toLowerCase().includes("b1_reversal");
+const isReversal =
+  String(execReason || "").toLowerCase().includes("b1_reversal") ||
+  String(execReason || "").toLowerCase().includes("wick_reclaim") ||
+  String(execReason || "").toLowerCase().includes("wick_reject") ||
+  String(execReason || "").toLowerCase().includes("wick_flush_reclaim") ||
+  String(execReason || "").toLowerCase().includes("wick_spike_reject");
 const b = String(bias || "neutral").toLowerCase();
 if (b !== "long" && b !== "short") return null;
 
@@ -465,6 +473,23 @@ async function getRecentPricesFromSeries(instId, n) {
     .filter((x) => x != null);
 }
 
+async function getRecentSeriesPoints(instId, n) {
+  const raw = await redis.lrange(CFG.keys.series5m(instId), -Math.max(1, n), -1);
+  return (raw || []).map(safeJsonParse).filter(Boolean);
+}
+
+function wickPct(point, bias) {
+  const h = asNum(point?.h ?? point?.p);
+  const l = asNum(point?.l ?? point?.p);
+  const c = asNum(point?.p);
+
+  if (h == null || l == null || c == null || c <= 0) return null;
+
+  if (bias === "short") return ((h - c) / c) * 100;
+  if (bias === "long") return ((c - l) / c) * 100;
+  return null;
+}
+
 // bias logic (mode intent)
 function biasFromItem(item, mode) {
   const m = String(mode || "scalp").toLowerCase();
@@ -590,7 +615,12 @@ function computeConfidence(t) {
   const execReason = String(t?.execReason || "").toLowerCase();
 
   // 5m reversal confirmed = reversal path (not break path)
-  const reversalConfirmed = execReason.includes("b1_reversal");
+  const reversalConfirmed =
+  execReason.includes("b1_reversal") ||
+  execReason.includes("wick_reclaim") ||
+  execReason.includes("wick_reject") ||
+  execReason.includes("wick_flush_reclaim") ||
+  execReason.includes("wick_spike_reject");
 
   // breakout-only = break path
   const breakoutOnly =
@@ -719,9 +749,16 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
   if (!Number.isFinite(oi15) || oi15 < CFG.shockOi15mPct)
     return { ok: false, reason: "oi15_not_confirming" };
 
-  const recent = await getRecentPricesFromSeries(instId, CFG.scalp.sweepLookbackPoints);
-  const minRecent = recent.length ? Math.min(...recent) : null;
-  const maxRecent = recent.length ? Math.max(...recent) : null;
+    const recentPts = await getRecentSeriesPoints(instId, CFG.wick.sweepLookbackPoints);
+  const minRecent = recentPts.length
+    ? Math.min(...recentPts.map((p) => asNum(p?.l ?? p?.p)).filter((x) => x != null))
+    : null;
+  const maxRecent = recentPts.length
+    ? Math.max(...recentPts.map((p) => asNum(p?.h ?? p?.p)).filter((x) => x != null))
+    : null;
+
+  const lastPt = recentPts.length ? recentPts[recentPts.length - 1] : null;
+  const lastWickPct = wickPct(lastPt, bias);
 
   if (bias === "long") {
     const breakout = priceNow > hi;
@@ -737,7 +774,7 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         )})`,
       };
     }
-    if (sweepReclaim) {
+        if (sweepReclaim) {
       return {
         ok: true,
         reason: "long_sweep_reclaim",
@@ -746,6 +783,20 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         )})`,
       };
     }
+
+    const wickFlushReclaim =
+      Number.isFinite(lastWickPct) &&
+      lastWickPct >= CFG.wick.minPct &&
+      priceNow > lo;
+
+    if (wickFlushReclaim) {
+      return {
+        ok: true,
+        reason: "long_wick_flush_reclaim",
+        entryLine: `5m flush wick reclaimed above 1h low (${fmtPrice(lo)}) + OI confirms`,
+      };
+    }
+
     return { ok: false, reason: "price_trigger_not_active" };
   }
 
@@ -763,7 +814,7 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         )})`,
       };
     }
-    if (sweepReject) {
+        if (sweepReject) {
       return {
         ok: true,
         reason: "short_sweep_reject",
@@ -772,6 +823,20 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         )})`,
       };
     }
+
+    const wickSpikeReject =
+      Number.isFinite(lastWickPct) &&
+      lastWickPct >= CFG.wick.minPct &&
+      priceNow < hi;
+
+    if (wickSpikeReject) {
+      return {
+        ok: true,
+        reason: "short_wick_spike_reject",
+        entryLine: `5m spike wick rejected below 1h high (${fmtPrice(hi)}) + OI confirms`,
+      };
+    }
+
     return { ok: false, reason: "price_trigger_not_active" };
   }
 
@@ -804,7 +869,7 @@ function continuationTfForMode(modeLabel) {
   return "1h";
 }
 
-function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
+async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWING" }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { ok: false, reason: "1h_warmup" };
 
@@ -832,6 +897,9 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
 
   const d5 = item?.deltas?.["5m"];
   const p5 = asNum(d5?.price_change_pct);
+    const recentPts = await getRecentSeriesPoints(instId, 1);
+  const lastPt = recentPts.length ? recentPts[recentPts.length - 1] : null;
+  const lastWickPct = wickPct(lastPt, bias);
 
   const range = hi - lo;
   if (!(range > 0)) return { ok: false, reason: "bad_range" };
@@ -860,7 +928,7 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   };
 }
 
-    const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
+        const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
     if (reversalOk) {
       return {
         ok: true,
@@ -871,7 +939,23 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
       };
     }
 
-    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inLowBand, p5 } };
+    const wickReclaim =
+  modeLabel === "SWING" &&
+  inLowBand &&
+  Number.isFinite(lastWickPct) &&
+  lastWickPct >= CFG.wick.minPct &&
+  Number.isFinite(p5) &&
+  p5 > 0;
+
+    if (wickReclaim) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_wick_reclaim_long`,
+        entryLine: `wick reclaim in B1 low band (${lowBandTxt}) + 5m turned up`,
+      };
+    }
+
+    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inLowBand, p5, lastWickPct } };
   }
 
   if (bias === "short") {
@@ -883,7 +967,7 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   };
 }
 
-    const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
+        const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
     if (reversalOk) {
       return {
         ok: true,
@@ -894,7 +978,23 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
       };
     }
 
-    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inHighBand, p5 } };
+    const wickReject =
+  modeLabel === "SWING" &&
+  inHighBand &&
+  Number.isFinite(lastWickPct) &&
+  lastWickPct >= CFG.wick.minPct &&
+  Number.isFinite(p5) &&
+  p5 < 0;
+
+    if (wickReject) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_wick_reject_short`,
+        entryLine: `wick reject in B1 high band (${highBandTxt}) + 5m turned down`,
+      };
+    }
+
+    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inHighBand, p5, lastWickPct } };
   }
 
   return { ok: false, reason: "neutral_bias" };
@@ -1195,7 +1295,7 @@ if (mode === "build") {
   }
 }
             const modeLabel = mode === "build" ? "BUILD" : "SWING";
-            const g = swingExecutionGate({ bias, levels, item, modeLabel });
+            const g = await swingExecutionGate({ instId, bias, levels, item, modeLabel });
 
             if (!g.ok) {
               if (debug)
