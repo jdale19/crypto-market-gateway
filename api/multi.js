@@ -15,7 +15,7 @@
 // - SNAPSHOT_KEY_PREFIX (default "snap:okx:swap:")  -> key becomes `${prefix}${instId}`
 // - SNAPSHOT_SYMBOL_FALLBACK_PREFIX (default "snap:symbol:") -> `${prefix}${SYMBOL}`
 // Snapshot JSON expected (either key):
-//   { "ts": 123, "price": 123.45, "funding_rate": 0.0001, "open_interest_contracts": 123456 }
+//   { "ts": 123, "price": 123.45, "high": 123.80, "low": 122.90, "funding_rate": 0.0001, "open_interest_contracts": 123456 }
 
 import { Redis } from "@upstash/redis";
 
@@ -202,20 +202,24 @@ async function fetchSnapshotForInstId(instId, counters) {
   if (raw) {
     const j = safeJsonParse(raw);
     const price = Number(j?.price);
-    const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
-    const oi = Number(j?.open_interest_contracts);
+const high = Number(j?.high);
+const low = Number(j?.low);
+const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
+const oi = Number(j?.open_interest_contracts);
 
-    if (Number.isFinite(price) && Number.isFinite(oi)) {
-      counters.snapshot_hits += 1;
-      return {
-        ok: true,
-        price,
-        funding_rate: Number.isFinite(fr) ? fr : null,
-        open_interest_contracts: oi,
-        ts: j?.ts ?? null,
-        key,
-      };
-    }
+if (Number.isFinite(price) && Number.isFinite(oi) && Number.isFinite(high) && Number.isFinite(low)) {
+  counters.snapshot_hits += 1;
+  return {
+    ok: true,
+    price,
+    high,
+    low,
+    funding_rate: Number.isFinite(fr) ? fr : null,
+    open_interest_contracts: oi,
+    ts: j?.ts ?? null,
+    key,
+  };
+}
   }
 
   counters.snapshot_misses += 1;
@@ -471,6 +475,8 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
   if (!cur.ok) return { ok: false, symbol, instId, error: cur.error };
 
   const price = cur.price;
+  const high = cur.high;
+  const low = cur.low;
   const funding_rate = cur.funding_rate;
   const open_interest_contracts = cur.open_interest_contracts;
 
@@ -488,7 +494,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
   let wrotePoint = false;
 
   if (!Number.isFinite(lastBucketNum) || lastBucketNum !== bucket) {
-    const point = { b: bucket, ts: now, p: price, fr: funding_rate, oi: open_interest_contracts };
+    const point = { b: bucket, ts: now, p: price, h: high, l: low, fr: funding_rate, oi: open_interest_contracts };
 
     await redis.rpush(seriesKey, JSON.stringify(point));
     wrotePoint = true;
