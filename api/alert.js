@@ -786,7 +786,8 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
  * Returns entryLine (for "Entry:" DM line).
  */
 function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
-  const l1h = levels?.["1h"];
+  const contTf = continuationTfForMode(mode)
+  const lvl = levels?.[contTf]
   if (!l1h || l1h.warmup) return { ok: false, reason: "1h_warmup" };
 
   const hi = asNum(l1h.hi);
