@@ -69,6 +69,7 @@ const CFG = {
   // Levels windows (from stored 5m series)
   levelWindows: {
   "15m": 3,   // NEW (scalp invalidation)
+  "30m": 6,
   "1h": 12,
   "4h": 48,
 },
