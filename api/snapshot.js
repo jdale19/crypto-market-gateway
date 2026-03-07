@@ -132,27 +132,40 @@ async function resolveOkxSwapInstId(symbol, reqCache) {
 }
 
 async function fetchOkxSwap(instId) {
-  const [tickerRes, fundingRes, oiRes] = await Promise.all([
+  const [tickerRes, fundingRes, oiRes, candlesRes] = await Promise.all([
     fetchWithTimeout(`https://www.okx.com/api/v5/market/ticker?instId=${instId}`),
     fetchWithTimeout(`https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`),
     fetchWithTimeout(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`),
+    fetchWithTimeout(`https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=5m&limit=1`),
   ]);
 
-  if (!tickerRes.ok || !fundingRes.ok || !oiRes.ok)
+  if (!tickerRes.ok || !fundingRes.ok || !oiRes.ok || !candlesRes.ok) {
     return { ok: false, error: "okx fetch failed" };
+  }
 
   const ticker = await tickerRes.json();
   const funding = await fundingRes.json();
   const oi = await oiRes.json();
+  const candles = await candlesRes.json();
+
+  const c = candles?.data?.[0] || null;
 
   const price = Number(ticker?.data?.[0]?.last);
   const funding_rate = Number(funding?.data?.[0]?.fundingRate);
   const open_interest_contracts = Number(oi?.data?.[0]?.oi);
+  const high = Number(c?.[2]);
+  const low = Number(c?.[3]);
 
-  if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts))
+  if (
+    !Number.isFinite(price) ||
+    !Number.isFinite(open_interest_contracts) ||
+    !Number.isFinite(high) ||
+    !Number.isFinite(low)
+  ) {
     return { ok: false, error: "instrument missing data" };
+  }
 
-  return { ok: true, price, funding_rate, open_interest_contracts };
+  return { ok: true, price, high, low, funding_rate, open_interest_contracts };
 }
 
 async function processOne(symbol, reqCache) {
@@ -179,11 +192,13 @@ async function processOne(symbol, reqCache) {
 
   if (!snapNow) {
     snapNow = {
-      price: okx.price,
-      funding_rate: okx.funding_rate,
-      open_interest_contracts: okx.open_interest_contracts,
-      ts: now,
-    };
+  price: okx.price,
+  high: okx.high,
+  low: okx.low,
+  funding_rate: okx.funding_rate,
+  open_interest_contracts: okx.open_interest_contracts,
+  ts: now,
+};
     await redis.set(keyNow, JSON.stringify(snapNow));
     await redis.expire(keyNow, SNAP_TTL_SECONDS);
   }
