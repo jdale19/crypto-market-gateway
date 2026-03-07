@@ -1,5 +1,5 @@
 // /api/snapshot.js
-// OKX PERP (SWAP) ONLY — strict 5m bucket snapshots + 5m deltas + state
+// OKX PERP (SWAP) ONLY —  strict 5m bucket snapshots + 5m deltas + state
 // Supports batch mode: ?symbols=BTCUSDT,ETHUSDT,...
 
 import { Redis } from "@upstash/redis";
