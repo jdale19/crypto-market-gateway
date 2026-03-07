@@ -785,15 +785,41 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
  *
  * Returns entryLine (for "Entry:" DM line).
  */
+
+function continuationTfForMode(modeLabel) {
+  const allowed = new Set(["15m", "30m", "1h", "4h"]);
+  const m = String(modeLabel || "").toLowerCase();
+
+  if (m === "swing") {
+    const tf = String(process.env.ALERT_CONT_TF_SWING || "30m").toLowerCase();
+    return allowed.has(tf) ? tf : "30m";
+  }
+
+  if (m === "build") {
+    const tf = String(process.env.ALERT_CONT_TF_BUILD || "1h").toLowerCase();
+    return allowed.has(tf) ? tf : "1h";
+  }
+
+  return "1h";
+}
+
 function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { ok: false, reason: "1h_warmup" };
 
+  const contTf = continuationTfForMode(modeLabel);
+  const contLvl = levels?.[contTf];
+  if (!contLvl || contLvl.warmup) return { ok: false, reason: `${contTf}_warmup` };
+
   const hi = asNum(l1h.hi);
   const lo = asNum(l1h.lo);
   const p = asNum(item?.price);
-  if (hi == null || lo == null || p == null) return { ok: false, reason: "missing_levels_or_price" };
-
+  const contHi = asNum(contLvl.hi);
+  const contLo = asNum(contLvl.lo);
+  
+  if (hi == null || lo == null || contHi == null || contLo == null || p == null) {
+  return { ok: false, reason: "missing_levels_or_price" };
+}
   const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
   if (Number.isFinite(oi15) && oi15 < CFG.swing.minOiPct) {
     return {
@@ -825,13 +851,13 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   const highBandTxt = `${fmtPrice(highBandLo)}–${fmtPrice(highBandHi)}`;
 
   if (bias === "long") {
-    if (p > hi) {
-      return {
-        ok: true,
-        reason: `${modeLabel.toLowerCase()}_break_above_1h_high`,
-        entryLine: `break above 1h high (${fmtPrice(hi)}) → continuation`,
-      };
-    }
+    if (p > contHi) {
+  return {
+    ok: true,
+    reason: `${modeLabel.toLowerCase()}_break_above_${contTf}_high`,
+    entryLine: `break above ${contTf} high (${fmtPrice(contHi)}) → continuation`,
+  };
+}
 
     const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
     if (reversalOk) {
@@ -848,13 +874,13 @@ function swingExecutionGate({ bias, levels, item, modeLabel = "SWING" }) {
   }
 
   if (bias === "short") {
-    if (p < lo) {
-      return {
-        ok: true,
-        reason: `${modeLabel.toLowerCase()}_break_below_1h_low`,
-        entryLine: `break below 1h low (${fmtPrice(lo)}) → continuation`,
-      };
-    }
+    if (p < contLo) {
+  return {
+    ok: true,
+    reason: `${modeLabel.toLowerCase()}_break_below_${contTf}_low`,
+    entryLine: `break below ${contTf} low (${fmtPrice(contLo)}) → continuation`,
+  };
+}
 
     const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
     if (reversalOk) {
