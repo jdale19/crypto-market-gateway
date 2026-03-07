@@ -263,11 +263,13 @@ async function fetchOkxSwap(instId, counters) {
   }
 
   return {
-    ok: true,
-    price,
-    funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
-    open_interest_contracts,
-  };
+  ok: true,
+  price,
+  high: price,
+  low: price,
+  funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
+  open_interest_contracts,
+};
 }
 
 function computeTfDeltas(points, tf, funding_rate) {
