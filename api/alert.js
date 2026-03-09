@@ -100,12 +100,12 @@ macro: {
   btcSymbol: String(process.env.ALERT_MACRO_BTC_SYMBOL || "BTCUSDT").toUpperCase(),
 
   // Mode -> BTC delta timeframe used for macro
-  // Defaults: scalp=1h, swing=4h, build=4h
+  // Defaults: scalp=1h, swing=1h, build=4h
   btcTfByMode: {
-    scalp: String(process.env.ALERT_MACRO_BTC_TF_SCALP || "1h").toLowerCase(),
-    swing: String(process.env.ALERT_MACRO_BTC_TF_SWING || "4h").toLowerCase(),
-    build: String(process.env.ALERT_MACRO_BTC_TF_BUILD || "4h").toLowerCase(),
-  },
+  scalp: String(process.env.ALERT_MACRO_BTC_TF_SCALP || "1h").toLowerCase(),
+  swing: String(process.env.ALERT_MACRO_BTC_TF_SWING || "1h").toLowerCase(),
+  build: String(process.env.ALERT_MACRO_BTC_TF_BUILD || "4h").toLowerCase(),
+},
 
   // Thresholds apply to the selected BTC timeframe
   btcPricePctMin: Number(process.env.ALERT_MACRO_BTC_PRICE_PCT_MIN || 2.0),
@@ -730,7 +730,37 @@ function computeBtcMacro(results, mode) {
   };
 }
 
+function computeBtcWaterfall(results, mode) {
+  if (!CFG.macro.enabled) return { ok: false, reason: "macro_disabled", btcWaterfall: false };
 
+  const btcSym = CFG.macro.btcSymbol;
+  const btcItem = (results || []).find((x) => String(x?.symbol || "").toUpperCase() === btcSym);
+  if (!btcItem?.ok) return { ok: false, reason: "btc_missing", btcWaterfall: false };
+
+  const m = String(mode || "swing").toLowerCase();
+  const tf = CFG.macro.btcTfByMode?.[m] || "4h";
+
+  const d = btcItem?.deltas?.[tf];
+  const pricePct = asNum(d?.price_change_pct);
+  const oiPct = asNum(d?.oi_change_pct);
+
+  const waterfall =
+    Number.isFinite(pricePct) &&
+    Number.isFinite(oiPct) &&
+    pricePct <= -CFG.macro.btcPricePctMin &&
+    oiPct >= CFG.macro.btcOiPctMin;
+
+  return {
+    ok: true,
+    reason: "ok",
+    btcWaterfall: waterfall,
+    tf,
+    btc: {
+      pricePct: Number.isFinite(pricePct) ? pricePct : null,
+      oiPct: Number.isFinite(oiPct) ? oiPct : null,
+    },
+  };
+}
 
 /**
  * STRICT ENTRY (SCALP) — unchanged logic, UPDATED COPY (message contract ready)
@@ -1237,6 +1267,7 @@ if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
 }
         
         const macroMode = computeBtcMacro(j.results || [], mode);
+        
         // Macro block
         if (
           !force &&
@@ -1257,6 +1288,26 @@ if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
             });
           continue;
         }
+
+        const waterfallMode = computeBtcWaterfall(j.results || [], mode);
+
+if (
+  !force &&
+  waterfallMode?.ok &&
+  waterfallMode?.btcWaterfall &&
+  bias === "long"
+) {
+  if (debug) {
+    skipped.push({
+      symbol,
+      mode,
+      reason: "btc_waterfall_override",
+      btc: waterfallMode?.btc || null,
+      tf: waterfallMode?.tf || null,
+    });
+  }
+  continue;
+}
 
         const b1 = strongRecoB1({ bias, levels, price: item.price });
 
