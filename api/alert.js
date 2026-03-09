@@ -1445,9 +1445,12 @@ if (mode === "build") {
 // ---- Render DM ----
 
 const lines = [];
+const analyticsEvents = [];
 
 lines.push(`⚡️TRADE ENTRY`);
 lines.push("");
+    
+   
 
 for (const t of triggered) {
   const mode = String(t.mode || "swing").toLowerCase();
@@ -1563,6 +1566,20 @@ lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
 lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
   
   lines.push("");
+  analyticsEvents.push({
+  alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
+  source: "gateway",
+  ts: now,
+  symbol: t.symbol,
+  instId: t.instId,
+  mode,
+  side: bias,
+  entry_price: price,
+  confidence,
+  driver_tf,
+  observation_type: "fired",
+  rejection_reason: ""
+});
 }
 
 const message = lines.join("\n");
@@ -1570,46 +1587,36 @@ const message = lines.join("\n");
     if (!dry) {
       const tg = await sendTelegram(message);
       if (!tg.ok) {
-        await writeHeartbeat(
-          {
-            ts: now,
-            iso: new Date(now).toISOString(),
-            ok: false,
-            stage: "telegram_failed",
-            modes,
-            risk_profile,
-            sent: false,
-            triggered_count: triggered.length,
-            itemErrors,
-            topSkips,
-            telegram_error: tg.detail || null,
-          },
-          { dry }
-        );
-        return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+  await writeHeartbeat(
+    {
+      ts: now,
+      iso: new Date(now).toISOString(),
+      ok: false,
+      stage: "telegram_failed",
+      modes,
+      risk_profile,
+      sent: false,
+      triggered_count: triggered.length,
+      itemErrors,
+      topSkips,
+      telegram_error: tg.detail || null,
+    },
+    { dry }
+  );
+  return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+}
+
+for (const evt of analyticsEvents) {
+  try {
+    await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(evt)
+    });
+  } catch (e) {}
       }
     }
-try {
-  await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      alert_id: `${now}_${t.symbol}_${mode}_${side}`,
-      source: "gateway",
-      ts: now,
-      symbol: t.symbol,
-      instId: t.instId,
-      mode,
-      side,
-      price: entry,
-      confidence,
-      driver_tf: driverTf,
-      fired: true
-    })
-  });
-} catch (e) {
-  // analytics must never break alerts
-}
+
     await writeHeartbeat(
       {
         ts: now,
