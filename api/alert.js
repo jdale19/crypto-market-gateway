@@ -1589,7 +1589,27 @@ const message = lines.join("\n");
         return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
       }
     }
-
+try {
+  await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      alert_id: `${now}_${t.symbol}_${mode}_${side}`,
+      source: "gateway",
+      ts: now,
+      symbol: t.symbol,
+      instId: t.instId,
+      mode,
+      side,
+      price: entry,
+      confidence,
+      driver_tf: driverTf,
+      fired: true
+    })
+  });
+} catch (e) {
+  // analytics must never break alerts
+}
     await writeHeartbeat(
       {
         ts: now,
