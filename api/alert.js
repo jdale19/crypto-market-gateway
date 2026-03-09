@@ -1446,12 +1446,38 @@ if (mode === "build") {
 
 const lines = [];
 const analyticsEvents = [];
+const randomGroupId = `${now}_baseline`;
 
 lines.push(`⚡️TRADE ENTRY`);
 lines.push("");
     
    
+const baselineCandidates = triggered.map((t) => ({
+  symbol: t.symbol,
+  instId: t.instId,
+  mode: t.mode,
+  driver_tf,
+}));
+    for (const b of baselineCandidates) {
+  const side = Math.random() < 0.5 ? "long" : "short";
 
+  analyticsEvents.push({
+    alert_id: `${randomGroupId}_${b.symbol}_${b.mode}_${side}`,
+    source: "gateway",
+    ts: now,
+    symbol: b.symbol,
+    instId: b.instId,
+    mode: b.mode,
+    side,
+    entry_price: "",
+    confidence: "",
+    driver_tf: b.driver_tf,
+    observation_type: "random",
+    rejection_reason: "",
+    random_group_id: randomGroupId,
+    random_source: "matched_random"
+  });
+}
 for (const t of triggered) {
   const mode = String(t.mode || "swing").toLowerCase();
   const modeUp = mode.toUpperCase();
