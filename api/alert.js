@@ -1476,6 +1476,7 @@ const baselineCandidates = triggered.map((t) => ({
   instId: t.instId,
   mode: t.mode,
   driver_tf,
+  entry_price: asNum(t.price),
 }));
     for (const b of baselineCandidates) {
   const side = Math.random() < 0.5 ? "long" : "short";
@@ -1488,7 +1489,7 @@ const baselineCandidates = triggered.map((t) => ({
     instId: b.instId,
     mode: b.mode,
     side,
-    entry_price: null,
+    entry_price: b.entry_price,
     confidence: null,
     driver_tf: b.driver_tf,
     observation_type: "random",
