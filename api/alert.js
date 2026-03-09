@@ -46,6 +46,8 @@ function getDeployInfo() {
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
   minRR: Number(process.env.ALERT_MIN_RR || 1.5),
+  randomBaselineEnabled: String(process.env.RANDOM_BASELINE_ENABLED || "0") === "1",
+  randomBaselinePct: Number(process.env.RANDOM_BASELINE_PCT || 10),
   stop: {
   // candle flip method for reversals
   reversalUseWick: String(process.env.ALERT_STOP_REVERSAL_USE_WICK || "0") === "1", // 0=body, 1=wick
@@ -1424,80 +1426,47 @@ if (mode === "build") {
       mode: s.mode,
       reason: s.reason,
     }));
-
-    if (!force && !triggered.length) {
-      await writeHeartbeat(
-        {
-          ts: now,
-          iso: new Date(now).toISOString(),
-          ok: true,
-          modes,
-          risk_profile,
-          sent: false,
-          triggered_count: 0,
-          itemErrors,
-          topSkips,
-        },
-        { dry }
-      );
-
-      const heartbeat_last_run = debug ? await readHeartbeat() : undefined;
-
-      return res.json({
-        ok: true,
-        sent: false,
-      ...(debug
-  ? {
-      deploy: getDeployInfo(),
-      multiUrl,
-      macro: macroByMode,
-      skipped,
-      modes,
-      risk_profile,
-      debug_build_regimes,
-      heartbeat_last_run,
-    }
-  : {}),
-      });
-    }
     
 // ---- Render DM ----
 
 const lines = [];
 const analyticsEvents = [];
-const randomGroupId = `${now}_baseline`;
 
 lines.push(`⚡️TRADE ENTRY`);
 lines.push("");
-    
-   
-const baselineCandidates = triggered.map((t) => ({
-  symbol: t.symbol,
-  instId: t.instId,
-  mode: t.mode,
-  driver_tf,
-  entry_price: asNum(t.price),
-}));
-    for (const b of baselineCandidates) {
-  const side = Math.random() < 0.5 ? "long" : "short";
+// Independent random baseline observation
+if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 0) {
+  const roll = Math.floor(Math.random() * 100) + 1;
 
-  analyticsEvents.push({
-    alert_id: `${randomGroupId}_${b.symbol}_${b.mode}_${side}`,
-    source: "gateway",
-    ts: now,
-    symbol: b.symbol,
-    instId: b.instId,
-    mode: b.mode,
-    side,
-    entry_price: b.entry_price,
-    confidence: null,
-    driver_tf: b.driver_tf,
-    observation_type: "random",
-    rejection_reason: "",
-    random_group_id: randomGroupId,
-    random_source: "matched_random"
-  });
+  if (roll <= CFG.randomBaselinePct) {
+    const eligible = j.results.filter((x) => x?.ok && x?.price);
+
+    if (eligible.length > 0) {
+      const pick = eligible[Math.floor(Math.random() * eligible.length)];
+
+      const side = Math.random() < 0.5 ? "long" : "short";
+      const modePick = modes[Math.floor(Math.random() * modes.length)];
+
+      analyticsEvents.push({
+        alert_id: `${now}_random_${pick.symbol}_${side}`,
+        source: "gateway",
+        ts: now,
+        symbol: pick.symbol,
+        instId: pick.instId,
+        mode: modePick,
+        side,
+        entry_price: asNum(pick.price),
+        confidence: null,
+        driver_tf,
+        observation_type: "random",
+        rejection_reason: "",
+        random_group_id: `${now}_random`,
+        random_source: "independent_random"
+      });
+    }
+  }
 }
+
 for (const t of triggered) {
   const mode = String(t.mode || "swing").toLowerCase();
   const modeUp = mode.toUpperCase();
@@ -1660,6 +1629,18 @@ const renderedTradeCount = analyticsEvents.filter(
 ).length;
 
 if (!force && renderedTradeCount === 0) {
+  if (!dry) {
+    for (const evt of analyticsEvents) {
+      try {
+        await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(evt)
+        });
+      } catch (e) {}
+    }
+  }
+
   await writeHeartbeat(
     {
       ts: now,
