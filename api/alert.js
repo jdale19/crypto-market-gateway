@@ -45,7 +45,7 @@ function getDeployInfo() {
 
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
-
+  minRR: Number(process.env.ALERT_MIN_RR || 1.5),
   stop: {
   // candle flip method for reversals
   reversalUseWick: String(process.env.ALERT_STOP_REVERSAL_USE_WICK || "0") === "1", // 0=body, 1=wick
@@ -328,6 +328,25 @@ const fmtPct = (x, digits = 2) => {
   if (!Number.isFinite(n)) return "n/a";
   return `${n.toFixed(digits)}%`;
 };
+
+function computeRiskReward({ entryPrice, stopLossPx, tp }) {
+  const entry = asNum(entryPrice);
+  const sl = asNum(stopLossPx);
+  const take = asNum(tp);
+
+  if (entry == null || sl == null || take == null || entry <= 0) return null;
+
+  const rewardPct = (Math.abs(take - entry) / entry) * 100;
+  const riskPct = (Math.abs(entry - sl) / entry) * 100;
+
+  if (!Number.isFinite(rewardPct) || !Number.isFinite(riskPct) || riskPct <= 0) return null;
+
+  return {
+    rewardPct,
+    riskPct,
+    rr: rewardPct / riskPct,
+  };
+}
 
 function safeJsonParse(v) {
   if (v == null) return null;
@@ -1600,6 +1619,32 @@ if (!tpPick) {
 const tp = tpPick.tp;
 const tpTf = tpPick.tf;
 const tpPct = tpPick.tpPct;
+
+const rrInfo = computeRiskReward({
+  entryPrice: price,
+  stopLossPx,
+  tp,
+});
+
+if (!rrInfo || rrInfo.rr < CFG.minRR) {
+  if (debug) {
+    skipped.push({
+      symbol: t.symbol,
+      mode,
+      reason: "rr_too_small",
+      detail: {
+        rr: rrInfo?.rr ?? null,
+        minRR: CFG.minRR,
+        rewardPct: rrInfo?.rewardPct ?? null,
+        riskPct: rrInfo?.riskPct ?? null,
+        entryPrice: price,
+        stopLossPx,
+        tp,
+      }
+    });
+  }
+  continue;
+}
 
 // MESSAGE
 lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
