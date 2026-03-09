@@ -1630,15 +1630,15 @@ const renderedTradeCount = analyticsEvents.filter(
 
 if (!force && renderedTradeCount === 0) {
   if (!dry) {
-    for (const evt of analyticsEvents) {
-      try {
-        await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(evt)
-        });
-      } catch (e) {}
-    }
+    await Promise.all(
+  analyticsEvents.map(evt =>
+    fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(evt)
+    }).catch(() => null)
+  )
+);
   }
 
   await writeHeartbeat(
@@ -1700,15 +1700,15 @@ if (!force && renderedTradeCount === 0) {
   return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
 }
 
-for (const evt of analyticsEvents) {
-  try {
-    await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+await Promise.all(
+  analyticsEvents.map(evt =>
+    fetch(process.env.ANALYTICS_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(evt)
-    });
-  } catch (e) {}
-      }
+    }).catch(() => null)
+  )
+);
     }
 
     await writeHeartbeat(
