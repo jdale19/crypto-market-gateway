@@ -1550,55 +1550,6 @@ const lev = computeLeverageFromStop({
   // lines.push(`⚡️ ${modeUp} TRADE ENTRY`);
   // lines.push("");
 
-  lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-  lines.push(`Confidence = ${confidence}`);
-  lines.push("");
-  analyticsEvents.push({
-  alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
-  source: "gateway",
-  ts: now,
-  symbol: t.symbol,
-  instId: t.instId,
-  mode,
-  side: bias,
-  entry_price: price,
-  confidence,
-  driver_tf,
-  observation_type: "fired",
-  rejection_reason: ""
-});
-
-  // Entry Zone (1h B1 band)
-  if (hi1h != null && lo1h != null) {
-    const range1h = hi1h - lo1h;
-    const edge1h = CFG.strongEdgePct1h * range1h;
-
-  if (bias === "long") lines.push(`Entry Zone: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
-  else if (bias === "short") lines.push(`Entry Zone: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
-  }
-
-  // Invalidation (mode-aware TF)
-  if (invalidationPx != null) lines.push(`Invalidation (${invTf}): ${fmtPrice(invalidationPx)}`);
-  else lines.push("Invalidation:");
-
-  // Avoid chasing (unchanged)
-  if (price != null) {
-    const chaseBuffer = price * 0.0025;
-    if (bias === "long") lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
-    else if (bias === "short") lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
-  }
-
-  // Leverage (from stop distance)
-if (lev) {
-  lines.push(`Leverage: ${lev.suggestedLow}–${lev.suggestedHigh}x (max ${lev.adjustedMax}x)`);
-}
-
-  lines.push("");
-
-  // Stop Loss (separate from invalidation now)
-  if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
-  else lines.push("Stop Loss:");
-
   // Take Profit (DYNAMIC TF)
 // dynamic TP
 const { minTpPct } = getModeCfg(mode);
@@ -1645,6 +1596,55 @@ if (!rrInfo || rrInfo.rr < CFG.minRR) {
   }
   continue;
 }
+lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
+lines.push(`Confidence = ${confidence}`);
+lines.push("");
+
+analyticsEvents.push({
+  alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
+  source: "gateway",
+  ts: now,
+  symbol: t.symbol,
+  instId: t.instId,
+  mode,
+  side: bias,
+  entry_price: price,
+  confidence,
+  driver_tf,
+  observation_type: "fired",
+  rejection_reason: ""
+});
+
+// Entry Zone (1h B1 band)
+if (hi1h != null && lo1h != null) {
+  const range1h = hi1h - lo1h;
+  const edge1h = CFG.strongEdgePct1h * range1h;
+
+  if (bias === "long") lines.push(`Entry Zone: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
+  else if (bias === "short") lines.push(`Entry Zone: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
+}
+
+// Invalidation (mode-aware TF)
+if (invalidationPx != null) lines.push(`Invalidation (${invTf}): ${fmtPrice(invalidationPx)}`);
+else lines.push("Invalidation:");
+
+// Avoid chasing (unchanged)
+if (price != null) {
+  const chaseBuffer = price * 0.0025;
+  if (bias === "long") lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
+  else if (bias === "short") lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
+}
+
+// Leverage (from stop distance)
+if (lev) {
+  lines.push(`Leverage: ${lev.suggestedLow}–${lev.suggestedHigh}x (max ${lev.adjustedMax}x)`);
+}
+
+lines.push("");
+
+// Stop Loss (separate from invalidation now)
+if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
+else lines.push("Stop Loss:");
 
 // MESSAGE
 lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
@@ -1654,6 +1654,47 @@ lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
 }
 
 const message = lines.join("\n");
+const renderedTradeCount = analyticsEvents.filter(
+  (e) => e.observation_type === "fired"
+).length;
+
+if (!force && renderedTradeCount === 0) {
+  await writeHeartbeat(
+    {
+      ts: now,
+      iso: new Date(now).toISOString(),
+      ok: true,
+      modes,
+      risk_profile,
+      sent: false,
+      triggered_count: 0,
+      itemErrors,
+      topSkips,
+    },
+    { dry }
+  );
+
+  const heartbeat_last_run = debug ? await readHeartbeat() : undefined;
+
+  return res.json({
+    ok: true,
+    sent: false,
+    ...(debug
+      ? {
+          deploy: getDeployInfo(),
+          multiUrl,
+          macro: macroByMode,
+          skipped,
+          triggered,
+          modes,
+          debug_build_regimes,
+          risk_profile,
+          renderedMessage: message,
+          heartbeat_last_run,
+        }
+      : {}),
+  });
+}
 
     if (!dry) {
       const tg = await sendTelegram(message);
@@ -1667,7 +1708,7 @@ const message = lines.join("\n");
       modes,
       risk_profile,
       sent: false,
-      triggered_count: triggered.length,
+      triggered_count: renderedTradeCount,
       itemErrors,
       topSkips,
       telegram_error: tg.detail || null,
@@ -1696,7 +1737,7 @@ for (const evt of analyticsEvents) {
         modes,
         risk_profile,
         sent: !dry,
-        triggered_count: triggered.length,
+        triggered_count: renderedTradeCount,
         itemErrors,
         topSkips,
       },
@@ -1708,7 +1749,7 @@ for (const evt of analyticsEvents) {
     return res.json({
       ok: true,
       sent: !dry,
-      triggered_count: triggered.length,
+      triggered_count: renderedTradeCount,
       ...(debug
         ? {
             deploy: getDeployInfo(),
