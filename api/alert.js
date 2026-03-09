@@ -1534,6 +1534,20 @@ const lev = computeLeverageFromStop({
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
   lines.push(`Confidence = ${confidence}`);
   lines.push("");
+  analyticsEvents.push({
+  alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
+  source: "gateway",
+  ts: now,
+  symbol: t.symbol,
+  instId: t.instId,
+  mode,
+  side: bias,
+  entry_price: price,
+  confidence,
+  driver_tf,
+  observation_type: "fired",
+  rejection_reason: ""
+});
 
   // Entry Zone (1h B1 band)
   if (hi1h != null && lo1h != null) {
@@ -1592,20 +1606,6 @@ lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
 lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
   
   lines.push("");
-  analyticsEvents.push({
-  alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
-  source: "gateway",
-  ts: now,
-  symbol: t.symbol,
-  instId: t.instId,
-  mode,
-  side: bias,
-  entry_price: price,
-  confidence,
-  driver_tf,
-  observation_type: "fired",
-  rejection_reason: ""
-});
 }
 
 const message = lines.join("\n");
