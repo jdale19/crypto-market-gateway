@@ -159,6 +159,38 @@ macro: {
     minOiPct: Number(process.env.ALERT_SWING_MIN_OI_PCT || -0.5),
   },
 
+  entryIdeas: {
+    ignitionBreakout: {
+      enabled: String(process.env.ALERT_IDEA_IGNITION_ENABLED || "1") === "1",
+      lookbackCandles: Number(process.env.ALERT_IDEA_IGNITION_LOOKBACK || 10),
+      minBodyMult: Number(process.env.ALERT_IDEA_IGNITION_MIN_BODY_MULT || 1.5),
+      minBodyPct: Number(process.env.ALERT_IDEA_IGNITION_MIN_BODY_PCT || 0.12),
+      minOiRiseCount: Number(process.env.ALERT_IDEA_IGNITION_MIN_OI_RISE_COUNT || 2),
+      oiRiseLookback: Number(process.env.ALERT_IDEA_IGNITION_OI_RISE_LOOKBACK || 3),
+      maxFundingAbs: Number(process.env.ALERT_IDEA_IGNITION_MAX_FUNDING_ABS || 0.01),
+    },
+    liquiditySnap: {
+      enabled: String(process.env.ALERT_IDEA_LIQUIDITY_SNAP_ENABLED || "1") === "1",
+      lookbackCandles: Number(process.env.ALERT_IDEA_LIQUIDITY_SNAP_LOOKBACK || 10),
+      minReclaimPct: Number(process.env.ALERT_IDEA_LIQUIDITY_SNAP_MIN_RECLAIM_PCT || 0.0),
+      minWickQualityScore: Number(process.env.ALERT_IDEA_LIQUIDITY_SNAP_MIN_WICK_SCORE || 2.5),
+    },
+    slowLeverageSqueeze: {
+      enabled: String(process.env.ALERT_IDEA_SLOW_SQUEEZE_ENABLED || "1") === "1",
+      oiCandles: Number(process.env.ALERT_IDEA_SLOW_SQUEEZE_OI_CANDLES || 6),
+      minOiRiseCount: Number(process.env.ALERT_IDEA_SLOW_SQUEEZE_MIN_OI_RISE_COUNT || 5),
+      maxPricePct: Number(process.env.ALERT_IDEA_SLOW_SQUEEZE_MAX_PRICE_PCT || 0.6),
+      breakLookbackCandles: Number(process.env.ALERT_IDEA_SLOW_SQUEEZE_BREAK_LOOKBACK || 10),
+    },
+    slowShortBreak: {
+      enabled: String(process.env.ALERT_IDEA_SHORT_BREAK_ENABLED || "1") === "1",
+      fundingMin: Number(process.env.ALERT_IDEA_SHORT_FUNDING_MIN || 0.01),
+      oiRiseCandles: Number(process.env.ALERT_IDEA_SHORT_OI_RISE_CANDLES || 6),
+      maxPricePct: Number(process.env.ALERT_IDEA_SHORT_MAX_PRICE_PCT || 0.6),
+      breakLookbackCandles: Number(process.env.ALERT_IDEA_SHORT_BREAK_LOOKBACK || 10),
+    },
+  },
+
   // --- Leverage Model (advisory copy only) ---
   leverage: {
     // master switch (optional)
@@ -243,7 +275,8 @@ async function computeStopLossPx({ instId, mode, bias, price, levels, execReason
     reason.includes("wick_reclaim") ||
     reason.includes("wick_reject") ||
     reason.includes("wick_flush_reclaim") ||
-    reason.includes("wick_spike_reject");
+    reason.includes("wick_spike_reject") ||
+    reason.includes("liquidity_snap_reversal");
 
   const b = String(bias || "neutral").toLowerCase();
   if (b !== "long" && b !== "short") return null;
@@ -642,6 +675,163 @@ function wickQuality(point, bias) {
   };
 }
 
+function avg(nums) {
+  const vals = (nums || []).filter((x) => Number.isFinite(x));
+  if (!vals.length) return null;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
+
+function countOiRiseIntervals(points) {
+  let rises = 0;
+  for (let i = 1; i < points.length; i++) {
+    const prevOi = asNum(points[i - 1]?.oi);
+    const curOi = asNum(points[i]?.oi);
+    if (prevOi != null && curOi != null && curOi > prevOi) rises += 1;
+  }
+  return rises;
+}
+
+function priceChangePctBetweenPoints(firstPoint, lastPoint) {
+  const first = asNum(firstPoint?.p);
+  const last = asNum(lastPoint?.p);
+  if (first == null || last == null || first <= 0) return null;
+  return ((last - first) / first) * 100;
+}
+
+async function getIdeaWindow(instId, n) {
+  const pts = await getRecentSeriesPoints(instId, n);
+  return Array.isArray(pts) ? pts : [];
+}
+
+function ignitionBreakoutLongCheck(points, price, fundingRate) {
+  const cfg = CFG.entryIdeas.ignitionBreakout;
+  if (!cfg?.enabled) return { ok: false, reason: 'ignition_disabled' };
+  const need = Math.max(cfg.lookbackCandles + 1, cfg.oiRiseLookback + 1, 4);
+  if (!Array.isArray(points) || points.length < need) return { ok: false, reason: 'ignition_warmup' };
+
+  const last = points[points.length - 1];
+  const prev = points.slice(-(cfg.lookbackCandles + 1), -1);
+  const prevHighs = prev.map((pt) => asNum(pt?.h ?? pt?.p)).filter((x) => x != null);
+  if (!prevHighs.length) return { ok: false, reason: 'ignition_missing_highs' };
+
+  const recentHigh = Math.max(...prevHighs);
+  const bodyNow = candleBodyPct(last);
+  const avgBody = avg(prev.slice(-5).map(candleBodyPct));
+  const breakout = Number.isFinite(price) && Number.isFinite(recentHigh) && price > recentHigh;
+  const bodyOk = Number.isFinite(bodyNow) && bodyNow >= cfg.minBodyPct && (!Number.isFinite(avgBody) || bodyNow >= avgBody * cfg.minBodyMult);
+
+  const oiWindow = points.slice(-(cfg.oiRiseLookback + 1));
+  const oiRiseCount = countOiRiseIntervals(oiWindow);
+  const oiOk = oiRiseCount >= cfg.minOiRiseCount;
+  const fundingOk = !Number.isFinite(fundingRate) || Math.abs(fundingRate) <= cfg.maxFundingAbs;
+
+  if (breakout && bodyOk && oiOk && fundingOk) {
+    return {
+      ok: true,
+      reason: 'ignition_breakout_long',
+      entryLine: `ignition breakout above ${fmtPrice(recentHigh)} + expanding body + OI rise (${oiRiseCount}/${cfg.oiRiseLookback})`,
+      detail: { recentHigh, bodyNow, avgBody, oiRiseCount },
+    };
+  }
+
+  return { ok: false, reason: 'ignition_not_ready', detail: { recentHigh, bodyNow, avgBody, oiRiseCount, breakout, bodyOk, oiOk, fundingOk } };
+}
+
+function liquiditySnapReversalLongCheck(points, price, p5) {
+  const cfg = CFG.entryIdeas.liquiditySnap;
+  if (!cfg?.enabled) return { ok: false, reason: 'liq_snap_disabled' };
+  const need = cfg.lookbackCandles + 1;
+  if (!Array.isArray(points) || points.length < need) return { ok: false, reason: 'liq_snap_warmup' };
+
+  const last = points[points.length - 1];
+  const prev = points.slice(-(cfg.lookbackCandles + 1), -1);
+  const prevLows = prev.map((pt) => asNum(pt?.l ?? pt?.p)).filter((x) => x != null);
+  if (!prevLows.length) return { ok: false, reason: 'liq_snap_missing_lows' };
+
+  const recentLow = Math.min(...prevLows);
+  const lastLow = asNum(last?.l ?? last?.p);
+  const wickMeta = wickQuality(last, 'long');
+  const reclaimPct = Number.isFinite(price) && Number.isFinite(recentLow) && recentLow > 0 ? ((price - recentLow) / recentLow) * 100 : null;
+  const swept = Number.isFinite(lastLow) && Number.isFinite(recentLow) && lastLow < recentLow;
+  const reclaimed = Number.isFinite(price) && Number.isFinite(recentLow) && price > recentLow;
+  const reclaimOk = Number.isFinite(reclaimPct) && reclaimPct >= cfg.minReclaimPct;
+  const wickOk = wickMeta.strong || wickMeta.extreme || (Number.isFinite(wickMeta.qualityScore) && wickMeta.qualityScore >= cfg.minWickQualityScore);
+  const turnOk = Number.isFinite(p5) && p5 > 0;
+
+  if (swept && reclaimed && reclaimOk && wickOk && turnOk) {
+    return {
+      ok: true,
+      reason: 'liquidity_snap_reversal_long',
+      entryLine: `liquidity snap below ${fmtPrice(recentLow)} then reclaim + strong wick reversal`,
+      wickMeta,
+      detail: { recentLow, reclaimPct },
+    };
+  }
+
+  return { ok: false, reason: 'liq_snap_not_ready', detail: { recentLow, lastLow, reclaimPct, swept, reclaimed, wickOk, turnOk } };
+}
+
+function slowLeverageSqueezeLongCheck(points, price) {
+  const cfg = CFG.entryIdeas.slowLeverageSqueeze;
+  if (!cfg?.enabled) return { ok: false, reason: 'slow_squeeze_disabled' };
+  const need = Math.max(cfg.oiCandles + 1, cfg.breakLookbackCandles + 1);
+  if (!Array.isArray(points) || points.length < need) return { ok: false, reason: 'slow_squeeze_warmup' };
+
+  const oiWindow = points.slice(-(cfg.oiCandles + 1));
+  const prevBreakWindow = points.slice(-(cfg.breakLookbackCandles + 1), -1);
+  const prevHighs = prevBreakWindow.map((pt) => asNum(pt?.h ?? pt?.p)).filter((x) => x != null);
+  if (!prevHighs.length) return { ok: false, reason: 'slow_squeeze_missing_highs' };
+
+  const recentHigh = Math.max(...prevHighs);
+  const oiRiseCount = countOiRiseIntervals(oiWindow);
+  const pricePct = priceChangePctBetweenPoints(oiWindow[0], oiWindow[oiWindow.length - 1]);
+  const breakout = Number.isFinite(price) && price > recentHigh;
+  const compressionOk = Number.isFinite(pricePct) && pricePct > 0 && pricePct < cfg.maxPricePct;
+  const oiOk = oiRiseCount >= cfg.minOiRiseCount;
+
+  if (breakout && compressionOk && oiOk) {
+    return {
+      ok: true,
+      reason: 'slow_leverage_squeeze_long',
+      entryLine: `slow leverage squeeze: OI rose ${oiRiseCount}/${cfg.oiCandles} candles, price compressed, then broke ${fmtPrice(recentHigh)}`,
+      detail: { recentHigh, oiRiseCount, pricePct },
+    };
+  }
+
+  return { ok: false, reason: 'slow_squeeze_not_ready', detail: { recentHigh, oiRiseCount, pricePct, breakout, compressionOk, oiOk } };
+}
+
+function slowShortBreakdownCheck(points, price, fundingRate) {
+  const cfg = CFG.entryIdeas.slowShortBreak;
+  if (!cfg?.enabled) return { ok: false, reason: 'slow_short_disabled' };
+  const need = Math.max(cfg.oiRiseCandles + 1, cfg.breakLookbackCandles + 1);
+  if (!Array.isArray(points) || points.length < need) return { ok: false, reason: 'slow_short_warmup' };
+
+  const oiWindow = points.slice(-(cfg.oiRiseCandles + 1));
+  const prevBreakWindow = points.slice(-(cfg.breakLookbackCandles + 1), -1);
+  const prevLows = prevBreakWindow.map((pt) => asNum(pt?.l ?? pt?.p)).filter((x) => x != null);
+  if (!prevLows.length) return { ok: false, reason: 'slow_short_missing_lows' };
+
+  const recentLow = Math.min(...prevLows);
+  const oiRiseCount = countOiRiseIntervals(oiWindow);
+  const pricePct = priceChangePctBetweenPoints(oiWindow[0], oiWindow[oiWindow.length - 1]);
+  const fundingOk = Number.isFinite(fundingRate) && fundingRate > cfg.fundingMin;
+  const oiOk = oiRiseCount >= cfg.oiRiseCandles;
+  const driftOk = Number.isFinite(pricePct) && Math.abs(pricePct) < cfg.maxPricePct;
+  const breakdown = Number.isFinite(price) && price < recentLow;
+
+  if (fundingOk && oiOk && driftOk && breakdown) {
+    return {
+      ok: true,
+      reason: 'slow_short_breakdown',
+      entryLine: `funding stretched + OI rose ${oiRiseCount}/${cfg.oiRiseCandles} candles + broke ${fmtPrice(recentLow)}`,
+      detail: { recentLow, oiRiseCount, pricePct, fundingRate },
+    };
+  }
+
+  return { ok: false, reason: 'slow_short_not_ready', detail: { recentLow, oiRiseCount, pricePct, fundingRate, fundingOk, oiOk, driftOk, breakdown } };
+}
+
 // bias logic (mode intent)
 function biasFromItem(item, mode) {
   const m = String(mode || "scalp").toLowerCase();
@@ -771,7 +961,8 @@ function computeConfidence(t) {
     execReason.includes("wick_reclaim") ||
     execReason.includes("wick_reject") ||
     execReason.includes("wick_flush_reclaim") ||
-    execReason.includes("wick_spike_reject");
+    execReason.includes("wick_spike_reject") ||
+  execReason.includes("liquidity_snap_reversal");
 
   const wickDriven = execReason.includes("wick");
 
@@ -779,7 +970,10 @@ function computeConfidence(t) {
     execReason.includes("break_above") ||
     execReason.includes("break_below") ||
     execReason.includes("breakout") ||
-    execReason.includes("breakdown");
+    execReason.includes("breakdown") ||
+    execReason.includes("ignition_breakout") ||
+    execReason.includes("slow_leverage_squeeze") ||
+    execReason.includes("slow_short_breakdown");
 
   const lean15m = String(t?.ctx?.lean15m || "").toLowerCase();
   const oiAligned = lean15m === bias;
@@ -1064,10 +1258,11 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   const p = asNum(item?.price);
   const contHi = asNum(contLvl.hi);
   const contLo = asNum(contLvl.lo);
-  
+
   if (hi == null || lo == null || contHi == null || contLo == null || p == null) {
-  return { ok: false, reason: "missing_levels_or_price" };
-}
+    return { ok: false, reason: "missing_levels_or_price" };
+  }
+
   const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
   if (Number.isFinite(oi15) && oi15 < CFG.swing.minOiPct) {
     return {
@@ -1079,7 +1274,16 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
 
   const d5 = item?.deltas?.["5m"];
   const p5 = asNum(d5?.price_change_pct);
-    const recentPts = await getRecentSeriesPoints(instId, 1);
+  const maxIdeaLookback = Math.max(
+    CFG.entryIdeas.ignitionBreakout.lookbackCandles + 1,
+    CFG.entryIdeas.liquiditySnap.lookbackCandles + 1,
+    CFG.entryIdeas.slowLeverageSqueeze.breakLookbackCandles + 1,
+    CFG.entryIdeas.slowLeverageSqueeze.oiCandles + 1,
+    CFG.entryIdeas.slowShortBreak.breakLookbackCandles + 1,
+    CFG.entryIdeas.slowShortBreak.oiRiseCandles + 1,
+    10
+  );
+  const recentPts = await getIdeaWindow(instId, maxIdeaLookback);
   const lastPt = recentPts.length ? recentPts[recentPts.length - 1] : null;
   const wickMeta = wickQuality(lastPt, bias);
   const lastWickPct = wickMeta.wickPct;
@@ -1088,47 +1292,71 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   if (!(range > 0)) return { ok: false, reason: "bad_range" };
 
   const edge = CFG.strongEdgePct1h * range;
-
-  // Explicit band boundaries
   const lowBandLo = lo;
   const lowBandHi = lo + edge;
-
   const highBandLo = hi - edge;
   const highBandHi = hi;
-
   const inLowBand = p <= lowBandHi;
   const inHighBand = p >= highBandLo;
-
   const lowBandTxt = `${fmtPrice(lowBandLo)}–${fmtPrice(lowBandHi)}`;
   const highBandTxt = `${fmtPrice(highBandLo)}–${fmtPrice(highBandHi)}`;
 
   if (bias === "long") {
-    if (p > contHi) {
-  return {
-    ok: true,
-    reason: `${modeLabel.toLowerCase()}_break_above_${contTf}_high`,
-    entryLine: `break above ${contTf} high (${fmtPrice(contHi)}) → continuation`,
-  };
-}
+    const ignition = ignitionBreakoutLongCheck(recentPts, p, asNum(item?.funding_rate));
+    if (ignition.ok) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_${ignition.reason}`,
+        entryLine: ignition.entryLine,
+        detail: ignition.detail,
+      };
+    }
 
-        const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
+    const liqSnap = liquiditySnapReversalLongCheck(recentPts, p, p5);
+    if (liqSnap.ok) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_${liqSnap.reason}`,
+        entryLine: liqSnap.entryLine,
+        wickMeta: liqSnap.wickMeta,
+        detail: liqSnap.detail,
+      };
+    }
+
+    const slowSqueeze = slowLeverageSqueezeLongCheck(recentPts, p);
+    if (slowSqueeze.ok) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_${slowSqueeze.reason}`,
+        entryLine: slowSqueeze.entryLine,
+        detail: slowSqueeze.detail,
+      };
+    }
+
+    if (p > contHi) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_break_above_${contTf}_high`,
+        entryLine: `break above ${contTf} high (${fmtPrice(contHi)}) → continuation`,
+      };
+    }
+
+    const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
     if (reversalOk) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_long`,
-        entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(
-          CFG.swingReversalMin5mMovePct
-        )})`,
+        entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(CFG.swingReversalMin5mMovePct)})`,
       };
     }
 
     const wickReclaim =
-  modeLabel === "SWING" &&
-  inLowBand &&
-  Number.isFinite(lastWickPct) &&
-  lastWickPct >= CFG.wick.minPct &&
-  Number.isFinite(p5) &&
-  p5 > 0;
+      modeLabel === "SWING" &&
+      inLowBand &&
+      Number.isFinite(lastWickPct) &&
+      lastWickPct >= CFG.wick.minPct &&
+      Number.isFinite(p5) &&
+      p5 > 0;
 
     if (wickReclaim) {
       return {
@@ -1143,32 +1371,40 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   }
 
   if (bias === "short") {
-    if (p < contLo) {
-  return {
-    ok: true,
-    reason: `${modeLabel.toLowerCase()}_break_below_${contTf}_low`,
-    entryLine: `break below ${contTf} low (${fmtPrice(contLo)}) → continuation`,
-  };
-}
+    const slowShort = slowShortBreakdownCheck(recentPts, p, asNum(item?.funding_rate));
+    if (slowShort.ok) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_${slowShort.reason}`,
+        entryLine: slowShort.entryLine,
+        detail: slowShort.detail,
+      };
+    }
 
-        const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
+    if (p < contLo) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_break_below_${contTf}_low`,
+        entryLine: `break below ${contTf} low (${fmtPrice(contLo)}) → continuation`,
+      };
+    }
+
+    const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
     if (reversalOk) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_short`,
-        entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(
-          CFG.swingReversalMin5mMovePct
-        )})`,
+        entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(CFG.swingReversalMin5mMovePct)})`,
       };
     }
 
     const wickReject =
-  modeLabel === "SWING" &&
-  inHighBand &&
-  Number.isFinite(lastWickPct) &&
-  lastWickPct >= CFG.wick.minPct &&
-  Number.isFinite(p5) &&
-  p5 < 0;
+      modeLabel === "SWING" &&
+      inHighBand &&
+      Number.isFinite(lastWickPct) &&
+      lastWickPct >= CFG.wick.minPct &&
+      Number.isFinite(p5) &&
+      p5 < 0;
 
     if (wickReject) {
       return {
