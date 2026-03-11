@@ -153,19 +153,21 @@ async function fetchOkxSwap(instId) {
   const price = Number(ticker?.data?.[0]?.last);
   const funding_rate = Number(funding?.data?.[0]?.fundingRate);
   const open_interest_contracts = Number(oi?.data?.[0]?.oi);
+  const open = Number(c?.[1]);
   const high = Number(c?.[2]);
   const low = Number(c?.[3]);
 
   if (
     !Number.isFinite(price) ||
     !Number.isFinite(open_interest_contracts) ||
+    !Number.isFinite(open) ||
     !Number.isFinite(high) ||
     !Number.isFinite(low)
   ) {
     return { ok: false, error: "instrument missing data" };
   }
 
-  return { ok: true, price, high, low, funding_rate, open_interest_contracts };
+  return { ok: true, price, open, high, low, funding_rate, open_interest_contracts };
 }
 
 async function processOne(symbol, reqCache) {
@@ -193,12 +195,23 @@ async function processOne(symbol, reqCache) {
   if (!snapNow) {
     snapNow = {
   price: okx.price,
+  open: okx.open,
   high: okx.high,
   low: okx.low,
   funding_rate: okx.funding_rate,
   open_interest_contracts: okx.open_interest_contracts,
   ts: now,
 };
+    await redis.set(keyNow, JSON.stringify(snapNow));
+    await redis.expire(keyNow, SNAP_TTL_SECONDS);
+  } else if (!Number.isFinite(Number(snapNow?.open))) {
+    snapNow = {
+      ...snapNow,
+      open: okx.open,
+      high: Number.isFinite(Number(snapNow?.high)) ? snapNow.high : okx.high,
+      low: Number.isFinite(Number(snapNow?.low)) ? snapNow.low : okx.low,
+      ts: snapNow?.ts ?? now,
+    };
     await redis.set(keyNow, JSON.stringify(snapNow));
     await redis.expire(keyNow, SNAP_TTL_SECONDS);
   }
@@ -221,6 +234,7 @@ async function processOne(symbol, reqCache) {
     instId,
     ts: now,
     price: okx.price,
+    open: okx.open,
     funding_rate: okx.funding_rate,
     open_interest_contracts: okx.open_interest_contracts,
     open_interest_usd: okx.open_interest_contracts * okx.price,
