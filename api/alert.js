@@ -42,6 +42,22 @@ function getDeployInfo() {
       null,
   };
 }
+async function postAnalyticsBatch(events, meta = {}) {
+  if (!process.env.ANALYTICS_WEBHOOK_URL || !Array.isArray(events) || events.length === 0) return;
+
+  try {
+    await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "gateway",
+        ts: Date.now(),
+        ...meta,
+        events,
+      }),
+    });
+  } catch (_) {}
+}
 
 const CFG = {
   cooldownMinutes: Number(process.env.ALERT_COOLDOWN_MINUTES || 20),
@@ -451,23 +467,6 @@ function rangePct1h({ levels, price }) {
   if (!(range > 0)) return null;
 
   return (range / p) * 100;
-}
-
-async function postAnalyticsBatch(events, meta = {}) {
-  if (!process.env.ANALYTICS_WEBHOOK_URL || !Array.isArray(events) || events.length === 0) return;
-
-  try {
-    await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        source: "gateway",
-        ts: Date.now(),
-        ...meta,
-        events,
-      }),
-    });
-  } catch (_) {}
 }
 
 async function sendTelegram(text) {
