@@ -219,37 +219,65 @@ function stopTfForMode(mode) {
 
 async function computeStopLossPx({ instId, mode, bias, price, levels, execReason }) {
   const px = asNum(price);
-if (px == null) return null;
+  if (px == null) return null;
 
-const isReversal =
-  String(execReason || "").toLowerCase().includes("b1_reversal") ||
-  String(execReason || "").toLowerCase().includes("wick_reclaim") ||
-  String(execReason || "").toLowerCase().includes("wick_reject") ||
-  String(execReason || "").toLowerCase().includes("wick_flush_reclaim") ||
-  String(execReason || "").toLowerCase().includes("wick_spike_reject");
-const b = String(bias || "neutral").toLowerCase();
-if (b !== "long" && b !== "short") return null;
+  const reason = String(execReason || "").toLowerCase();
+  const isReversal =
+    reason.includes("b1_reversal") ||
+    reason.includes("wick_reclaim") ||
+    reason.includes("wick_reject") ||
+    reason.includes("wick_flush_reclaim") ||
+    reason.includes("wick_spike_reject");
 
-  // ---- REVERSAL STOP (flip the prior candle/body using close-close fallback) ----
+  const b = String(bias || "neutral").toLowerCase();
+  if (b !== "long" && b !== "short") return null;
+
+  // ---- REVERSAL STOP ----
+  // Prefer real wick anchoring for wick-driven reversals. Fallback to body-flip for generic reversals.
   if (isReversal) {
+    const useWick = CFG.stop.reversalUseWick && reason.includes("wick");
+
+    if (useWick) {
+      const recentPts = await getRecentSeriesPoints(instId, Math.max(2, CFG.wick.sweepLookbackPoints));
+      if (recentPts.length) {
+        const wickLows = recentPts
+          .map((pt) => asNum(pt?.l ?? pt?.p))
+          .filter((x) => x != null);
+        const wickHighs = recentPts
+          .map((pt) => asNum(pt?.h ?? pt?.p))
+          .filter((x) => x != null);
+        const wickLow = wickLows.length ? Math.min(...wickLows) : null;
+        const wickHigh = wickHighs.length ? Math.max(...wickHighs) : null;
+        const pad = Math.abs(Number(CFG.stop.reversalPadPct) || 0) / 100;
+
+        if (b === "long" && wickLow != null) {
+          let sl = wickLow;
+          if (pad > 0) sl = sl * (1 - pad);
+          if (Number.isFinite(sl) && sl < px) return sl;
+        }
+
+        if (b === "short" && wickHigh != null) {
+          let sl = wickHigh;
+          if (pad > 0) sl = sl * (1 + pad);
+          if (Number.isFinite(sl) && sl > px) return sl;
+        }
+      }
+    }
+
     const pair = await getPrevClosePair(instId);
     if (!pair) return null;
 
     const prev = pair.prev;
     const last = pair.last;
-
-    // "body" size from prev close to last close
     const body = Math.abs(last - prev);
     if (!Number.isFinite(body) || body <= 0) return null;
 
-    // flipped distance: full body by default, configurable
     const dist = body * Math.max(0, Math.min(1, CFG.stop.reversalBodyPct));
 
     let sl = null;
     if (b === "long") sl = px - dist;
     if (b === "short") sl = px + dist;
 
-    // pad (percent)
     const pad = Math.abs(Number(CFG.stop.reversalPadPct) || 0) / 100;
     if (pad > 0) {
       if (b === "long") sl = sl * (1 - pad);
@@ -279,6 +307,7 @@ if (b !== "long" && b !== "short") return null;
   }
   return sl;
 }
+
 
 
 function invalidationTfForMode(mode) {
@@ -530,6 +559,73 @@ function wickPct(point, bias) {
   return null;
 }
 
+function candleBodyPct(point) {
+  const o = asNum(point?.o ?? point?.open);
+  const c = asNum(point?.p ?? point?.c ?? point?.close);
+  if (o == null || c == null || c <= 0) return null;
+  return (Math.abs(c - o) / c) * 100;
+}
+
+function wickQuality(point, bias) {
+  const h = asNum(point?.h ?? point?.p);
+  const l = asNum(point?.l ?? point?.p);
+  const c = asNum(point?.p ?? point?.c ?? point?.close);
+
+  if (h == null || l == null || c == null || c <= 0) {
+    return {
+      wickPct: null,
+      bodyPct: null,
+      wickToBody: null,
+      qualityScore: 0,
+      dominant: false,
+      strong: false,
+      extreme: false,
+      bodyAware: false,
+    };
+  }
+
+  const wick = wickPct(point, bias);
+  const body = candleBodyPct(point);
+  const bodyAware = Number.isFinite(body) && body > 0;
+  const wickToBody =
+    Number.isFinite(wick) && bodyAware
+      ? wick / Math.max(body, 0.0001)
+      : null;
+
+  const dominant = bodyAware
+    ? Number.isFinite(wickToBody) && wickToBody >= 1.5
+    : Number.isFinite(wick) && wick >= Math.max(CFG.wick.minPct * 1.75, CFG.wick.minPct + 0.12);
+
+  const strong = bodyAware
+    ? Number.isFinite(wick) &&
+      wick >= Math.max(CFG.wick.minPct * 1.5, CFG.wick.minPct + 0.10) &&
+      dominant
+    : Number.isFinite(wick) && wick >= Math.max(CFG.wick.minPct * 2.0, CFG.wick.minPct + 0.18);
+
+  const extreme = bodyAware
+    ? Number.isFinite(wick) &&
+      wick >= Math.max(CFG.wick.minPct * 2, CFG.wick.minPct + 0.20) &&
+      Number.isFinite(wickToBody) &&
+      wickToBody >= 2.5
+    : Number.isFinite(wick) && wick >= Math.max(CFG.wick.minPct * 2.6, CFG.wick.minPct + 0.30);
+
+  let qualityScore = 0;
+  if (Number.isFinite(wick)) qualityScore += Math.min(3, wick / Math.max(CFG.wick.minPct, 0.01));
+  if (Number.isFinite(wickToBody)) qualityScore += Math.min(3, wickToBody / 1.5);
+  else if (Number.isFinite(wick)) qualityScore += Math.min(1.5, wick / Math.max(CFG.wick.minPct * 2, 0.02));
+
+  return {
+    wickPct: Number.isFinite(wick) ? wick : null,
+    bodyPct: Number.isFinite(body) ? body : null,
+    wickToBody: Number.isFinite(wickToBody) ? wickToBody : null,
+    qualityScore,
+    dominant,
+    strong,
+    extreme,
+    bodyAware,
+  };
+}
+
 // bias logic (mode intent)
 function biasFromItem(item, mode) {
   const m = String(mode || "scalp").toLowerCase();
@@ -649,57 +745,54 @@ function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item }) {
  * Only execReason + ctx fields.
  */
 function computeConfidence(t) {
-  const bias = String(t?.bias || "").toLowerCase(); // "long" | "short"
+  const bias = String(t?.bias || "").toLowerCase();
   const b1Strong = !!t?.b1?.strong;
 
   const execReason = String(t?.execReason || "").toLowerCase();
 
-  // 5m reversal confirmed = reversal path (not break path)
   const reversalConfirmed =
-  execReason.includes("b1_reversal") ||
-  execReason.includes("wick_reclaim") ||
-  execReason.includes("wick_reject") ||
-  execReason.includes("wick_flush_reclaim") ||
-  execReason.includes("wick_spike_reject");
+    execReason.includes("b1_reversal") ||
+    execReason.includes("wick_reclaim") ||
+    execReason.includes("wick_reject") ||
+    execReason.includes("wick_flush_reclaim") ||
+    execReason.includes("wick_spike_reject");
 
-  // breakout-only = break path
+  const wickDriven = execReason.includes("wick");
+
   const breakoutOnly =
     execReason.includes("break_above") ||
     execReason.includes("break_below") ||
     execReason.includes("breakout") ||
     execReason.includes("breakdown");
 
-  // 15m OI aligned (mechanical proxy) = 15m lean matches bias
   const lean15m = String(t?.ctx?.lean15m || "").toLowerCase();
   const oiAligned = lean15m === bias;
 
-  // OI neutral = 15m lean is neutral/unknown OR abs OI small vs shock threshold
   const oi15 = asNum(t?.ctx?.oi15);
   const oiNeutral =
     lean15m === "neutral" ||
     lean15m === "" ||
     (Number.isFinite(oi15) && Math.abs(oi15) < CFG.shockOi15mPct);
 
-  // weak OI = not aligned and not neutral
   const oiWeak = !oiAligned && !oiNeutral;
 
-  // 1h lean aligned = 1h lean matches bias
   const lean1h = String(t?.ctx?.lean1h || "").toLowerCase();
   const oneHourAligned = lean1h === bias;
   const counter1hLean = lean1h && lean1h !== "neutral" && !oneHourAligned;
 
-  // A: B1 strong + reversalConfirmed + oiAligned + 1h aligned
+  const wickMeta = t?.ctx?.wickMeta || {};
+  const wickStrong = !!wickMeta?.strong;
+  const wickExtreme = !!wickMeta?.extreme;
+
+  if (b1Strong && wickDriven && wickExtreme && oiAligned && oneHourAligned) return "A";
+  if (b1Strong && wickDriven && wickStrong && oiAligned) return "A";
   if (b1Strong && reversalConfirmed && oiAligned && oneHourAligned) return "A";
-
-  // B: B1 strong + reversalConfirmed + oiNeutral
+  if (b1Strong && wickDriven && wickStrong && oiNeutral) return "B";
   if (b1Strong && reversalConfirmed && oiNeutral) return "B";
-
-  // C: only breakout trigger OR weak OI OR counter 1h lean
   if (breakoutOnly || oiWeak || counter1hLean) return "C";
-
-  // conservative fallback
   return "C";
 }
+
 
 /**
  * DETECTION (mode-aware; loosened)
@@ -828,7 +921,8 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
     : null;
 
   const lastPt = recentPts.length ? recentPts[recentPts.length - 1] : null;
-  const lastWickPct = wickPct(lastPt, bias);
+  const wickMeta = wickQuality(lastPt, bias);
+  const lastWickPct = wickMeta.wickPct;
 
   if (bias === "long") {
     const breakout = priceNow > hi;
@@ -864,6 +958,7 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         ok: true,
         reason: "long_wick_flush_reclaim",
         entryLine: `5m flush wick reclaimed above 1h low (${fmtPrice(lo)}) + OI confirms`,
+        wickMeta,
       };
     }
 
@@ -904,6 +999,7 @@ async function scalpExecutionGate({ instId, item, bias, levels }) {
         ok: true,
         reason: "short_wick_spike_reject",
         entryLine: `5m spike wick rejected below 1h high (${fmtPrice(hi)}) + OI confirms`,
+        wickMeta,
       };
     }
 
@@ -969,7 +1065,8 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   const p5 = asNum(d5?.price_change_pct);
     const recentPts = await getRecentSeriesPoints(instId, 1);
   const lastPt = recentPts.length ? recentPts[recentPts.length - 1] : null;
-  const lastWickPct = wickPct(lastPt, bias);
+  const wickMeta = wickQuality(lastPt, bias);
+  const lastWickPct = wickMeta.wickPct;
 
   const range = hi - lo;
   if (!(range > 0)) return { ok: false, reason: "bad_range" };
@@ -1022,6 +1119,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         ok: true,
         reason: `${modeLabel.toLowerCase()}_wick_reclaim_long`,
         entryLine: `wick reclaim in B1 low band (${lowBandTxt}) + 5m turned up`,
+        wickMeta,
       };
     }
 
@@ -1061,6 +1159,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         ok: true,
         reason: `${modeLabel.toLowerCase()}_wick_reject_short`,
         entryLine: `wick reject in B1 high band (${highBandTxt}) + 5m turned down`,
+        wickMeta,
       };
     }
 
@@ -1355,6 +1454,7 @@ if (
 
         let entryLine = null;
         let execReason = null;
+        let execWickMeta = null;
 
         if (!force) {
           if (mode === "scalp") {
@@ -1378,6 +1478,7 @@ if (
 
             entryLine = g.entryLine || null;
             execReason = g.reason || null;
+            execWickMeta = g.wickMeta || null;
           } else {
             // --- Build Regime Gate (soft) ---
 if (mode === "build") {
@@ -1426,6 +1527,7 @@ if (mode === "build") {
             oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
             lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
             lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
+            wickMeta: execWickMeta || null,
           },
         };
 
