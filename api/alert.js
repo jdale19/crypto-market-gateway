@@ -389,6 +389,25 @@ function getModeCfg(mode) {
   };
 }
 
+function horizonMinForMode(mode) {
+  const m = String(mode || "scalp").toLowerCase();
+  if (m === "scalp") return 60;
+  if (m === "swing") return 240;
+  if (m === "build") return 1440;
+  return 240;
+}
+
+function summarizeSkips(skipped) {
+  return {
+    itemErrors: (skipped || []).filter((s) => String(s?.reason || "") === "item_not_ok").length,
+    topSkips: (skipped || []).slice(0, 12).map((s) => ({
+      symbol: s.symbol,
+      mode: s.mode,
+      reason: s.reason,
+    })),
+  };
+}
+
 // Uses 1h range as the structural “room to trade” proxy
 function rangePct1h({ levels, price }) {
   const l1h = levels?.["1h"];
@@ -1416,19 +1435,8 @@ if (mode === "build") {
       if (!winner) continue;
 
       triggered.push(winner);
-
-      if (!dry) {
-        await redis.set(CFG.keys.lastSentAt(instId), String(now));
-      }
     }
 
-    const itemErrors = (skipped || []).filter((s) => String(s?.reason || "") === "item_not_ok").length;
-    const topSkips = (skipped || []).slice(0, 12).map((s) => ({
-      symbol: s.symbol,
-      mode: s.mode,
-      reason: s.reason,
-    }));
-    
 // ---- Render DM ----
 
 const lines = [];
@@ -1449,10 +1457,12 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
       const side = Math.random() < 0.5 ? "long" : "short";
       const modePick = modes[Math.floor(Math.random() * modes.length)];
 
+      const horizonMin = horizonMinForMode(modePick);
       analyticsEvents.push({
         alert_id: `${now}_random_${pick.symbol}_${side}`,
         source: "gateway",
         ts: now,
+        due_ts: now + horizonMin * 60 * 1000,
         symbol: pick.symbol,
         instId: pick.instId,
         mode: modePick,
@@ -1460,6 +1470,7 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
         entry_price: asNum(pick.price),
         confidence: null,
         driver_tf,
+        horizon_min: horizonMin,
         observation_type: "random",
         rejection_reason: "",
         random_group_id: `${now}_random`,
@@ -1572,10 +1583,12 @@ lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
 lines.push(`Confidence = ${confidence}`);
 lines.push("");
 
+const horizonMin = horizonMinForMode(mode);
 analyticsEvents.push({
   alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
   source: "gateway",
   ts: now,
+  due_ts: now + horizonMin * 60 * 1000,
   symbol: t.symbol,
   instId: t.instId,
   mode,
@@ -1583,6 +1596,12 @@ analyticsEvents.push({
   entry_price: price,
   confidence,
   driver_tf,
+  horizon_min: horizonMin,
+  tp_tf: tpTf,
+  tp_price: tp,
+  stop_loss: stopLossPx,
+  invalidation_price: invalidationPx,
+  rr: rrInfo?.rr ?? null,
   observation_type: "fired",
   rejection_reason: ""
 });
@@ -1629,6 +1648,16 @@ const message = lines.join("\n");
 const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
 ).length;
+
+const firedInstIds = [
+  ...new Set(
+    analyticsEvents
+      .filter((e) => e.observation_type === "fired" && e.instId)
+      .map((e) => String(e.instId))
+  )
+];
+
+const { itemErrors, topSkips } = summarizeSkips(skipped);
 
 if (!force && renderedTradeCount === 0) {
   if (!dry) {
@@ -1700,6 +1729,14 @@ if (!force && renderedTradeCount === 0) {
     { dry }
   );
   return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+}
+
+if (firedInstIds.length > 0) {
+  await Promise.all(
+    firedInstIds.map((id) =>
+      redis.set(CFG.keys.lastSentAt(id), String(now)).catch(() => null)
+    )
+  );
 }
 
 await Promise.all(
