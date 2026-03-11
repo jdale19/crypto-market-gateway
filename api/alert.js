@@ -453,6 +453,23 @@ function rangePct1h({ levels, price }) {
   return (range / p) * 100;
 }
 
+async function postAnalyticsBatch(events, meta = {}) {
+  if (!process.env.ANALYTICS_WEBHOOK_URL || !Array.isArray(events) || events.length === 0) return;
+
+  try {
+    await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "gateway",
+        ts: Date.now(),
+        ...meta,
+        events,
+      }),
+    });
+  } catch (_) {}
+}
+
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -1763,15 +1780,15 @@ const { itemErrors, topSkips } = summarizeSkips(skipped);
 
 if (!force && renderedTradeCount === 0) {
   if (!dry) {
-    await Promise.all(
-  analyticsEvents.map(evt =>
-    fetch(process.env.ANALYTICS_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(evt)
-    }).catch(() => null)
-  )
-);
+    await postAnalyticsBatch(analyticsEvents, {
+      deploy_sha:
+        process.env.VERCEL_GIT_COMMIT_SHA ||
+        process.env.VERCEL_GITHUB_COMMIT_SHA ||
+        process.env.GITHUB_SHA ||
+        null,
+      modes,
+      risk_profile,
+    });
   }
 
   await writeHeartbeat(
@@ -1841,15 +1858,15 @@ if (firedInstIds.length > 0) {
   );
 }
 
-await Promise.all(
-  analyticsEvents.map(evt =>
-    fetch(process.env.ANALYTICS_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(evt)
-    }).catch(() => null)
-  )
-);
+    await postAnalyticsBatch(analyticsEvents, {
+      deploy_sha:
+        process.env.VERCEL_GIT_COMMIT_SHA ||
+        process.env.VERCEL_GITHUB_COMMIT_SHA ||
+        process.env.GITHUB_SHA ||
+        null,
+      modes,
+      risk_profile,
+    });
     }
 
     await writeHeartbeat(
