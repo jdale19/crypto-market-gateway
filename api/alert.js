@@ -1882,6 +1882,28 @@ const lev = computeLeverageFromStop({
   item: t._rawItem,
 });
 
+const minLev = Number(process.env.ALERT_MIN_LEVERAGE || 0);
+
+if (!force) {
+  const effectiveLev = Number(lev?.suggestedHigh || 0);
+
+  if (effectiveLev < minLev) {
+    if (debug) {
+      skipped.push({
+        symbol: t.symbol,
+        mode,
+        reason: "leverage_floor",
+        detail: {
+          suggestedLow: lev?.suggestedLow ?? null,
+          suggestedHigh: lev?.suggestedHigh ?? null,
+          minLev,
+        },
+      });
+    }
+    continue;
+  }
+}
+
   // ---- Block ----
   // If you want the mode header per-trade instead of once at top, uncomment:
   // lines.push(`⚡️ ${modeUp} TRADE ENTRY`);
