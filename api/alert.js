@@ -1264,10 +1264,12 @@ const debug_build_regimes =
         // ✅ MEMORY ISOLATED — ALWAYS WRITE IMMEDIATELY
         await writeLastState(mode, instId, curState, { dry });
 
-        if (!force && !triggers.length) {
-          if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
-          continue;
-        }
+        const requiresTrigger = mode === "scalp";
+
+if (!force && requiresTrigger && !triggers.length) {
+  if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
+  continue;
+}
 
         const bias = biasFromItem(item, mode);
         
