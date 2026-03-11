@@ -196,30 +196,34 @@ async function fetchSnapshotForInstId(instId, counters) {
   const now = Date.now();
   const bucket = Math.floor(now / BUCKET_MS);
 
-  const key = `snap5m:${instId}:${bucket}`;
-  const raw = await redis.get(key);
+  const candidates = [bucket, bucket - 1];
+  for (const b of candidates) {
+    const key = `snap5m:${instId}:${b}`;
+    const raw = await redis.get(key);
+    if (!raw) continue;
 
-  if (raw) {
     const j = safeJsonParse(raw);
     const price = Number(j?.price);
-const high = Number(j?.high);
-const low = Number(j?.low);
-const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
-const oi = Number(j?.open_interest_contracts);
+    const high = Number(j?.high);
+    const low = Number(j?.low);
+    const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
+    const oi = Number(j?.open_interest_contracts);
 
-if (Number.isFinite(price) && Number.isFinite(oi) && Number.isFinite(high) && Number.isFinite(low)) {
-  counters.snapshot_hits += 1;
-  return {
-    ok: true,
-    price,
-    high,
-    low,
-    funding_rate: Number.isFinite(fr) ? fr : null,
-    open_interest_contracts: oi,
-    ts: j?.ts ?? null,
-    key,
-  };
-}
+    if (Number.isFinite(price) && Number.isFinite(oi) && Number.isFinite(high) && Number.isFinite(low)) {
+      counters.snapshot_hits += 1;
+      return {
+        ok: true,
+        price,
+        high,
+        low,
+        funding_rate: Number.isFinite(fr) ? fr : null,
+        open_interest_contracts: oi,
+        ts: j?.ts ?? null,
+        key,
+        bucket: b,
+        lag_buckets: bucket - b,
+      };
+    }
   }
 
   counters.snapshot_misses += 1;
@@ -228,13 +232,13 @@ if (Number.isFinite(price) && Number.isFinite(oi) && Number.isFinite(high) && Nu
 
 // --- OKX fetch (OKX MODE only) ---
 async function fetchOkxSwap(instId, counters) {
-  // counters prove OKX usage
-  counters.okx_http_calls += 3;
+  counters.okx_http_calls += 4;
 
-  const [tickerRes, fundingRes, oiRes] = await Promise.all([
+  const [tickerRes, fundingRes, oiRes, candlesRes] = await Promise.all([
     fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`),
     fetch(`https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`),
     fetch(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`),
+    fetch(`https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=5m&limit=1`),
   ]);
 
   if (!tickerRes.ok) {
@@ -249,27 +253,35 @@ async function fetchOkxSwap(instId, counters) {
     counters.okx_http_failures += 1;
     return { ok: false, error: "oi fetch failed" };
   }
+  if (!candlesRes.ok) {
+    counters.okx_http_failures += 1;
+    return { ok: false, error: "candles fetch failed" };
+  }
 
   const tickerJson = await tickerRes.json().catch(() => null);
   const fundingJson = await fundingRes.json().catch(() => null);
   const oiJson = await oiRes.json().catch(() => null);
+  const candlesJson = await candlesRes.json().catch(() => null);
 
   const price = Number(tickerJson?.data?.[0]?.last);
   const funding_rate = Number(fundingJson?.data?.[0]?.fundingRate);
   const open_interest_contracts = Number(oiJson?.data?.[0]?.oi);
+  const candle = candlesJson?.data?.[0] || null;
+  const high = Number(candle?.[2]);
+  const low = Number(candle?.[3]);
 
-  if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts)) {
+  if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts) || !Number.isFinite(high) || !Number.isFinite(low)) {
     return { ok: false, error: "instrument not found or missing data" };
   }
 
   return {
-  ok: true,
-  price,
-  high: price,
-  low: price,
-  funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
-  open_interest_contracts,
-};
+    ok: true,
+    price,
+    high,
+    low,
+    funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
+    open_interest_contracts,
+  };
 }
 
 function computeTfDeltas(points, tf, funding_rate) {
@@ -487,6 +499,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
 
   // ---- Rolling 5m history append (once per bucket) ----
   const bucket = Math.floor(now / BUCKET_MS);
+  const sourceBucket = Number.isFinite(cur?.bucket) ? Number(cur.bucket) : bucket;
   const seriesKey = `series5m:${instId}`;
   const lastBucketKey = `lastBucket:${instId}`;
 
@@ -495,8 +508,8 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
 
   let wrotePoint = false;
 
-  if (!Number.isFinite(lastBucketNum) || lastBucketNum !== bucket) {
-    const point = { b: bucket, ts: now, p: price, h: high, l: low, fr: funding_rate, oi: open_interest_contracts };
+  if (!Number.isFinite(lastBucketNum) || sourceBucket > lastBucketNum) {
+    const point = { b: sourceBucket, ts: cur?.ts ?? now, p: price, h: high, l: low, fr: funding_rate, oi: open_interest_contracts };
 
     await redis.rpush(seriesKey, JSON.stringify(point));
     wrotePoint = true;
@@ -508,7 +521,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
       await redis.ltrim(seriesKey, startKeep, lenAfter - 1);
     }
 
-    await redis.set(lastBucketKey, String(bucket));
+    await redis.set(lastBucketKey, String(sourceBucket));
 
     await redis.expire(seriesKey, SERIES_TTL_SECONDS);
     await redis.expire(lastBucketKey, SERIES_TTL_SECONDS);
@@ -570,6 +583,8 @@ if (includeRegime) {
       snapshot_ts: dataSource === "snapshot" ? (cur?.ts ?? null) : null,
 
       bucket_now: bucket,
+      snapshot_bucket_used: dataSource === "snapshot" ? (Number.isFinite(cur?.bucket) ? cur.bucket : null) : null,
+      snapshot_lag_buckets: dataSource === "snapshot" ? (Number.isFinite(cur?.lag_buckets) ? cur.lag_buckets : null) : null,
       last_bucket_stored: Number.isFinite(lastBucketNum) ? lastBucketNum : null,
       wrote_point: wrotePoint,
       series_len: Number.isFinite(seriesLen) ? seriesLen : null,
