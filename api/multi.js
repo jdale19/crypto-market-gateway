@@ -204,6 +204,7 @@ async function fetchSnapshotForInstId(instId, counters) {
 
     const j = safeJsonParse(raw);
     const price = Number(j?.price);
+    const open = Number(j?.open);
     const high = Number(j?.high);
     const low = Number(j?.low);
     const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
@@ -214,6 +215,7 @@ async function fetchSnapshotForInstId(instId, counters) {
       return {
         ok: true,
         price,
+        open: Number.isFinite(open) ? open : null,
         high,
         low,
         funding_rate: Number.isFinite(fr) ? fr : null,
@@ -267,16 +269,18 @@ async function fetchOkxSwap(instId, counters) {
   const funding_rate = Number(fundingJson?.data?.[0]?.fundingRate);
   const open_interest_contracts = Number(oiJson?.data?.[0]?.oi);
   const candle = candlesJson?.data?.[0] || null;
+  const open = Number(candle?.[1]);
   const high = Number(candle?.[2]);
   const low = Number(candle?.[3]);
 
-  if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts) || !Number.isFinite(high) || !Number.isFinite(low)) {
+  if (!Number.isFinite(price) || !Number.isFinite(open_interest_contracts) || !Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low)) {
     return { ok: false, error: "instrument not found or missing data" };
   }
 
   return {
     ok: true,
     price,
+    open,
     high,
     low,
     funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
@@ -489,6 +493,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
   if (!cur.ok) return { ok: false, symbol, instId, error: cur.error };
 
   const price = cur.price;
+  const open = Number.isFinite(Number(cur?.open)) ? Number(cur.open) : null;
   const high = cur.high;
   const low = cur.low;
   const funding_rate = cur.funding_rate;
@@ -509,7 +514,7 @@ async function fetchOne(symbol, now, driver_tf, debugMode, dataSource, includeRe
   let wrotePoint = false;
 
   if (!Number.isFinite(lastBucketNum) || sourceBucket > lastBucketNum) {
-    const point = { b: sourceBucket, ts: cur?.ts ?? now, p: price, h: high, l: low, fr: funding_rate, oi: open_interest_contracts };
+    const point = { b: sourceBucket, ts: cur?.ts ?? now, p: price, o: open, h: high, l: low, fr: funding_rate, oi: open_interest_contracts };
 
     await redis.rpush(seriesKey, JSON.stringify(point));
     wrotePoint = true;
