@@ -159,6 +159,19 @@ macro: {
     minOiPct: Number(process.env.ALERT_SWING_MIN_OI_PCT || -0.5),
   },
 
+  flowPersists: {
+    enabled: String(process.env.ALERT_FLOW_PERSISTS_ENABLED || "1") === "1",
+    tfs: String(process.env.ALERT_FLOW_PERSISTS_TFS || "5m,15m,30m")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter((tf) => ["5m", "15m", "30m", "1h", "4h"].includes(tf)),
+    minMatches: Number(process.env.ALERT_FLOW_PERSISTS_MIN_MATCHES || 3),
+    requireOiPositive:
+      String(process.env.ALERT_FLOW_PERSISTS_REQUIRE_OI_POSITIVE || "1") === "1",
+    maxFundingAbs: Number(process.env.ALERT_FLOW_PERSISTS_MAX_FUNDING_ABS || 0.01),
+    min5mPricePct: Number(process.env.ALERT_FLOW_PERSISTS_MIN_5M_PRICE_PCT || 0.03),
+  },
+
   entryIdeas: {
     ignitionBreakout: {
       enabled: String(process.env.ALERT_IDEA_IGNITION_ENABLED || "1") === "1",
@@ -966,6 +979,11 @@ function computeConfidence(t) {
 
   const wickDriven = execReason.includes("wick");
 
+  const flowPersists =
+    execReason.includes("flow_persists_long") ||
+    execReason.includes("flow_persists_short") ||
+    execReason.includes("flow_persists");
+
   const breakoutOnly =
     execReason.includes("break_above") ||
     execReason.includes("break_below") ||
@@ -994,6 +1012,8 @@ function computeConfidence(t) {
   const wickStrong = !!wickMeta?.strong;
   const wickExtreme = !!wickMeta?.extreme;
 
+  if (flowPersists && oiAligned && oneHourAligned) return "A";
+  if (flowPersists && (oiAligned || oneHourAligned)) return "B";
   if (b1Strong && wickDriven && wickExtreme && oiAligned && oneHourAligned) return "A";
   if (b1Strong && wickDriven && wickStrong && oiAligned) return "A";
   if (b1Strong && reversalConfirmed && oiAligned && oneHourAligned) return "A";
@@ -1245,6 +1265,80 @@ function continuationTfForMode(modeLabel) {
   return "1h";
 }
 
+function flowPersistsAcrossTfs(item, bias) {
+  const cfg = CFG.flowPersists;
+  const funding = asNum(item?.funding_rate);
+  const p5 = asNum(item?.deltas?.["5m"]?.price_change_pct);
+  const matchedTfs = [];
+
+  if (!cfg?.enabled) {
+    return {
+      ok: false,
+      reason: "flow_persists_disabled",
+      matchedTfs,
+      matchCount: 0,
+      funding,
+      p5,
+    };
+  }
+
+  if (!Number.isFinite(p5) || Math.abs(p5) < cfg.min5mPricePct) {
+    return {
+      ok: false,
+      reason: "flow_persists_5m_too_small",
+      matchedTfs,
+      matchCount: 0,
+      funding,
+      p5,
+    };
+  }
+
+  if (Number.isFinite(funding) && Math.abs(funding) > cfg.maxFundingAbs) {
+    return {
+      ok: false,
+      reason: "flow_persists_funding_too_high",
+      matchedTfs,
+      matchCount: 0,
+      funding,
+      p5,
+    };
+  }
+
+  for (const tf of cfg.tfs) {
+    const d = item?.deltas?.[tf];
+    if (!d) continue;
+
+    const lean = String(d?.lean || "").toLowerCase();
+    const oi = asNum(d?.oi_change_pct);
+
+    if (lean !== bias) continue;
+    if (cfg.requireOiPositive && !(Number.isFinite(oi) && oi > 0)) continue;
+
+    matchedTfs.push(tf);
+  }
+
+  const matchCount = matchedTfs.length;
+  if (matchCount < cfg.minMatches) {
+    return {
+      ok: false,
+      reason: "flow_persists_not_enough_matches",
+      matchedTfs,
+      matchCount,
+      funding,
+      p5,
+    };
+  }
+
+  return {
+    ok: true,
+    reason: `flow_persists_${bias}`,
+    matchedTfs,
+    matchCount,
+    funding,
+    p5,
+  };
+}
+
 async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWING" }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { ok: false, reason: "1h_warmup" };
@@ -1367,7 +1461,21 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inLowBand, p5, lastWickPct } };
+    const flowPersist = flowPersistsAcrossTfs(item, "long");
+    if (flowPersist.ok) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_flow_persists_long`,
+        entryLine: `flow persists across TFs (${flowPersist.matchedTfs.join("/")}) + OI aligned`,
+        detail: flowPersist,
+      };
+    }
+
+    return {
+      ok: false,
+      reason: "no_entry_trigger",
+      detail: { p, hi, lo, inLowBand, p5, lastWickPct, flowPersists: flowPersist },
+    };
   }
 
   if (bias === "short") {
@@ -1415,7 +1523,21 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-    return { ok: false, reason: "no_entry_trigger", detail: { p, hi, lo, inHighBand, p5, lastWickPct } };
+    const flowPersist = flowPersistsAcrossTfs(item, "short");
+    if (flowPersist.ok) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_flow_persists_short`,
+        entryLine: `flow persists across TFs (${flowPersist.matchedTfs.join("/")}) + OI aligned`,
+        detail: flowPersist,
+      };
+    }
+
+    return {
+      ok: false,
+      reason: "no_entry_trigger",
+      detail: { p, hi, lo, inHighBand, p5, lastWickPct, flowPersists: flowPersist },
+    };
   }
 
   return { ok: false, reason: "neutral_bias" };
