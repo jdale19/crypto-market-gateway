@@ -1696,10 +1696,50 @@ module.exports = async function handler(req, res) {
 );
     
     const now = Date.now();
+    const deployInfo = getDeployInfo();
     const cooldownMs = CFG.cooldownMinutes * 60000;
 
     const triggered = [];
     const skipped = [];
+    const analyticsEvents = [];
+
+    function shouldLogSkippedReason(reason) {
+      const r = String(reason || "");
+      if (!r) return false;
+      return !["item_not_ok", "cooldown", "warmup_gate_1h"].includes(r);
+    }
+
+    function recordSkipEvent({ symbol, instId = "", mode = "", side = "", entryPrice = "", confidence = "", horizonMin = "", rejectionReason = "", extra = {} }) {
+      if (!shouldLogSkippedReason(rejectionReason)) return;
+      analyticsEvents.push({
+        alert_id: `${now}_${symbol}_${mode || 'unknown'}_skipped_${String(rejectionReason).replace(/[^a-zA-Z0-9_:-]+/g, '_')}`,
+        source: "gateway",
+        ts: now,
+        due_ts: horizonMin ? now + Number(horizonMin) * 60 * 1000 : "",
+        symbol: symbol || "",
+        instId: instId || "",
+        driver_tf,
+        mode: mode || "",
+        side: side || "",
+        entry_price: entryPrice === "" ? "" : entryPrice,
+        tp_price: extra.tp_price ?? "",
+        stop_loss: extra.stop_loss ?? "",
+        invalidation_price: extra.invalidation_price ?? "",
+        rr: extra.rr ?? "",
+        confidence: confidence || "",
+        horizon_min: horizonMin || "",
+        status: "PENDING",
+        exit_price: "",
+        return_pct: "",
+        abs_return_pct: "",
+        result: "",
+        gateway_version: deployInfo.sha || "",
+        observation_type: "skipped",
+        rejection_reason: rejectionReason,
+        random_group_id: "",
+        random_source: "",
+      });
+    }
 
     // Debug-only: show build regime per symbol (so you can confirm gate inputs)
 const debug_build_regimes =
@@ -1916,8 +1956,6 @@ if (mode === "build") {
 // ---- Render DM ----
 
 const lines = [];
-const analyticsEvents = [];
-
 lines.push(`⚡️TRADE ENTRY`);
 lines.push("");
 // Independent random baseline observation
@@ -1941,12 +1979,22 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
         due_ts: now + horizonMin * 60 * 1000,
         symbol: pick.symbol,
         instId: pick.instId,
+        driver_tf,
         mode: modePick,
         side,
         entry_price: asNum(pick.price),
-        confidence: null,
-        driver_tf,
+        tp_price: "",
+        stop_loss: "",
+        invalidation_price: "",
+        rr: "",
+        confidence: "",
         horizon_min: horizonMin,
+        status: "PENDING",
+        exit_price: "",
+        return_pct: "",
+        abs_return_pct: "",
+        result: "",
+        gateway_version: deployInfo.sha || "",
         observation_type: "random",
         rejection_reason: "",
         random_group_id: `${now}_random`,
@@ -2089,19 +2137,26 @@ analyticsEvents.push({
   due_ts: now + horizonMin * 60 * 1000,
   symbol: t.symbol,
   instId: t.instId,
+  driver_tf,
   mode,
   side: bias,
   entry_price: price,
-  confidence,
-  driver_tf,
-  horizon_min: horizonMin,
-  tp_tf: tpTf,
   tp_price: tp,
-  stop_loss: stopLossPx,
-  invalidation_price: invalidationPx,
-  rr: rrInfo?.rr ?? null,
+  stop_loss: stopLossPx ?? "",
+  invalidation_price: invalidationPx ?? "",
+  rr: rrInfo?.rr ?? "",
+  confidence,
+  horizon_min: horizonMin,
+  status: "PENDING",
+  exit_price: "",
+  return_pct: "",
+  abs_return_pct: "",
+  result: "",
+  gateway_version: deployInfo.sha || "",
   observation_type: "fired",
-  rejection_reason: ""
+  rejection_reason: "",
+  random_group_id: "",
+  random_source: ""
 });
 
 // Entry Zone (1h B1 band)
@@ -2143,6 +2198,23 @@ lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
 }
 
 const message = lines.join("\n");
+
+for (const s of skipped) {
+  const reason = String(s?.reason || "");
+  if (!shouldLogSkippedReason(reason)) continue;
+  const mode = s?.mode || "";
+  recordSkipEvent({
+    symbol: s?.symbol || "",
+    instId: "",
+    mode,
+    side: s?.bias || "",
+    entryPrice: "",
+    confidence: "",
+    horizonMin: mode ? horizonMinForMode(mode) : "",
+    rejectionReason: reason,
+  });
+}
+
 const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
 ).length;
