@@ -23,6 +23,8 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+const EVAL_BUCKET_MS = 5 * 60 * 1000;
+
 // Faster always wins
 const MODE_PRIORITY = ["scalp", "swing", "build"]; // fastest -> slowest
 
@@ -510,6 +512,26 @@ function horizonMinForMode(mode) {
   if (m === "swing") return 240;
   if (m === "build") return 1440;
   return 240;
+}
+
+function buildEvaluationTiming(baseTs, horizonMin) {
+  const hasHorizon = Number.isFinite(Number(horizonMin)) && Number(horizonMin) > 0;
+  if (!hasHorizon) {
+    return {
+      dueTs: "",
+      evalBucket: "",
+      evalTsEffective: "",
+    };
+  }
+
+  const dueTs = Number(baseTs) + Number(horizonMin) * 60 * 1000;
+  const evalBucket = Math.floor(dueTs / EVAL_BUCKET_MS);
+
+  return {
+    dueTs,
+    evalBucket,
+    evalTsEffective: evalBucket * EVAL_BUCKET_MS,
+  };
 }
 
 function summarizeSkips(skipped) {
@@ -1735,11 +1757,14 @@ module.exports = async function handler(req, res) {
 
     function recordSkipEvent({ symbol, instId = "", mode = "", side = "", entryPrice = "", confidence = "", horizonMin = "", rejectionReason = "", extra = {} }) {
       if (!shouldLogSkippedReason(rejectionReason)) return;
+      const evalTiming = buildEvaluationTiming(now, horizonMin);
       analyticsEvents.push({
         alert_id: `${now}_${symbol}_${mode || 'unknown'}_skipped_${String(rejectionReason).replace(/[^a-zA-Z0-9_:-]+/g, '_')}`,
         source: "gateway",
         ts: now,
-        due_ts: horizonMin ? now + Number(horizonMin) * 60 * 1000 : "",
+        due_ts: evalTiming.dueTs,
+        eval_bucket: evalTiming.evalBucket,
+        eval_ts_effective: evalTiming.evalTsEffective,
         symbol: symbol || "",
         instId: instId || "",
         driver_tf,
@@ -1996,11 +2021,14 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
       const modePick = modes[Math.floor(Math.random() * modes.length)];
 
       const horizonMin = horizonMinForMode(modePick);
+      const evalTiming = buildEvaluationTiming(now, horizonMin);
       analyticsEvents.push({
         alert_id: `${now}_random_${pick.symbol}_${side}`,
         source: "gateway",
         ts: now,
-        due_ts: now + horizonMin * 60 * 1000,
+        due_ts: evalTiming.dueTs,
+        eval_bucket: evalTiming.evalBucket,
+        eval_ts_effective: evalTiming.evalTsEffective,
         symbol: pick.symbol,
         instId: pick.instId,
         driver_tf,
@@ -2178,11 +2206,14 @@ lines.push(`Confidence = ${confidence}`);
 lines.push("");
 
 const horizonMin = horizonMinForMode(mode);
+const evalTiming = buildEvaluationTiming(now, horizonMin);
 analyticsEvents.push({
   alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
   source: "gateway",
   ts: now,
-  due_ts: now + horizonMin * 60 * 1000,
+  due_ts: evalTiming.dueTs,
+  eval_bucket: evalTiming.evalBucket,
+  eval_ts_effective: evalTiming.evalTsEffective,
   symbol: t.symbol,
   instId: t.instId,
   driver_tf,
