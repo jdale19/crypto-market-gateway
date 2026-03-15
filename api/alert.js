@@ -441,6 +441,30 @@ function computeRiskReward({ entryPrice, stopLossPx, tp }) {
   };
 }
 
+function buildTpLadder({ bias, entryPrice, tp1 }) {
+  const entry = asNum(entryPrice);
+  const first = asNum(tp1);
+  if (entry == null || first == null || entry <= 0) return [];
+
+  const dist = Math.abs(first - entry);
+  if (!(dist > 0)) return [];
+
+  const dir = String(bias || '').toLowerCase();
+  if (!['long', 'short'].includes(dir)) return [];
+
+  const mults = [1, 2, 3, 5];
+
+  return mults.map((m, idx) => {
+    const tp = dir === 'long' ? entry + dist * m : entry - dist * m;
+    const tpPct = (Math.abs(tp - entry) / entry) * 100;
+    return {
+      label: `TP${idx + 1}`,
+      tp,
+      tpPct,
+    };
+  });
+}
+
 function safeJsonParse(v) {
   if (v == null) return null;
   if (typeof v === "object") return v;
@@ -2099,11 +2123,17 @@ if (!tpPick) {
 const tp = tpPick.tp;
 const tpTf = tpPick.tf;
 const tpPct = tpPick.tpPct;
+const buildTargets = mode === "build"
+  ? buildTpLadder({ bias, entryPrice: price, tp1: tp })
+  : [];
+const rrAnchorTp = mode === "build" && buildTargets.length >= 2
+  ? buildTargets[1].tp
+  : tp;
 
 const rrInfo = computeRiskReward({
   entryPrice: price,
   stopLossPx,
-  tp,
+  tp: rrAnchorTp,
 });
 
 if (!rrInfo || rrInfo.rr < CFG.minRR) {
@@ -2191,8 +2221,15 @@ if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
 else lines.push("Stop Loss:");
 
 // MESSAGE
-lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
-lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
+if (mode === "build" && buildTargets.length) {
+  lines.push(`Targets (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
+  for (const target of buildTargets) {
+    lines.push(`• ${target.label}: ${fmtPrice(target.tp)} (≈ ${target.tpPct.toFixed(2)}%)`);
+  }
+} else {
+  lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
+  lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
+}
   
   lines.push("");
 }
