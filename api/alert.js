@@ -2123,6 +2123,24 @@ if (!tpPick) {
 const tp = tpPick.tp;
 const tpTf = tpPick.tf;
 const tpPct = tpPick.tpPct;
+if (!force && mode === "build" && tpPct < CFG.minTpPctByMode.build) {
+  if (debug) {
+    skipped.push({
+      symbol: t.symbol,
+      mode,
+      reason: "build_tp_too_small",
+      detail: {
+        tpPct,
+        minTpPct: CFG.minTpPctByMode.build,
+        forced: !!tpPick?.forced,
+        entryPrice: price,
+        tp,
+        tpTf,
+      },
+    });
+  }
+  continue;
+}
 const buildTargets = mode === "build"
   ? buildTpLadder({ bias, entryPrice: price, tp1: tp })
   : [];
