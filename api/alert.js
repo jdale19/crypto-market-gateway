@@ -2123,7 +2123,7 @@ if (!tpPick) {
 const tp = tpPick.tp;
 const tpTf = tpPick.tf;
 const tpPct = tpPick.tpPct;
-if (!force && mode === "build" && tpPct < CFG.minTpPctByMode.build) {
+if (mode === "build" && tpPct < CFG.minTpPctByMode.build) {
   if (debug) {
     skipped.push({
       symbol: t.symbol,
