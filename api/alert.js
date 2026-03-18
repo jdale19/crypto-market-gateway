@@ -9,7 +9,7 @@
 // - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
 // - MESSAGE CONTRACT: header includes MODE; uses Entry Zone format (no Entry: line)
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
-// - LEVERAGE RECO: advisory only (compact line) + OI/funding adjustments
+// - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -213,7 +213,7 @@ macro: {
     },
   },
 
-  // --- Leverage Model (advisory copy only) ---
+  // --- Leverage Model (rendered copy + optional hard floor via ALERT_MIN_LEVERAGE) ---
   leverage: {
     // master switch (optional)
     enabled: String(process.env.ALERT_LEVERAGE_ENABLED || "1") === "1",
@@ -1665,33 +1665,47 @@ function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
     return false;
   };
 
-  // First pass: find a TP with enough room
+  const candidates = [];
+
   for (const tf of order) {
     const lvl = levels?.[tf];
     for (const tp of tpCandidatesForBias(bias, lvl)) {
-      if (!isValidDir(price, tp)) continue;          // ✅ direction guard
+      if (!isValidDir(price, tp)) continue;
       const tpPct = pctMove(price, tp);
-      if (tpPct >= minTpPct) return { tf, tp, tpPct, forced: false };
+      candidates.push({ tf, tp, tpPct });
     }
   }
 
-  // Fallback: farthest available (but still correct direction)
-  for (let i = order.length - 1; i >= 0; i--) {
-    const tf = order[i];
-    const lvl = levels?.[tf];
-    const tps = tpCandidatesForBias(bias, lvl).filter((tp) => isValidDir(price, tp)); // ✅
-    if (tps.length) {
-      // pick FARTHER one, not tps[0]
-      let best = null;
-      for (const tp of tps) {
-        const tpPct = pctMove(price, tp);
-        if (!best || tpPct > best.tpPct) best = { tf, tp, tpPct, forced: true };
-      }
-      return best;
+  if (!candidates.length) return null;
+
+  // For swing, choose the FARTHER valid structural target.
+  // This aligns better with the fixed 1h structural stop.
+  if (String(mode || "").toLowerCase() === "swing") {
+    let best = null;
+    for (const c of candidates) {
+      if (c.tpPct < minTpPct) continue;
+      if (!best || c.tpPct > best.tpPct) best = { ...c, forced: false };
     }
+    if (best) return best;
+
+    // fallback: still return the farthest valid target
+    for (const c of candidates) {
+      if (!best || c.tpPct > best.tpPct) best = { ...c, forced: true };
+    }
+    return best;
   }
 
-  return null;
+  // Existing behavior for scalp/build:
+  // first TF with enough room, else farthest valid fallback
+  for (const c of candidates) {
+    if (c.tpPct >= minTpPct) return { ...c, forced: false };
+  }
+
+  let best = null;
+  for (const c of candidates) {
+    if (!best || c.tpPct > best.tpPct) best = { ...c, forced: true };
+  }
+  return best;
 }
 
 module.exports = async function handler(req, res) {
