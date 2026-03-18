@@ -14,7 +14,7 @@
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
 // - Default modes now use DEFAULT_MODES env var (comma list). DEFAULT_MODE is still honored as fallback.
-// - Leverage reco is advisory text only; does not change gating.
+// - Leverage reco; can also be used to change gating.
 
 const { Redis } = require("@upstash/redis");
 
@@ -1654,7 +1654,7 @@ function tpCandidatesForBias(bias, lvl) {
   return [];
 }
 
-// chooses the FIRST TF that gives you “enough room”; if none do, picks farthest TF available
+// for SWING mode only, chooses the FURTHEST TF that gives you “enough room”; for SCALP or BUILD, chooses the FIRST TF; if none give enough room, picks farthest TF available
 function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
   const order = modeTpTfOrder(mode);
   const pctMove = (a, b) => (Math.abs(b - a) / a) * 100;
