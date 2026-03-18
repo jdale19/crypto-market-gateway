@@ -117,7 +117,6 @@ minRangePctByMode: {
     enabled: String(process.env.ALERT_DPS_ENABLED || "1") === "1",
     threshold: Number(process.env.ALERT_DPS_THRESHOLD || 0.35),
     favoredReversalMult: Number(process.env.ALERT_DPS_FAVORED_REVERSAL_MULT || 0.85),
-    opposedReversalMult: Number(process.env.ALERT_DPS_OPPOSED_REVERSAL_MULT || 1.15),
   },
   
   telegramMaxChars: 3900,
