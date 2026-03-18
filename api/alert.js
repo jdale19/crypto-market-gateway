@@ -111,7 +111,15 @@ minRangePctByMode: {
   
   // Swing reversal micro-confirm (5m push away from extreme)
   swingReversalMin5mMovePct: Number(process.env.ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT || 0.05),
-
+ 
+  // Directional Pull Score (swing/build only, neutral-rescue only)
+  dps: {
+    enabled: String(process.env.ALERT_DPS_ENABLED || "1") === "1",
+    threshold: Number(process.env.ALERT_DPS_THRESHOLD || 0.35),
+    favoredReversalMult: Number(process.env.ALERT_DPS_FAVORED_REVERSAL_MULT || 0.85),
+    opposedReversalMult: Number(process.env.ALERT_DPS_OPPOSED_REVERSAL_MULT || 1.15),
+  },
+  
   telegramMaxChars: 3900,
 
   // Macro gate (mode-aware timeframe)
@@ -733,7 +741,42 @@ function wickQuality(point, bias) {
     bodyAware,
   };
 }
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
 
+function computeDps({ levels, price, lastPoint }) {
+  const l1h = levels?.["1h"];
+  const p = asNum(price);
+
+  if (!CFG.dps?.enabled || !l1h || l1h.warmup || p == null) {
+    return { score: 0, bias: "neutral", pos01: null, wickEdge: null, locationScore: null };
+  }
+
+  const hi = asNum(l1h.hi);
+  const lo = asNum(l1h.lo);
+  if (hi == null || lo == null || !(hi > lo)) {
+    return { score: 0, bias: "neutral", pos01: null, wickEdge: null, locationScore: null };
+  }
+
+  const pos01 = clamp((p - lo) / (hi - lo), 0, 1);
+  const locationScore = (pos01 - 0.5) * 2; // near high = +1 => short tilt
+
+  const shortWick = wickQuality(lastPoint, "short");
+  const longWick = wickQuality(lastPoint, "long");
+
+  const shortEdge = Number(shortWick?.qualityScore || 0);
+  const longEdge = Number(longWick?.qualityScore || 0);
+  const wickEdge = (shortEdge - longEdge) / 3;
+
+  const score = locationScore + wickEdge;
+
+  let bias = "neutral";
+  if (score >= CFG.dps.threshold) bias = "short";
+  else if (score <= -CFG.dps.threshold) bias = "long";
+
+  return { score, bias, pos01, wickEdge, locationScore };
+}
 function avg(nums) {
   const vals = (nums || []).filter((x) => Number.isFinite(x));
   if (!vals.length) return null;
@@ -1385,7 +1428,7 @@ function flowPersistsAcrossTfs(item, bias) {
   };
 }
 
-async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWING" }) {
+async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWING", dps = null }) {
   const l1h = levels?.["1h"];
   if (!l1h || l1h.warmup) return { ok: false, reason: "1h_warmup" };
 
@@ -1440,6 +1483,9 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   const inHighBand = p >= highBandLo;
   const lowBandTxt = `${fmtPrice(lowBandLo)}–${fmtPrice(lowBandHi)}`;
   const highBandTxt = `${fmtPrice(highBandLo)}–${fmtPrice(highBandHi)}`;
+    let reversalMin = CFG.swingReversalMin5mMovePct;
+  const dpsBias = String(dps?.bias || "neutral").toLowerCase();
+  if (dpsBias === bias) reversalMin *= CFG.dps.favoredReversalMult;
 
   if (bias === "long") {
     const ignition = ignitionBreakoutLongCheck(recentPts, p, asNum(item?.funding_rate));
@@ -1481,12 +1527,12 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-    const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= CFG.swingReversalMin5mMovePct;
+    const reversalOk = inLowBand && Number.isFinite(p5) && p5 >= reversalMin;
     if (reversalOk) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_long`,
-        entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(CFG.swingReversalMin5mMovePct)})`,
+        entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(reversalMin)})`,
       };
     }
 
@@ -1543,12 +1589,12 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-    const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -CFG.swingReversalMin5mMovePct;
+    const reversalOk = inHighBand && Number.isFinite(p5) && p5 <= -reversalMin;
     if (reversalOk) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_short`,
-        entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(CFG.swingReversalMin5mMovePct)})`,
+        entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(reversalMin)})`,
       };
     }
 
@@ -1852,7 +1898,27 @@ if (!force && requiresTrigger && !triggers.length) {
   continue;
 }
 
-        const bias = biasFromItem(item, mode);
+        const baseBias = biasFromItem(item, mode);
+        let dps = null;
+        let bias = baseBias;
+
+        if ((mode === "swing" || mode === "build") && baseBias === "neutral" && CFG.dps?.enabled) {
+          const recentPtsForDps = await getRecentSeriesPoints(
+            instId,
+            Math.max(2, CFG.wick.sweepLookbackPoints)
+          );
+          const lastPtForDps = recentPtsForDps.length
+            ? recentPtsForDps[recentPtsForDps.length - 1]
+            : null;
+
+          dps = computeDps({
+            levels,
+            price: item.price,
+            lastPoint: lastPtForDps,
+          });
+
+          if (dps?.bias && dps.bias !== "neutral") bias = dps.bias;
+        }
         
         const { minRangePct } = getModeCfg(mode);
 const rPct = rangePct1h({ levels, price: item.price });
@@ -1952,7 +2018,7 @@ if (mode === "build") {
   }
 }
             const modeLabel = mode === "build" ? "BUILD" : "SWING";
-            const g = await swingExecutionGate({ instId, bias, levels, item, modeLabel });
+            const g = await swingExecutionGate({ instId, bias, levels, item, modeLabel, dps });
 
             if (!g.ok) {
               if (debug)
@@ -1978,6 +2044,7 @@ if (mode === "build") {
           symbol,
           price: item.price,
           bias,
+          baseBias,
           triggers,
           levels,
           b1,
@@ -1991,6 +2058,7 @@ if (mode === "build") {
             lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
             lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
             wickMeta: execWickMeta || null,
+            dps: dps || null,
           },
         };
 
