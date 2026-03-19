@@ -980,11 +980,15 @@ function strongRecoB1({ bias, levels, price }) {
 // --- Leverage suggestion (advisory) ---
 // Base = floor(riskBudgetPct / distance_to_invalidation_pct)
 // Then reduce if OI is jumpy or funding is stretched.
-function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item }) {
+function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item, dynamicRisk = null }) {
   if (!CFG.leverage?.enabled) return null;
 
   const m = String(mode || "scalp").toLowerCase();
-  const riskBudgetPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
+  const baseRiskBudgetPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
+  const riskBudgetPct =
+    dynamicRisk && Number.isFinite(Number(dynamicRisk.effectiveRiskPct))
+      ? Number(dynamicRisk.effectiveRiskPct)
+      : baseRiskBudgetPct;
 
   const entry = asNum(entryPrice);
   const sl = asNum(stopLossPx);
@@ -993,12 +997,10 @@ function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item }) {
   const stopDistPct = Math.abs((entry - sl) / entry) * 100;
   if (!Number.isFinite(stopDistPct) || stopDistPct <= 0) return null;
 
-  // base leverage proxy (same model as before, but using stop distance)
   const baseMax = Math.floor(
     Math.max(0, Number(riskBudgetPct) || 0) / Math.max(0.01, stopDistPct)
   );
 
-  // OI adjustment
   const oi5 = Math.abs(asNum(item?.deltas?.["5m"]?.oi_change_pct) ?? 0);
   const oi15 = Math.abs(asNum(item?.deltas?.["15m"]?.oi_change_pct) ?? 0);
 
@@ -1006,7 +1008,6 @@ function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item }) {
   if (oi5 > CFG.leverage.oiReduce2 || oi15 > CFG.leverage.oiReduce2) oiMult = 0.6;
   else if (oi5 > CFG.leverage.oiReduce1 || oi15 > CFG.leverage.oiReduce1) oiMult = 0.75;
 
-  // Funding adjustment
   const funding = Math.abs(asNum(item?.funding_rate) ?? 0);
 
   let fMult = 1;
@@ -1024,7 +1025,9 @@ function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item }) {
     adjustedMax,
     stopDistPct,
     riskBudgetPct,
+    baseRiskBudgetPct,
     flags: { oiReduced: oiMult < 1, fundingReduced: fMult < 1 },
+    dynamicRisk: dynamicRisk || null,
   };
 }
 
@@ -1109,6 +1112,77 @@ function computeConfidence(t) {
   if (b1Strong && reversalConfirmed && oiNeutral) return "B";
   if (breakoutOnly || oiWeak || counter1hLean) return "C";
   return "C";
+}
+function computeDynamicRiskBudget({ mode, t, confidence }) {
+  const m = String(mode || "scalp").toLowerCase();
+  const baseRiskPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
+
+  let score = 0;
+  const reasons = [];
+
+  const execReason = String(t?.execReason || "").toLowerCase();
+  const lean1h = String(t?.ctx?.lean1h || "").toLowerCase();
+  const bias = String(t?.bias || "").toLowerCase();
+  const oneHourAligned = lean1h === bias;
+  const counter1hLean = lean1h && lean1h !== "neutral" && !oneHourAligned;
+
+  const b1Strong = !!t?.b1?.strong;
+
+  const flowPersists =
+    execReason.includes("flow_persists_long") ||
+    execReason.includes("flow_persists_short") ||
+    execReason.includes("flow_persists");
+
+  const reversalConfirmed =
+    execReason.includes("b1_reversal") ||
+    execReason.includes("wick_reclaim") ||
+    execReason.includes("wick_reject") ||
+    execReason.includes("wick_flush_reclaim") ||
+    execReason.includes("wick_spike_reject") ||
+    execReason.includes("liquidity_snap_reversal");
+
+  const breakoutOnly =
+    execReason.includes("break_above") ||
+    execReason.includes("break_below") ||
+    execReason.includes("breakout") ||
+    execReason.includes("breakdown") ||
+    execReason.includes("ignition_breakout") ||
+    execReason.includes("slow_leverage_squeeze") ||
+    execReason.includes("slow_short_breakdown");
+
+  const wickMeta = t?.ctx?.wickMeta || {};
+  const wickStrong = !!wickMeta?.strong;
+  const wickExtreme = !!wickMeta?.extreme;
+
+  if (confidence === "A") { score += 2; reasons.push("conf_A"); }
+  else if (confidence === "B") { score += 1; reasons.push("conf_B"); }
+
+  if (b1Strong) { score += 1; reasons.push("b1_strong"); }
+  if (flowPersists) { score += 1; reasons.push("flow_persists"); }
+  if (oneHourAligned) { score += 1; reasons.push("aligned_1h"); }
+  if (wickExtreme) { score += 0.5; reasons.push("wick_extreme"); }
+  else if (wickStrong) { score += 0.25; reasons.push("wick_strong"); }
+
+  if (reversalConfirmed) { score += 0.25; reasons.push("reversal_confirmed"); }
+  if (breakoutOnly) { score -= 0.5; reasons.push("breakout_only"); }
+  if (counter1hLean) { score -= 1; reasons.push("counter_1h"); }
+
+  let multiplier = 1.0;
+  if (score >= 5) multiplier = 2.0;
+  else if (score >= 4) multiplier = 1.75;
+  else if (score >= 3) multiplier = 1.5;
+  else if (score >= 2) multiplier = 1.25;
+  else if (score <= 0) multiplier = 0.75;
+
+  const effectiveRiskPct = Number((baseRiskPct * multiplier).toFixed(4));
+
+  return {
+    baseRiskPct,
+    effectiveRiskPct,
+    multiplier,
+    score,
+    reasons,
+  };
 }
 
 
@@ -1846,6 +1920,12 @@ module.exports = async function handler(req, res) {
         rejection_reason: rejectionReason,
         random_group_id: "",
         random_source: "",
+        risk_budget_pct: extra.risk_budget_pct ?? "",
+        risk_budget_base_pct: extra.risk_budget_base_pct ?? "",
+        leverage_suggested_low: extra.leverage_suggested_low ?? "",
+        leverage_suggested_high: extra.leverage_suggested_high ?? "",
+        min_lev: extra.min_lev ?? "",
+        dynamic_risk: extra.dynamic_risk ?? "",
       });
     }
 
@@ -2152,6 +2232,11 @@ for (const t of triggered) {
   const bias = String(t.bias || "neutral").toLowerCase();
   const biasUp = bias.toUpperCase();
   const confidence = computeConfidence(t);
+  const dynamicRisk =
+  mode === "swing"
+    ? computeDynamicRiskBudget({ mode, t, confidence })
+    : null;
+
 
   // MODE-AWARE INVALIDATION TF (fallback-safe)
   const invTfRaw = invalidationTfForMode(mode); // you added this helper
@@ -2183,29 +2268,33 @@ const lev = computeLeverageFromStop({
   entryPrice: price,
   stopLossPx,
   item: t._rawItem,
+  dynamicRisk,
 });
-
 const minLev = Number(process.env.ALERT_MIN_LEVERAGE || 0);
 
 if (!force) {
   const effectiveLev = Number(lev?.suggestedHigh || 0);
 
   if (effectiveLev < minLev) {
-    if (debug) {
-      skipped.push({
-        symbol: t.symbol,
-        mode,
-        reason: "leverage_floor",
-        detail: {
-          suggestedLow: lev?.suggestedLow ?? null,
-          suggestedHigh: lev?.suggestedHigh ?? null,
-          minLev,
-        },
-      });
-    }
+    skipped.push({
+      symbol: t.symbol,
+      mode,
+      reason: "leverage_floor",
+      bias,
+      detail: {
+        riskBudgetPct: lev?.riskBudgetPct ?? null,
+        baseRiskBudgetPct: lev?.baseRiskBudgetPct ?? null,
+        dynamicRisk: lev?.dynamicRisk ?? null,
+        suggestedLow: lev?.suggestedLow ?? null,
+        suggestedHigh: lev?.suggestedHigh ?? null,
+        minLev,
+      },
+    });
     continue;
   }
 }
+
+
 
   // ---- Block ----
   // If you want the mode header per-trade instead of once at top, uncomment:
@@ -2225,7 +2314,7 @@ const tpPick = chooseDynamicTp({
 });
 
 if (!tpPick) {
-  if (debug) skipped.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
+  skipped.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
   continue;
 }
 
@@ -2233,7 +2322,7 @@ const tp = tpPick.tp;
 const tpTf = tpPick.tf;
 const tpPct = tpPick.tpPct;
 if (mode === "build" && tpPct < CFG.minTpPctByMode.build) {
-  if (debug) {
+  {
     skipped.push({
       symbol: t.symbol,
       mode,
@@ -2264,7 +2353,7 @@ const rrInfo = computeRiskReward({
 });
 
 if (!rrInfo || rrInfo.rr < CFG.minRR) {
-  if (debug) {
+ {
     skipped.push({
       symbol: t.symbol,
       mode,
@@ -2282,8 +2371,28 @@ if (!rrInfo || rrInfo.rr < CFG.minRR) {
   }
   continue;
 }
+      console.log("DYNAMIC_RISK", JSON.stringify({
+    symbol: t.symbol,
+    mode,
+    side: bias,
+    confidence,
+    dynamicRisk,
+    leverage: lev ? {
+      suggestedLow: lev.suggestedLow,
+      suggestedHigh: lev.suggestedHigh,
+      stopDistPct: lev.stopDistPct,
+      riskBudgetPct: lev.riskBudgetPct,
+      baseRiskBudgetPct: lev.baseRiskBudgetPct,
+    } : null,
+  }));
 lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
 lines.push(`Confidence = ${confidence}`);
+lines.push(
+  `Risk = ${lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct}% ` +
+  `(base ${lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct}%, ` +
+  `mult x${dynamicRisk?.multiplier ?? 1}, score ${dynamicRisk?.score ?? 0})`
+);
+lines.push(`Risk drivers = ${(dynamicRisk?.reasons || []).join(", ") || "none"}`);
 lines.push("");
 
 const horizonMin = horizonMinForMode(mode);
@@ -2306,6 +2415,14 @@ analyticsEvents.push({
   invalidation_price: invalidationPx ?? "",
   rr: rrInfo?.rr ?? "",
   confidence,
+  leverage_suggested_low: lev?.suggestedLow ?? "",
+  leverage_suggested_high: lev?.suggestedHigh ?? "",
+  leverage_stop_dist_pct: lev?.stopDistPct ?? "",
+  risk_budget_pct: lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct ?? "",
+  risk_budget_base_pct: lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct ?? "",
+  risk_budget_multiplier: dynamicRisk?.multiplier ?? "",
+  risk_budget_score: dynamicRisk?.score ?? "",
+  risk_budget_reasons: (dynamicRisk?.reasons || []).join(","),
   horizon_min: horizonMin,
   status: "PENDING",
   exit_price: "",
@@ -2370,7 +2487,7 @@ for (const s of skipped) {
   const reason = String(s?.reason || "");
   if (!shouldLogSkippedReason(reason)) continue;
   const mode = s?.mode || "";
-  recordSkipEvent({
+    recordSkipEvent({
     symbol: s?.symbol || "",
     instId: "",
     mode,
@@ -2379,6 +2496,14 @@ for (const s of skipped) {
     confidence: "",
     horizonMin: mode ? horizonMinForMode(mode) : "",
     rejectionReason: reason,
+    extra: {
+      risk_budget_pct: s?.detail?.riskBudgetPct ?? "",
+      risk_budget_base_pct: s?.detail?.baseRiskBudgetPct ?? "",
+      leverage_suggested_low: s?.detail?.suggestedLow ?? "",
+      leverage_suggested_high: s?.detail?.suggestedHigh ?? "",
+      min_lev: s?.detail?.minLev ?? "",
+      dynamic_risk: s?.detail?.dynamicRisk ? JSON.stringify(s.detail.dynamicRisk) : "",
+    },
   });
 }
 
