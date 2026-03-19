@@ -195,10 +195,6 @@ async function resolveOkxSwapInstId(symbol, { dataSource, counters }) {
 async function fetchSnapshotForInstId(instId, counters) {
   const now = Date.now();
   const bucket = Math.floor(now / BUCKET_MS);
-
-  async function fetchSnapshotForInstId(instId, counters) {
-  const now = Date.now();
-  const bucket = Math.floor(now / BUCKET_MS);
   const key = `snap5m:${instId}:${bucket}`;
   const raw = await redis.get(key);
 
@@ -234,40 +230,6 @@ async function fetchSnapshotForInstId(instId, counters) {
     bucket,
     lag_buckets: 0,
   };
-}
-  for (const b of candidates) {
-    const key = `snap5m:${instId}:${b}`;
-    const raw = await redis.get(key);
-    if (!raw) continue;
-
-    const j = safeJsonParse(raw);
-    const price = Number(j?.price);
-    const open = Number(j?.open);
-    const high = Number(j?.high);
-    const low = Number(j?.low);
-    const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
-    const oi = Number(j?.open_interest_contracts);
-
-    if (Number.isFinite(price) && Number.isFinite(oi) && Number.isFinite(high) && Number.isFinite(low)) {
-      counters.snapshot_hits += 1;
-      return {
-        ok: true,
-        price,
-        open: Number.isFinite(open) ? open : null,
-        high,
-        low,
-        funding_rate: Number.isFinite(fr) ? fr : null,
-        open_interest_contracts: oi,
-        ts: j?.ts ?? null,
-        key,
-        bucket: b,
-        lag_buckets: bucket - b,
-      };
-    }
-  }
-
-  counters.snapshot_misses += 1;
-  return { ok: false, error: "snapshot_missing" };
 }
 
 // --- OKX fetch (OKX MODE only) ---
