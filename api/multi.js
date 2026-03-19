@@ -196,7 +196,45 @@ async function fetchSnapshotForInstId(instId, counters) {
   const now = Date.now();
   const bucket = Math.floor(now / BUCKET_MS);
 
-  const candidates = [bucket, bucket - 1];
+  async function fetchSnapshotForInstId(instId, counters) {
+  const now = Date.now();
+  const bucket = Math.floor(now / BUCKET_MS);
+  const key = `snap5m:${instId}:${bucket}`;
+  const raw = await redis.get(key);
+
+  if (!raw) {
+    counters.snapshot_misses += 1;
+    return { ok: false, error: "snapshot_missing", bucket };
+  }
+
+  const j = safeJsonParse(raw);
+  const price = Number(j?.price);
+  const open = Number(j?.open);
+  const high = Number(j?.high);
+  const low = Number(j?.low);
+  const fr = j?.funding_rate == null ? null : Number(j?.funding_rate);
+  const oi = Number(j?.open_interest_contracts);
+
+  if (!Number.isFinite(price) || !Number.isFinite(oi) || !Number.isFinite(high) || !Number.isFinite(low)) {
+    counters.snapshot_misses += 1;
+    return { ok: false, error: "snapshot_invalid", bucket };
+  }
+
+  counters.snapshot_hits += 1;
+  return {
+    ok: true,
+    price,
+    open: Number.isFinite(open) ? open : null,
+    high,
+    low,
+    funding_rate: Number.isFinite(fr) ? fr : null,
+    open_interest_contracts: oi,
+    ts: j?.ts ?? null,
+    key,
+    bucket,
+    lag_buckets: 0,
+  };
+}
   for (const b of candidates) {
     const key = `snap5m:${instId}:${b}`;
     const raw = await redis.get(key);
