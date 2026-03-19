@@ -1883,10 +1883,10 @@ module.exports = async function handler(req, res) {
     const analyticsEvents = [];
 
     function shouldLogSkippedReason(reason) {
-      const r = String(reason || "");
-      if (!r) return false;
-      return !["item_not_ok", "cooldown", "warmup_gate_1h"].includes(r);
-    }
+  const r = String(reason || "");
+  if (!r) return false;
+  return !["cooldown", "warmup_gate_1h"].includes(r);
+}
 
     function recordSkipEvent({ symbol, instId = "", mode = "", side = "", entryPrice = "", confidence = "", horizonMin = "", rejectionReason = "", extra = {} }) {
       if (!shouldLogSkippedReason(rejectionReason)) return;
@@ -1944,14 +1944,15 @@ const debug_build_regimes =
 
     for (const item of j.results || []) {
       if (!item?.ok) {
-        if (debug)
-          skipped.push({
-            symbol: item?.symbol || "?",
-            reason: "item_not_ok",
-            detail: item?.error || null,
-          });
-        continue;
-      }
+  const detail = String(item?.error || "item_not_ok");
+  if (debug) skipped.push({ symbol: item?.symbol || "?", reason: detail });
+  recordSkipEvent({
+    symbol: item?.symbol || "",
+    instId: item?.instId || "",
+    rejectionReason: detail,
+  });
+  continue;
+}
 
       const instId = String(item.instId || "");
       const symbol = String(item.symbol || "?");
