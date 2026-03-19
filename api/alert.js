@@ -259,7 +259,7 @@ macro: {
   keys: {
     lastState: (mode, id) => `alert:lastState:${String(mode || "unknown")}:${id}`,
     last15mState: (id) => `alert:lastState15m:${id}`, // legacy
-    lastSentAt: (id) => `alert:lastSentAt:${id}`,
+    lastSentAt: (id, mode) => `alert:lastSentAt:${id}:${String(mode || "unknown")}`,
     series5m: (id) => `series5m:${id}`,
   },
 };
@@ -1957,14 +1957,7 @@ const debug_build_regimes =
       const instId = String(item.instId || "");
       const symbol = String(item.symbol || "?");
 
-      // cooldown is per-instId (shared across modes) so you don't spam
-      const lastSentRaw = await redis.get(CFG.keys.lastSentAt(instId));
-      const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
 
-      if (!force && Number.isFinite(lastSent) && lastSent != null && now - lastSent < cooldownMs) {
-        if (debug) skipped.push({ symbol, reason: "cooldown" });
-        continue;
-      }
 
       const levels = await computeLevelsFromSeries(instId);
 
@@ -1977,20 +1970,17 @@ const debug_build_regimes =
       let winner = null;
 
       for (const mode of modes) {
+        const lastSentRaw = await redis.get(CFG.keys.lastSentAt(instId, mode));
+const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
+
+if (!force && Number.isFinite(lastSent) && now - lastSent < cooldownMs) {
+  if (debug) skipped.push({ symbol, mode, reason: "cooldown" });
+  continue;
+}
         const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
         const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
 
         const { triggers, curState } = evaluateCriteria(item, lastState, mode);
-
-        // ✅ MEMORY ISOLATED — ALWAYS WRITE IMMEDIATELY
-        await writeLastState(mode, instId, curState, { dry });
-
-        const requiresTrigger = mode === "scalp";
-
-if (!force && requiresTrigger && !triggers.length) {
-  if (debug) skipped.push({ symbol, mode, reason: "no_triggers" });
-  continue;
-}
 
         const baseBias = biasFromItem(item, mode);
         let dps = null;
@@ -2161,7 +2151,7 @@ if (mode === "build") {
 
       if (!winner) continue;
 
-      triggered.push(winner);
+triggered.push(winner);
     }
 
 // ---- Render DM ----
@@ -2398,7 +2388,7 @@ lines.push("");
 
 const horizonMin = horizonMinForMode(mode);
 const evalTiming = buildEvaluationTiming(now, horizonMin);
-analyticsEvents.push({
+  analyticsEvents.push({
   alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
   source: "gateway",
   ts: now,
@@ -2512,11 +2502,11 @@ const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
 ).length;
 
-const firedInstIds = [
+const firedKeys = [
   ...new Set(
     analyticsEvents
-      .filter((e) => e.observation_type === "fired" && e.instId)
-      .map((e) => String(e.instId))
+      .filter((e) => e.observation_type === "fired" && e.instId && e.mode)
+      .map((e) => `${String(e.instId)}__${String(e.mode)}`)
   )
 ];
 
@@ -2574,6 +2564,7 @@ if (!force && renderedTradeCount === 0) {
 
     if (!dry) {
       const tg = await sendTelegram(message);
+      
       if (!tg.ok) {
   await writeHeartbeat(
     {
@@ -2592,13 +2583,29 @@ if (!force && renderedTradeCount === 0) {
     { dry }
   );
   return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+        
+}
+      const firedStateWrites = analyticsEvents
+  .filter((e) => e.observation_type === "fired" && e.instId && e.mode)
+  .map((e) => {
+    const match = triggered.find(
+      (t) => String(t.instId) === String(e.instId) && String(t.mode) === String(e.mode)
+    );
+    if (!match) return null;
+    return writeLastState(match.mode, match.instId, match.curState, { dry: false });
+  })
+  .filter(Boolean);
+
+if (firedStateWrites.length > 0) {
+  await Promise.all(firedStateWrites);
 }
 
-if (firedInstIds.length > 0) {
+      if (firedKeys.length > 0) {
   await Promise.all(
-    firedInstIds.map((id) =>
-      redis.set(CFG.keys.lastSentAt(id), String(now)).catch(() => null)
-    )
+    firedKeys.map((key) => {
+      const [id, mode] = key.split("__");
+      return redis.set(CFG.keys.lastSentAt(id, mode), String(now)).catch(() => null);
+    })
   );
 }
 
