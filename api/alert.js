@@ -1781,7 +1781,147 @@ function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
   }
   return best;
 }
+function summarizeMacroBias(macroByMode, modes) {
+  const ordered = (modes || MODE_PRIORITY).filter(Boolean);
+  const leans = ordered
+    .map((mode) => ({ mode, lean: String(macroByMode?.[mode]?.btc?.lean || "neutral").toLowerCase() }))
+    .filter((x) => x.lean && x.lean !== "neutral");
 
+  if (!leans.length) return "mixed / neutral";
+  const uniqueLeans = [...new Set(leans.map((x) => x.lean))];
+  if (uniqueLeans.length === 1) {
+    return `${uniqueLeans[0]} across ${leans.map((x) => x.mode).join("/")}`;
+  }
+  return leans.map((x) => `${x.mode}:${x.lean}`).join(", ");
+}
+
+function summarizeBuildRegime(regimeRow) {
+  if (!regimeRow) return "no build regime read";
+  const regime = String(regimeRow.regime || "neutral").toLowerCase();
+  const score = Number(regimeRow.score ?? 0);
+  if (regime === "bullish" && score >= 40) return "strong bullish build tailwind";
+  if (regime === "bearish" && score <= -40) return "strong bearish build tailwind";
+  return "no strong build regime tailwind";
+}
+
+function summarizeSkipReason(skip, mode, focusSymbol) {
+  const reason = String(skip?.reason || "").toLowerCase();
+  if (!reason) return null;
+
+  if (reason === "range_floor") {
+    if (mode === "scalp") return "market too quiet / compressed";
+    if (mode === "swing" || mode === "build") return "some movement, but not enough for slower-mode range requirements";
+    return "range too small";
+  }
+
+  if (reason === "macro_block_btc_bull_expansion") return "BTC macro blocked the short";
+  if (reason === "btc_waterfall_override") return "BTC waterfall blocked the long";
+  if (reason === "leverage_floor") return "setup passed, but leverage recommendation was below floor";
+
+  if (reason.startsWith("weak_reco:")) {
+    const detail = reason.slice("weak_reco:".length);
+    if (detail === "short_not_near_high") return "short idea existed, but not stretched enough toward local high";
+    if (detail === "long_not_near_low") return "long idea existed, but not stretched enough toward local low";
+    return "direction was possible, but entry location was weak";
+  }
+
+  if (reason.startsWith("scalp_exec:")) {
+    return `scalp execution gate failed (${reason.slice("scalp_exec:".length)})`;
+  }
+
+  if (reason === "rr_too_small") return "reward-to-risk was too small";
+  if (reason === "build_tp_too_small") return "build target was too small";
+  if (reason === "no_dynamic_tp") return "no valid take-profit target found";
+  if (reason === "cooldown") return "cooldown blocked repeat alert";
+  if (reason === "warmup_gate_1h") return "not enough 1h data yet";
+
+  if (focusSymbol && String(skip?.symbol || "").toUpperCase() !== String(focusSymbol).toUpperCase()) {
+    return null;
+  }
+
+  return reason;
+}
+
+function buildDebugSummary({
+  symbols = [],
+  modes = [],
+  macroByMode = {},
+  skipped = [],
+  triggered = [],
+  debug_build_regimes = [],
+  btcSymbol = "BTCUSDT",
+}) {
+  const requested = (symbols || []).map((s) => String(s || "").toUpperCase()).filter(Boolean);
+  const focusSymbol = requested.find((s) => s !== String(btcSymbol || "BTCUSDT").toUpperCase()) || requested[0] || null;
+  const orderedModes = (modes || MODE_PRIORITY).filter(Boolean);
+  const focusSkips = (skipped || []).filter((x) => String(x?.symbol || "").toUpperCase() === String(focusSymbol || "").toUpperCase());
+  const btcSkips = (skipped || []).filter((x) => String(x?.symbol || "").toUpperCase() === String(btcSymbol || "BTCUSDT").toUpperCase());
+  const focusTriggered = (triggered || []).filter((x) => String(x?.symbol || "").toUpperCase() === String(focusSymbol || "").toUpperCase());
+  const buildRow = (debug_build_regimes || []).find((x) => String(x?.symbol || "").toUpperCase() === String(focusSymbol || "").toUpperCase());
+
+  const rangeFloorCount = (skipped || []).filter((x) => String(x?.reason || "") === "range_floor").length;
+  const marketState = rangeFloorCount >= Math.max(1, Math.ceil((skipped || []).length / 2))
+    ? "too quiet / compressed"
+    : ((triggered || []).length ? "tradeable" : "mixed");
+
+  const symbol_read = {};
+  for (const mode of orderedModes) {
+    const trig = focusTriggered.find((x) => String(x?.mode || "").toLowerCase() === String(mode).toLowerCase());
+    if (trig) {
+      symbol_read[mode] = `triggered ${String(trig?.bias || "").toLowerCase()} setup`;
+      continue;
+    }
+    const skip = focusSkips.find((x) => String(x?.mode || "").toLowerCase() === String(mode).toLowerCase());
+    symbol_read[mode] = skip ? summarizeSkipReason(skip, mode, focusSymbol) : "no clear read";
+  }
+
+  const whyNoAlert = [];
+  if (!(triggered || []).length) {
+    if (marketState === "too quiet / compressed") whyNoAlert.push("overall volatility too low");
+    for (const mode of orderedModes) {
+      const msg = symbol_read[mode];
+      if (!msg || msg === "no clear read") continue;
+      if (!whyNoAlert.includes(msg)) whyNoAlert.push(msg);
+    }
+    const buildTailwind = summarizeBuildRegime(buildRow);
+    if (buildTailwind === "no strong build regime tailwind" && !whyNoAlert.includes(buildTailwind)) {
+      whyNoAlert.push(buildTailwind);
+    }
+  }
+
+  const summary = {
+    focus_symbol: focusSymbol,
+    btc_macro_bias: summarizeMacroBias(macroByMode, orderedModes),
+    market_state: marketState,
+    symbol_read,
+    build_regime: buildRow
+      ? {
+          regime: buildRow.regime ?? null,
+          score: buildRow.score ?? null,
+          read: summarizeBuildRegime(buildRow),
+        }
+      : undefined,
+    why_no_alert: whyNoAlert,
+  };
+
+  const lines = [];
+  if (focusSymbol) lines.push(`${focusSymbol}`);
+  lines.push(`BTC macro bias: ${summary.btc_macro_bias}`);
+  lines.push(`Market state: ${summary.market_state}`);
+  for (const mode of orderedModes) {
+    if (summary.symbol_read?.[mode]) {
+      lines.push(`${mode[0].toUpperCase()}${mode.slice(1)}: ${summary.symbol_read[mode]}`);
+    }
+  }
+  if (summary.build_regime?.read) lines.push(`Build regime: ${summary.build_regime.read}`);
+  if (summary.why_no_alert?.length) lines.push(`Why no alert: ${summary.why_no_alert.join("; ")}`);
+  summary.text = lines.join("\n");
+
+  const btcRangeFloor = btcSkips.find((x) => String(x?.reason || "") === "range_floor");
+  if (btcRangeFloor?.detail) summary.btc_range_context = btcRangeFloor.detail;
+
+  return summary;
+}
 module.exports = async function handler(req, res) {
   let dry = false;
   let debug = false;
@@ -2575,7 +2715,17 @@ if (!force && renderedTradeCount === 0) {
   );
 
   const heartbeat_last_run = debug ? await readHeartbeat() : undefined;
-
+  const summary = debug
+  ? buildDebugSummary({
+      symbols,
+      modes,
+      macroByMode,
+      skipped,
+      triggered,
+      debug_build_regimes,
+      btcSymbol: CFG.macro.btcSymbol,
+    })
+  : undefined;
   return res.json({
     ok: true,
     sent: false,
@@ -2589,6 +2739,7 @@ if (!force && renderedTradeCount === 0) {
           modes,
           debug_build_regimes,
           risk_profile,
+          summary,
           renderedMessage: message,
           heartbeat_last_run,
         }
@@ -2670,7 +2821,17 @@ if (firedStateWrites.length > 0) {
     );
 
     const heartbeat_last_run = debug ? await readHeartbeat() : undefined;
-
+const summary = debug
+  ? buildDebugSummary({
+      symbols,
+      modes,
+      macroByMode,
+      skipped,
+      triggered,
+      debug_build_regimes,
+      btcSymbol: CFG.macro.btcSymbol,
+    })
+  : undefined;
     return res.json({
       ok: true,
       sent: !dry,
@@ -2685,6 +2846,7 @@ if (firedStateWrites.length > 0) {
             modes,
             debug_build_regimes,
             risk_profile,
+            summary,
             renderedMessage: message,
             heartbeat_last_run,
           }
