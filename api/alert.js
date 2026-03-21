@@ -2223,6 +2223,30 @@ for (const t of triggered) {
   const bias = String(t.bias || "neutral").toLowerCase();
   const biasUp = bias.toUpperCase();
   const confidence = computeConfidence(t);
+  const execReasonLc = String(t?.execReason || "").toLowerCase();
+const wickMeta = t?.ctx?.wickMeta || {};
+
+const flowPersists =
+  execReasonLc.includes("flow_persists_long") ||
+  execReasonLc.includes("flow_persists_short") ||
+  execReasonLc.includes("flow_persists");
+
+const reversalConfirmed =
+  execReasonLc.includes("b1_reversal") ||
+  execReasonLc.includes("wick_reclaim") ||
+  execReasonLc.includes("wick_reject") ||
+  execReasonLc.includes("wick_flush_reclaim") ||
+  execReasonLc.includes("wick_spike_reject") ||
+  execReasonLc.includes("liquidity_snap_reversal");
+
+const breakoutOnly =
+  execReasonLc.includes("break_above") ||
+  execReasonLc.includes("break_below") ||
+  execReasonLc.includes("breakout") ||
+  execReasonLc.includes("breakdown") ||
+  execReasonLc.includes("ignition_breakout") ||
+  execReasonLc.includes("slow_leverage_squeeze") ||
+  execReasonLc.includes("slow_short_breakdown");
   const dynamicRisk =
   mode === "swing"
     ? computeDynamicRiskBudget({ mode, t, confidence })
@@ -2406,6 +2430,16 @@ const evalTiming = buildEvaluationTiming(now, horizonMin);
   invalidation_price: invalidationPx ?? "",
   rr: rrInfo?.rr ?? "",
   confidence,
+  exec_reason: t?.execReason || "",
+b1_strong: !!t?.b1?.strong,
+lean_15m: t?.ctx?.lean15m || "",
+lean_1h: t?.ctx?.lean1h || "",
+oi_15m_pct: t?.ctx?.oi15 ?? "",
+wick_strong: !!wickMeta?.strong,
+wick_extreme: !!wickMeta?.extreme,
+flow_persists: flowPersists,
+reversal_confirmed: reversalConfirmed,
+breakout_only: breakoutOnly,
   leverage_suggested_low: lev?.suggestedLow ?? "",
   leverage_suggested_high: lev?.suggestedHigh ?? "",
   leverage_stop_dist_pct: lev?.stopDistPct ?? "",
