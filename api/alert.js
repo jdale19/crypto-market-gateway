@@ -130,7 +130,7 @@ macro: {
   // Defaults: scalp=1h, swing=1h, build=4h
   btcTfByMode: {
   scalp: String(process.env.ALERT_MACRO_BTC_TF_SCALP || "1h").toLowerCase(),
-  swing: String(process.env.ALERT_MACRO_BTC_TF_SWING || "1h").toLowerCase(),
+  swing: String(process.env.ALERT_MACRO_BTC_TF_SWING || "4h").toLowerCase(),
   build: String(process.env.ALERT_MACRO_BTC_TF_BUILD || "4h").toLowerCase(),
 },
 
