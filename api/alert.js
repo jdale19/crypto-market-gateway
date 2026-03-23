@@ -2482,7 +2482,11 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
 
       const side = Math.random() < 0.5 ? "long" : "short";
       const modePick = modes[Math.floor(Math.random() * modes.length)];
-
+      const randomExtAdj = getExternalContextAdj({
+  mode: modePick,
+  side,
+  bias: externalContext?.bias,
+});
       const horizonMin = horizonMinForMode(modePick);
       const evalTiming = buildEvaluationTiming(now, horizonMin);
       analyticsEvents.push({
@@ -2503,7 +2507,7 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
         invalidation_price: "",
         rr: "",
         confidence: "",
-        ext_context_adj: 0,
+        ext_context_adj: randomExtAdj,
         ext_context_bias: externalContext?.bias ?? "neutral",
         horizon_min: horizonMin,
         status: "PENDING",
