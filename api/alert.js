@@ -2503,6 +2503,8 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
         invalidation_price: "",
         rr: "",
         confidence: "",
+        ext_context_adj: 0,
+        ext_context_bias: externalContext?.bias ?? "neutral",
         horizon_min: horizonMin,
         status: "PENDING",
         exit_price: "",
