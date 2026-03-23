@@ -130,6 +130,16 @@ minRangePctByMode: {
     coinUrl: String(process.env.ALERT_EXT_CONTEXT_COIN_URL || "https://stooq.com/q/l/?s=coin.us&i=d"),
     vixUrl: String(process.env.ALERT_EXT_CONTEXT_VIX_URL || "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"),
   },
+  
+  anomaly: {
+  enabled: String(process.env.ALERT_ANOMALY_ENABLED || "1") === "1",
+  tf: String(process.env.ALERT_ANOMALY_TF || "15m").toLowerCase(),
+  basketSymbols: normalizeSymbols(
+    process.env.ALERT_ANOMALY_BASKET_SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT,NEARUSDT,SUIUSDT"
+  ),
+  minBasketSize: Number(process.env.ALERT_ANOMALY_MIN_BASKET_SIZE || 3),
+  fallbackBasketSize: Number(process.env.ALERT_ANOMALY_FALLBACK_BASKET_SIZE || 5),
+},
 
   // Macro gate (mode-aware timeframe)
 macro: {
@@ -534,8 +544,149 @@ async function loadExternalContext() {
     return out;
   }
 }
+function average(nums = []) {
+  const vals = (nums || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
+  if (!vals.length) return null;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
 
-function getExternalContextAdj({ mode, side, bias }) {
+function classifyAnomalyPattern({ pricePct, oiPct }) {
+  if (!Number.isFinite(pricePct) || !Number.isFinite(oiPct)) return "unknown";
+  if (pricePct > 0 && oiPct > 0) return "long_build";
+  if (pricePct < 0 && oiPct < 0) return "long_liq";
+  if (pricePct > 0 && oiPct < 0) return "short_squeeze";
+  if (pricePct < 0 && oiPct > 0) return "short_build";
+  return "mixed";
+}
+
+function buildCrossAssetAnomaly({
+  items = [],
+  tf = CFG.anomaly?.tf || "15m",
+  preferredBasket = CFG.anomaly?.basketSymbols || ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NEARUSDT", "SUIUSDT"],
+  minBasketSize = CFG.anomaly?.minBasketSize || 3,
+  fallbackBasketSize = CFG.anomaly?.fallbackBasketSize || 5,
+}) {
+  if (!CFG.anomaly?.enabled) {
+    return {
+      ok: false,
+      reason: "disabled",
+      tf,
+      basket_symbols: [],
+      ranking: [],
+    };
+  }
+
+  const rows = (items || [])
+    .filter((it) => it?.ok && it?.symbol)
+    .map((it) => {
+      const pricePct = asNum(it?.deltas?.[tf]?.price_change_pct);
+      const oiPct = asNum(it?.deltas?.[tf]?.oi_change_pct);
+      const fundingRate = asNum(it?.funding_rate);
+
+      if (!Number.isFinite(pricePct) || !Number.isFinite(oiPct) || !Number.isFinite(fundingRate)) {
+        return null;
+      }
+
+      return {
+        symbol: String(it.symbol).toUpperCase(),
+        pricePct,
+        oiPct,
+        fundingRate,
+      };
+    })
+    .filter(Boolean);
+
+  const preferredSet = new Set(
+    (preferredBasket || []).map((s) => String(s || "").toUpperCase()).filter(Boolean)
+  );
+
+  let basketRows = rows.filter((r) => preferredSet.has(r.symbol));
+
+  if (basketRows.length < minBasketSize) {
+    basketRows = rows
+      .slice()
+      .sort((a, b) => {
+        const aPri = preferredSet.has(a.symbol) ? 0 : 1;
+        const bPri = preferredSet.has(b.symbol) ? 0 : 1;
+        if (aPri !== bPri) return aPri - bPri;
+        return a.symbol.localeCompare(b.symbol);
+      })
+      .slice(0, Math.min(fallbackBasketSize, rows.length));
+  }
+
+  if (basketRows.length < minBasketSize) {
+    return {
+      ok: false,
+      reason: "basket_too_small",
+      tf,
+      basket_symbols: basketRows.map((r) => r.symbol),
+      ranking: [],
+    };
+  }
+
+  const basketPricePct = average(basketRows.map((r) => r.pricePct));
+  const basketOiPct = average(basketRows.map((r) => r.oiPct));
+  const basketFundingRate = average(basketRows.map((r) => r.fundingRate));
+
+  if (
+    !Number.isFinite(basketPricePct) ||
+    !Number.isFinite(basketOiPct) ||
+    !Number.isFinite(basketFundingRate)
+  ) {
+    return {
+      ok: false,
+      reason: "basket_invalid",
+      tf,
+      basket_symbols: basketRows.map((r) => r.symbol),
+      ranking: [],
+    };
+  }
+
+  const ranking = rows
+    .map((r) => {
+      const priceOiGap = Math.abs(r.oiPct - r.pricePct);
+      const fundingDeviationBps = Math.abs((r.fundingRate - basketFundingRate) * 10000);
+      const oiTrendDeviation = Math.abs(r.oiPct - basketOiPct);
+      const priceDeviation = Math.abs(r.pricePct - basketPricePct);
+
+      const score = Number(
+        (priceOiGap + fundingDeviationBps + oiTrendDeviation + priceDeviation).toFixed(2)
+      );
+
+      return {
+        symbol: r.symbol,
+        score,
+        pattern: classifyAnomalyPattern({ pricePct: r.pricePct, oiPct: r.oiPct }),
+        price_pct: Number(r.pricePct.toFixed(4)),
+        oi_pct: Number(r.oiPct.toFixed(4)),
+        funding_rate: r.fundingRate,
+        basket_price_pct: Number(basketPricePct.toFixed(4)),
+        basket_oi_pct: Number(basketOiPct.toFixed(4)),
+        basket_funding_rate: basketFundingRate,
+        components: {
+          price_oi_gap: Number(priceOiGap.toFixed(2)),
+          funding_deviation_bps: Number(fundingDeviationBps.toFixed(2)),
+          oi_trend_deviation: Number(oiTrendDeviation.toFixed(2)),
+          price_deviation: Number(priceDeviation.toFixed(2)),
+        },
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return {
+    ok: true,
+    tf,
+    basket_symbols: basketRows.map((r) => r.symbol),
+    basket: {
+      price_pct: Number(basketPricePct.toFixed(4)),
+      oi_pct: Number(basketOiPct.toFixed(4)),
+      funding_rate: basketFundingRate,
+    },
+    ranking,
+  };
+}
+function getExternalContextAdj({ mode, side, bias })
+{
   const m = String(mode || "").toLowerCase();
   const s = String(side || "").toLowerCase();
   const b = String(bias || "neutral").toLowerCase();
@@ -2176,11 +2327,14 @@ module.exports = async function handler(req, res) {
 );
     
     const now = Date.now();
-    const deployInfo = getDeployInfo();
-    const cooldownMs = CFG.cooldownMinutes * 60000;
-    const externalContext = await loadExternalContext();
+const deployInfo = getDeployInfo();
+const cooldownMs = CFG.cooldownMinutes * 60000;
+const externalContext = await loadExternalContext();
+const anomalyRanking = buildCrossAssetAnomaly({
+  items: j.results || [],
+});
 
-    const triggered = [];
+const triggered = [];
     const skipped = [];
     const analyticsEvents = [];
 
@@ -2920,6 +3074,7 @@ if (!force && renderedTradeCount === 0) {
           multiUrl,
           macro: macroByMode,
           externalContext,
+          anomalyRanking,
           skipped,
           triggered,
           modes,
@@ -3028,6 +3183,7 @@ const summary = debug
             multiUrl,
             macro: macroByMode,
             externalContext,
+            anomalyRanking,
             skipped,
             triggered,
             modes,
