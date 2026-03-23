@@ -2337,6 +2337,29 @@ const anomalyRanking = buildCrossAssetAnomaly({
 const triggered = [];
     const skipped = [];
     const analyticsEvents = [];
+    function getAnomalyEventFields(symbol = "") {
+  const sym = String(symbol || "").toUpperCase();
+  const ranking = Array.isArray(anomalyRanking?.ranking) ? anomalyRanking.ranking : [];
+  const idx = ranking.findIndex((r) => String(r?.symbol || "").toUpperCase() === sym);
+  const row = idx >= 0 ? ranking[idx] : null;
+
+  return {
+    anomaly_tf: anomalyRanking?.ok ? anomalyRanking?.tf ?? "" : "",
+    anomaly_score: row?.score ?? "",
+    anomaly_rank: idx >= 0 ? idx + 1 : "",
+    anomaly_pattern: row?.pattern ?? "",
+    anomaly_price_pct: row?.price_pct ?? "",
+    anomaly_oi_pct: row?.oi_pct ?? "",
+    anomaly_funding_rate: row?.funding_rate ?? "",
+    anomaly_basket_price_pct: row?.basket_price_pct ?? "",
+    anomaly_basket_oi_pct: row?.basket_oi_pct ?? "",
+    anomaly_basket_funding_rate: row?.basket_funding_rate ?? "",
+    anomaly_price_oi_gap: row?.components?.price_oi_gap ?? "",
+    anomaly_funding_deviation_bps: row?.components?.funding_deviation_bps ?? "",
+    anomaly_oi_trend_deviation: row?.components?.oi_trend_deviation ?? "",
+    anomaly_price_deviation: row?.components?.price_deviation ?? "",
+  };
+}
 
     function shouldLogSkippedReason(reason) {
   const r = String(reason || "");
@@ -2347,6 +2370,7 @@ const triggered = [];
     function recordSkipEvent({ symbol, instId = "", mode = "", side = "", entryPrice = "", confidence = "", horizonMin = "", rejectionReason = "", extra = {} }) {
       if (!shouldLogSkippedReason(rejectionReason)) return;
       const evalTiming = buildEvaluationTiming(now, horizonMin);
+      const anomaly = getAnomalyEventFields(symbol);
       analyticsEvents.push({
         alert_id: `${now}_${symbol}_${mode || 'unknown'}_skipped_${String(rejectionReason).replace(/[^a-zA-Z0-9_:-]+/g, '_')}`,
         source: "gateway",
@@ -2382,6 +2406,20 @@ const triggered = [];
         leverage_suggested_high: extra.leverage_suggested_high ?? "",
         min_lev: extra.min_lev ?? "",
         dynamic_risk: extra.dynamic_risk ?? "",
+        anomaly_tf: anomaly.anomaly_tf,
+anomaly_score: anomaly.anomaly_score,
+anomaly_rank: anomaly.anomaly_rank,
+anomaly_pattern: anomaly.anomaly_pattern,
+anomaly_price_pct: anomaly.anomaly_price_pct,
+anomaly_oi_pct: anomaly.anomaly_oi_pct,
+anomaly_funding_rate: anomaly.anomaly_funding_rate,
+anomaly_basket_price_pct: anomaly.anomaly_basket_price_pct,
+anomaly_basket_oi_pct: anomaly.anomaly_basket_oi_pct,
+anomaly_basket_funding_rate: anomaly.anomaly_basket_funding_rate,
+anomaly_price_oi_gap: anomaly.anomaly_price_oi_gap,
+anomaly_funding_deviation_bps: anomaly.anomaly_funding_deviation_bps,
+anomaly_oi_trend_deviation: anomaly.anomaly_oi_trend_deviation,
+anomaly_price_deviation: anomaly.anomaly_price_deviation,
       });
     }
 
@@ -2642,8 +2680,9 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
   bias: externalContext?.bias,
 });
       const horizonMin = horizonMinForMode(modePick);
-      const evalTiming = buildEvaluationTiming(now, horizonMin);
-      analyticsEvents.push({
+const evalTiming = buildEvaluationTiming(now, horizonMin);
+const anomaly = getAnomalyEventFields(pick.symbol);
+analyticsEvents.push({
         alert_id: `${now}_random_${pick.symbol}_${side}`,
         source: "gateway",
         ts: now,
@@ -2673,7 +2712,21 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
         observation_type: "random",
         rejection_reason: "",
         random_group_id: `${now}_random`,
-        random_source: "independent_random"
+        random_source: "independent_random",
+        anomaly_tf: anomaly.anomaly_tf,
+anomaly_score: anomaly.anomaly_score,
+anomaly_rank: anomaly.anomaly_rank,
+anomaly_pattern: anomaly.anomaly_pattern,
+anomaly_price_pct: anomaly.anomaly_price_pct,
+anomaly_oi_pct: anomaly.anomaly_oi_pct,
+anomaly_funding_rate: anomaly.anomaly_funding_rate,
+anomaly_basket_price_pct: anomaly.anomaly_basket_price_pct,
+anomaly_basket_oi_pct: anomaly.anomaly_basket_oi_pct,
+anomaly_basket_funding_rate: anomaly.anomaly_basket_funding_rate,
+anomaly_price_oi_gap: anomaly.anomaly_price_oi_gap,
+anomaly_funding_deviation_bps: anomaly.anomaly_funding_deviation_bps,
+anomaly_oi_trend_deviation: anomaly.anomaly_oi_trend_deviation,
+anomaly_price_deviation: anomaly.anomaly_price_deviation,
       });
     }
   }
@@ -2887,7 +2940,8 @@ lines.push("");
 
 const horizonMin = horizonMinForMode(mode);
 const evalTiming = buildEvaluationTiming(now, horizonMin);
-  analyticsEvents.push({
+const anomaly = getAnomalyEventFields(t.symbol);
+analyticsEvents.push({
   alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
   source: "gateway",
   ts: now,
@@ -2934,10 +2988,24 @@ breakout_only: breakoutOnly,
   abs_return_pct: "",
   result: "",
   gateway_version: deployInfo.sha || "",
-  observation_type: "fired",
+    observation_type: "fired",
   rejection_reason: "",
   random_group_id: "",
-  random_source: ""
+  random_source: "",
+  anomaly_tf: anomaly.anomaly_tf,
+  anomaly_score: anomaly.anomaly_score,
+  anomaly_rank: anomaly.anomaly_rank,
+  anomaly_pattern: anomaly.anomaly_pattern,
+  anomaly_price_pct: anomaly.anomaly_price_pct,
+  anomaly_oi_pct: anomaly.anomaly_oi_pct,
+  anomaly_funding_rate: anomaly.anomaly_funding_rate,
+  anomaly_basket_price_pct: anomaly.anomaly_basket_price_pct,
+  anomaly_basket_oi_pct: anomaly.anomaly_basket_oi_pct,
+  anomaly_basket_funding_rate: anomaly.anomaly_basket_funding_rate,
+  anomaly_price_oi_gap: anomaly.anomaly_price_oi_gap,
+  anomaly_funding_deviation_bps: anomaly.anomaly_funding_deviation_bps,
+  anomaly_oi_trend_deviation: anomaly.anomaly_oi_trend_deviation,
+  anomaly_price_deviation: anomaly.anomaly_price_deviation
 });
 
 // Entry Zone (1h B1 band)
