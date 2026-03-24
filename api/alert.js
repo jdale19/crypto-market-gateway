@@ -519,30 +519,57 @@ async function loadExternalContext() {
     return out;
   }
 
-  try {
-    const [coinText, vixText] = await Promise.all([
-      fetchTextWithTimeout(CFG.extContext.coinUrl, CFG.extContext.timeoutMs),
-      fetchTextWithTimeout(CFG.extContext.vixUrl, CFG.extContext.timeoutMs),
-    ]);
+  const [coinRes, vixRes] = await Promise.allSettled([
+    fetchTextWithTimeout(CFG.extContext.coinUrl, CFG.extContext.timeoutMs).then(parseStooqDayPct),
+    fetchTextWithTimeout(CFG.extContext.vixUrl, CFG.extContext.timeoutMs).then(parseFredDailyPct),
+  ]);
 
-    out.coinDayPct = parseStooqDayPct(coinText);
-    out.vixDayPct = parseFredDailyPct(vixText);
+  if (coinRes.status === "fulfilled" && Number.isFinite(coinRes.value)) {
+    out.coinDayPct = coinRes.value;
+  }
 
-    if (!Number.isFinite(out.coinDayPct) || !Number.isFinite(out.vixDayPct)) {
-      out.reason = "non_finite";
-      return out;
+  if (vixRes.status === "fulfilled" && Number.isFinite(vixRes.value)) {
+    out.vixDayPct = vixRes.value;
+  }
+
+  const reasons = [];
+
+  if (!Number.isFinite(out.coinDayPct)) {
+    if (coinRes.status === "rejected") {
+      reasons.push(
+        coinRes.reason?.name === "AbortError"
+          ? "coin_timeout"
+          : `coin_${coinRes.reason?.message || "fetch_failed"}`
+      );
+    } else {
+      reasons.push("coin_non_finite");
     }
+  }
 
+  if (!Number.isFinite(out.vixDayPct)) {
+    if (vixRes.status === "rejected") {
+      reasons.push(
+        vixRes.reason?.name === "AbortError"
+          ? "vix_timeout"
+          : `vix_${vixRes.reason?.message || "fetch_failed"}`
+      );
+    } else {
+      reasons.push("vix_non_finite");
+    }
+  }
+
+  if (Number.isFinite(out.coinDayPct) && Number.isFinite(out.vixDayPct)) {
     if (out.coinDayPct > 0 && out.vixDayPct < 0) out.bias = "supportive";
     else if (out.coinDayPct < 0 && out.vixDayPct > 0) out.bias = "defensive";
     else out.bias = "neutral";
 
     out.ok = true;
-    return out;
-  } catch (err) {
-    out.reason = err?.name === "AbortError" ? "timeout" : (err?.message || "fetch_failed");
+    out.reason = "ok";
     return out;
   }
+
+  out.reason = reasons.join("|") || "missing";
+  return out;
 }
 function average(nums = []) {
   const vals = (nums || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
@@ -2638,15 +2665,18 @@ if (mode === "build") {
 
           // Confidence context (mechanical inputs)
           ctx: {
-            oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
-            lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
-            lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
-            wickMeta: execWickMeta || null,
-            dps: dps || null,
-            externalBias: String(externalContext?.bias || "neutral").toLowerCase(),
-            externalContextAdj,
-            externalContextOk: !!externalContext?.ok,
-          },
+  oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
+  lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
+  lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
+  wickMeta: execWickMeta || null,
+  dps: dps || null,
+  externalBias: String(externalContext?.bias || "neutral").toLowerCase(),
+  externalContextAdj,
+  externalContextOk: !!externalContext?.ok,
+  externalContextReason: String(externalContext?.reason || ""),
+  coinDayPct: externalContext?.coinDayPct ?? null,
+  vixDayPct: externalContext?.vixDayPct ?? null,
+},
         };
 
         break;
@@ -2710,6 +2740,10 @@ analyticsEvents.push({
         result: "",
         gateway_version: deployInfo.sha || "",
         observation_type: "random",
+  ext_context_ok: !!externalContext?.ok,
+ext_context_reason: externalContext?.reason || "",
+coin_day_pct: externalContext?.coinDayPct ?? "",
+vix_day_pct: externalContext?.vixDayPct ?? "",
         rejection_reason: "",
         random_group_id: `${now}_random`,
         random_source: "independent_random",
@@ -2989,6 +3023,10 @@ breakout_only: breakoutOnly,
   result: "",
   gateway_version: deployInfo.sha || "",
     observation_type: "fired",
+  ext_context_ok: !!t?.ctx?.externalContextOk,
+ext_context_reason: t?.ctx?.externalContextReason || "",
+coin_day_pct: t?.ctx?.coinDayPct ?? "",
+vix_day_pct: t?.ctx?.vixDayPct ?? "",
   rejection_reason: "",
   random_group_id: "",
   random_source: "",
