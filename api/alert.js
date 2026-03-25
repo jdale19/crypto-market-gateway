@@ -2387,68 +2387,74 @@ const triggered = [];
     anomaly_price_deviation: row?.components?.price_deviation ?? "",
   };
 }
+function pushRandomRejectedEvent({
+  item,
+  mode,
+  side,
+  rejectionReason,
+  randomGroupId,
+  randomSource,
+  entryPrice = "",
+}) {
+  const horizonMin = horizonMinForMode(mode);
+  const evalTiming = buildEvaluationTiming(now, horizonMin);
+  const anomaly = getAnomalyEventFields(item?.symbol || "");
 
-    function shouldLogSkippedReason(reason) {
-  const r = String(reason || "");
-  if (!r) return false;
-  return !["cooldown", "warmup_gate_1h"].includes(r);
+  analyticsEvents.push({
+    alert_id: `${now}_random_${item?.symbol || "unknown"}_${side}_${String(rejectionReason || "rejected").replace(/[^a-zA-Z0-9_:-]+/g, "_")}`,
+    source: "gateway",
+    ts: now,
+    due_ts: evalTiming.dueTs,
+    eval_bucket: evalTiming.evalBucket,
+    eval_ts_effective: evalTiming.evalTsEffective,
+    symbol: item?.symbol || "",
+    instId: item?.instId || "",
+    driver_tf,
+    mode: mode || "",
+    side: side || "",
+    entry_price: entryPrice === "" ? "" : asNum(entryPrice),
+    tp_price: "",
+    stop_loss: "",
+    invalidation_price: "",
+    rr: "",
+    confidence: "",
+    ext_context_adj: getExternalContextAdj({
+      mode,
+      side,
+      bias: externalContext?.bias,
+    }),
+    ext_context_bias: externalContext?.bias ?? "neutral",
+    ext_context_ok: !!externalContext?.ok,
+    ext_context_reason: externalContext?.reason || "",
+    coin_day_pct: externalContext?.coinDayPct ?? "",
+    vix_day_pct: externalContext?.vixDayPct ?? "",
+    horizon_min: horizonMin,
+    status: "DONE",
+    exit_price: "",
+    return_pct: "",
+    abs_return_pct: "",
+    result: "SKIPPED",
+    gateway_version: deployInfo.sha || "",
+    observation_type: "random",
+    rejection_reason: rejectionReason || "",
+    random_group_id: randomGroupId || "",
+    random_source: randomSource || "",
+    anomaly_tf: anomaly.anomaly_tf,
+    anomaly_score: anomaly.anomaly_score,
+    anomaly_rank: anomaly.anomaly_rank,
+    anomaly_pattern: anomaly.anomaly_pattern,
+    anomaly_price_pct: anomaly.anomaly_price_pct,
+    anomaly_oi_pct: anomaly.anomaly_oi_pct,
+    anomaly_funding_rate: anomaly.anomaly_funding_rate,
+    anomaly_basket_price_pct: anomaly.anomaly_basket_price_pct,
+    anomaly_basket_oi_pct: anomaly.anomaly_basket_oi_pct,
+    anomaly_basket_funding_rate: anomaly.anomaly_basket_funding_rate,
+    anomaly_price_oi_gap: anomaly.anomaly_price_oi_gap,
+    anomaly_funding_deviation_bps: anomaly.anomaly_funding_deviation_bps,
+    anomaly_oi_trend_deviation: anomaly.anomaly_oi_trend_deviation,
+    anomaly_price_deviation: anomaly.anomaly_price_deviation,
+  });
 }
-
-    function recordSkipEvent({ symbol, instId = "", mode = "", side = "", entryPrice = "", confidence = "", horizonMin = "", rejectionReason = "", extra = {} }) {
-      if (!shouldLogSkippedReason(rejectionReason)) return;
-      const evalTiming = buildEvaluationTiming(now, horizonMin);
-      const anomaly = getAnomalyEventFields(symbol);
-      analyticsEvents.push({
-        alert_id: `${now}_${symbol}_${mode || 'unknown'}_skipped_${String(rejectionReason).replace(/[^a-zA-Z0-9_:-]+/g, '_')}`,
-        source: "gateway",
-        ts: now,
-        due_ts: evalTiming.dueTs,
-        eval_bucket: evalTiming.evalBucket,
-        eval_ts_effective: evalTiming.evalTsEffective,
-        symbol: symbol || "",
-        instId: instId || "",
-        driver_tf,
-        mode: mode || "",
-        side: side || "",
-        entry_price: entryPrice === "" ? "" : entryPrice,
-        tp_price: extra.tp_price ?? "",
-        stop_loss: extra.stop_loss ?? "",
-        invalidation_price: extra.invalidation_price ?? "",
-        rr: extra.rr ?? "",
-        confidence: confidence || "",
-        horizon_min: horizonMin || "",
-        status: "PENDING",
-        exit_price: "",
-        return_pct: "",
-        abs_return_pct: "",
-        result: "",
-        gateway_version: deployInfo.sha || "",
-        observation_type: "skipped",
-        rejection_reason: rejectionReason,
-        random_group_id: "",
-        random_source: "",
-        risk_budget_pct: extra.risk_budget_pct ?? "",
-        risk_budget_base_pct: extra.risk_budget_base_pct ?? "",
-        leverage_suggested_low: extra.leverage_suggested_low ?? "",
-        leverage_suggested_high: extra.leverage_suggested_high ?? "",
-        min_lev: extra.min_lev ?? "",
-        dynamic_risk: extra.dynamic_risk ?? "",
-        anomaly_tf: anomaly.anomaly_tf,
-anomaly_score: anomaly.anomaly_score,
-anomaly_rank: anomaly.anomaly_rank,
-anomaly_pattern: anomaly.anomaly_pattern,
-anomaly_price_pct: anomaly.anomaly_price_pct,
-anomaly_oi_pct: anomaly.anomaly_oi_pct,
-anomaly_funding_rate: anomaly.anomaly_funding_rate,
-anomaly_basket_price_pct: anomaly.anomaly_basket_price_pct,
-anomaly_basket_oi_pct: anomaly.anomaly_basket_oi_pct,
-anomaly_basket_funding_rate: anomaly.anomaly_basket_funding_rate,
-anomaly_price_oi_gap: anomaly.anomaly_price_oi_gap,
-anomaly_funding_deviation_bps: anomaly.anomaly_funding_deviation_bps,
-anomaly_oi_trend_deviation: anomaly.anomaly_oi_trend_deviation,
-anomaly_price_deviation: anomaly.anomaly_price_deviation,
-      });
-    }
 
     // Debug-only: show build regime per symbol (so you can confirm gate inputs)
 const debug_build_regimes =
@@ -2463,236 +2469,261 @@ const debug_build_regimes =
       }))
     : undefined;
 
-    for (const item of j.results || []) {
-      if (!item?.ok) {
-  const detail = String(item?.error || "item_not_ok");
-  if (debug) skipped.push({ symbol: item?.symbol || "?", reason: detail });
-  recordSkipEvent({
-    symbol: item?.symbol || "",
-    instId: item?.instId || "",
-    rejectionReason: detail,
-  });
-  continue;
-}
+    async function evaluateCandidate({
+  item,
+  modeList = modes,
+  forcedBias = null,
+  observationType = "fired",
+  randomGroupId = "",
+  randomSource = "",
+  analyticsOnly = false,
+}) {
+  const instId = String(item?.instId || "");
+  const symbol = String(item?.symbol || "?");
 
-      const instId = String(item.instId || "");
-      const symbol = String(item.symbol || "?");
+  const levels = await computeLevelsFromSeries(instId);
 
+  if (!force && levels?.["1h"]?.warmup) {
+    if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
+    return {
+      winner: null,
+      rejectionReason: "warmup_gate_1h",
+      rejectionMode: "",
+      rejectionBias: forcedBias || "",
+    };
+  }
 
+  let winner = null;
+  let lastReject = {
+    reason: "",
+    mode: "",
+    bias: forcedBias || "",
+    detail: null,
+  };
 
-      const levels = await computeLevelsFromSeries(instId);
+  for (const mode of modeList) {
+    const lastSentRaw = await redis.get(CFG.keys.lastSentAt(instId, mode));
+    const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
 
-      if (!force && levels?.["1h"]?.warmup) {
-        if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
+    if (!force && lastSent && now - lastSent < CFG.cooldownMinutes * 60 * 1000) {
+      if (debug) skipped.push({ symbol, mode, reason: "cooldown" });
+      lastReject = { reason: "cooldown", mode, bias: forcedBias || "", detail: null };
+      continue;
+    }
+
+    const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
+    const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
+
+    const { triggers, curState } = evaluateCriteria(item, lastState, mode);
+
+    const baseBias = biasFromItem(item, mode);
+    let dps = null;
+    let bias = forcedBias || baseBias;
+
+    if (!forcedBias && (mode === "swing" || mode === "build") && baseBias === "neutral" && CFG.dps?.enabled) {
+      const recentPtsForDps = await getRecentSeriesPoints(
+        instId,
+        Math.max(2, CFG.wick.sweepLookbackPoints)
+      );
+      const lastPtForDps = recentPtsForDps.length
+        ? recentPtsForDps[recentPtsForDps.length - 1]
+        : null;
+
+      dps = computeDps({
+        levels,
+        price: item.price,
+        lastPoint: lastPtForDps,
+      });
+
+      if (dps?.bias && dps.bias !== "neutral") bias = dps.bias;
+    }
+
+    const { minRangePct } = getModeCfg(mode);
+    const rPct = rangePct1h({ levels, price: item.price });
+
+    if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
+      if (!Number.isFinite(rPct) || rPct < minRangePct) {
+        if (debug) skipped.push({
+          symbol,
+          mode,
+          reason: "range_floor",
+          detail: { rangePct1h: rPct, minRangePct },
+        });
+        lastReject = { reason: "range_floor", mode, bias, detail: { rangePct1h: rPct, minRangePct } };
         continue;
       }
+    }
 
-      // Evaluate modes in priority order; first mode that passes wins.
-      let winner = null;
+    const macroMode = computeBtcMacro(j.results || [], mode);
 
-      for (const mode of modes) {
-        const lastSentRaw = await redis.get(CFG.keys.lastSentAt(instId, mode));
-const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
-
-if (!force && Number.isFinite(lastSent) && now - lastSent < cooldownMs) {
-  if (debug) skipped.push({ symbol, mode, reason: "cooldown" });
-  continue;
-}
-        const lastStateModeRaw = await redis.get(CFG.keys.lastState(mode, instId));
-        const lastState = lastStateModeRaw ? String(lastStateModeRaw) : null;
-
-        const { triggers, curState } = evaluateCriteria(item, lastState, mode);
-
-        const baseBias = biasFromItem(item, mode);
-        let dps = null;
-        let bias = baseBias;
-
-        if ((mode === "swing" || mode === "build") && baseBias === "neutral" && CFG.dps?.enabled) {
-          const recentPtsForDps = await getRecentSeriesPoints(
-            instId,
-            Math.max(2, CFG.wick.sweepLookbackPoints)
-          );
-          const lastPtForDps = recentPtsForDps.length
-            ? recentPtsForDps[recentPtsForDps.length - 1]
-            : null;
-
-          dps = computeDps({
-            levels,
-            price: item.price,
-            lastPoint: lastPtForDps,
-          });
-
-          if (dps?.bias && dps.bias !== "neutral") bias = dps.bias;
-        }
-        
-        const { minRangePct } = getModeCfg(mode);
-const rPct = rangePct1h({ levels, price: item.price });
-
-if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
-  if (!Number.isFinite(rPct) || rPct < minRangePct) {
-    if (debug)
-      skipped.push({
+    if (
+      !force &&
+      CFG.macro.enabled &&
+      CFG.macro.blockShortsOnAltsWhenBtcBull &&
+      macroMode?.ok &&
+      macroMode?.btcBullExpansion &&
+      symbol.toUpperCase() !== CFG.macro.btcSymbol &&
+      bias === "short"
+    ) {
+      if (debug) skipped.push({
         symbol,
         mode,
-        reason: "range_floor",
-        detail: { rangePct1h: rPct, minRangePct },
+        reason: "macro_block_btc_bull_expansion",
+        btc: macroMode?.btc || null,
+        tf: macroMode?.tf || null,
       });
-    continue;
-  }
-}
-        
-        const macroMode = computeBtcMacro(j.results || [], mode);
-        
-        // Macro block
-        if (
-          !force &&
-          CFG.macro.enabled &&
-          CFG.macro.blockShortsOnAltsWhenBtcBull &&
-          macroMode?.ok &&
-          macroMode?.btcBullExpansion &&
-          symbol.toUpperCase() !== CFG.macro.btcSymbol &&
-          bias === "short"
-        ) {
-          if (debug)
-            skipped.push({
-              symbol,
-              mode,
-              reason: "macro_block_btc_bull_expansion",
-              btc: macroMode?.btc || null,
-              tf: macroMode?.tf || null,
-            });
+      lastReject = { reason: "macro_block_btc_bull_expansion", mode, bias, detail: null };
+      continue;
+    }
+
+    const waterfallMode = computeBtcWaterfall(j.results || [], mode);
+
+    if (
+      !force &&
+      waterfallMode?.ok &&
+      waterfallMode?.btcWaterfall &&
+      bias === "long"
+    ) {
+      if (debug) skipped.push({
+        symbol,
+        mode,
+        reason: "btc_waterfall_override",
+        btc: waterfallMode?.btc || null,
+        tf: waterfallMode?.tf || null,
+      });
+      lastReject = { reason: "btc_waterfall_override", mode, bias, detail: null };
+      continue;
+    }
+
+    const b1 = strongRecoB1({ bias, levels, price: item.price });
+
+    let entryLine = null;
+    let execReason = null;
+    let execWickMeta = null;
+
+    if (!force) {
+      if (mode === "scalp") {
+        if (!b1.strong) {
+          if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
+          lastReject = { reason: `weak_reco:${b1.reason}`, mode, bias, detail: null };
           continue;
         }
 
-        const waterfallMode = computeBtcWaterfall(j.results || [], mode);
+        const g = await scalpExecutionGate({ instId, item, bias, levels });
+        if (!g.ok) {
+          if (debug) skipped.push({
+            symbol,
+            mode,
+            reason: `scalp_exec:${g.reason}`,
+            bias,
+            oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
+          });
+          lastReject = { reason: `scalp_exec:${g.reason}`, mode, bias, detail: g.detail || null };
+          continue;
+        }
 
-if (
-  !force &&
-  waterfallMode?.ok &&
-  waterfallMode?.btcWaterfall &&
-  bias === "long"
-) {
-  if (debug) {
-    skipped.push({
-      symbol,
-      mode,
-      reason: "btc_waterfall_override",
-      btc: waterfallMode?.btc || null,
-      tf: waterfallMode?.tf || null,
-    });
-  }
-  continue;
-}
-
-        const b1 = strongRecoB1({ bias, levels, price: item.price });
-
-        let entryLine = null;
-        let execReason = null;
-        let execWickMeta = null;
-
-        if (!force) {
-          if (mode === "scalp") {
-            if (!b1.strong) {
-              if (debug) skipped.push({ symbol, mode, reason: `weak_reco:${b1.reason}` });
-              continue;
-            }
-
-            const g = await scalpExecutionGate({ instId, item, bias, levels });
-            if (!g.ok) {
-              if (debug)
-                skipped.push({
-                  symbol,
-                  mode,
-                  reason: `scalp_exec:${g.reason}`,
-                  bias,
-                  oi15: item?.deltas?.["15m"]?.oi_change_pct ?? null,
-                });
-              continue;
-            }
-
-            entryLine = g.entryLine || null;
-            execReason = g.reason || null;
-            execWickMeta = g.wickMeta || null;
-          } else {
-            // --- Build Regime Gate (soft) ---
-if (mode === "build") {
-  const br = item?.build_regime;
-  if (br?.regime === "avoid") {
-    if (debug) skipped.push({ symbol, mode, reason: "build_regime_avoid", detail: br });
-    continue;
-  }
-}
-            const modeLabel = mode === "build" ? "BUILD" : "SWING";
-            const g = await swingExecutionGate({ instId, bias, levels, item, modeLabel, dps });
-
-            if (!g.ok) {
-              if (debug)
-                skipped.push({
-                  symbol,
-                  mode,
-                  reason: `${mode}_exec:${g.reason}`,
-                  bias,
-                  detail: g.detail || null,
-                });
-              continue;
-            }
-
-            entryLine = g.entryLine || null;
-            execReason = g.reason || null;
+        entryLine = g.entryLine || null;
+        execReason = g.reason || null;
+        execWickMeta = g.wickMeta || null;
+      } else {
+        if (mode === "build") {
+          const br = item?.build_regime;
+          if (br?.regime === "avoid") {
+            if (debug) skipped.push({ symbol, mode, reason: "build_regime_avoid", detail: br });
+            lastReject = { reason: "build_regime_avoid", mode, bias, detail: br };
+            continue;
           }
         }
 
-        const externalContextAdj = getExternalContextAdj({
-          mode,
-          side: bias,
-          bias: externalContext?.bias,
-        });
+        const modeLabel = mode === "build" ? "BUILD" : "SWING";
+        const g = await swingExecutionGate({ instId, bias, levels, item, modeLabel, dps });
 
-        winner = {
-          mode,
-          instId,
-          _rawItem: item,
-          symbol,
-          price: item.price,
-          bias,
-          baseBias,
-          triggers,
-          levels,
-          b1,
-          entryLine,
-          execReason,
-          curState,
+        if (!g.ok) {
+          if (debug) skipped.push({
+            symbol,
+            mode,
+            reason: `${mode}_exec:${g.reason}`,
+            bias,
+            detail: g.detail || null,
+          });
+          lastReject = { reason: `${mode}_exec:${g.reason}`, mode, bias, detail: g.detail || null };
+          continue;
+        }
 
-          // Confidence context (mechanical inputs)
-          ctx: {
-  oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
-  lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
-  lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
-  wickMeta: execWickMeta || null,
-  dps: dps || null,
-  externalBias: String(externalContext?.bias || "neutral").toLowerCase(),
-  externalContextAdj,
-  externalContextOk: !!externalContext?.ok,
-  externalContextReason: String(externalContext?.reason || ""),
-  coinDayPct: externalContext?.coinDayPct ?? null,
-  vixDayPct: externalContext?.vixDayPct ?? null,
-},
-        };
-
-        break;
+        entryLine = g.entryLine || null;
+        execReason = g.reason || null;
       }
-
-      if (!winner) continue;
-
-triggered.push(winner);
     }
 
+    const externalContextAdj = getExternalContextAdj({
+      mode,
+      side: bias,
+      bias: externalContext?.bias,
+    });
+
+    winner = {
+      mode,
+      instId,
+      _rawItem: item,
+      symbol,
+      price: item.price,
+      bias,
+      baseBias,
+      triggers,
+      levels,
+      b1,
+      entryLine,
+      execReason,
+      curState,
+      observationType,
+      randomGroupId,
+      randomSource,
+      analyticsOnly,
+      ctx: {
+        oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
+        lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
+        lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
+        wickMeta: execWickMeta || null,
+        dps: dps || null,
+        externalBias: String(externalContext?.bias || "neutral").toLowerCase(),
+        externalContextAdj,
+        externalContextOk: !!externalContext?.ok,
+        externalContextReason: String(externalContext?.reason || ""),
+        coinDayPct: externalContext?.coinDayPct ?? null,
+        vixDayPct: externalContext?.vixDayPct ?? null,
+      },
+    };
+
+    break;
+  }
+
+  return {
+    winner,
+    rejectionReason: winner ? "" : lastReject.reason,
+    rejectionMode: winner ? "" : lastReject.mode,
+    rejectionBias: winner ? "" : lastReject.bias,
+    rejectionDetail: winner ? null : lastReject.detail,
+  };
+}
+    for (const item of j.results || []) {
+  if (!item?.ok) {
+    const detail = String(item?.error || "item_not_ok");
+    if (debug) skipped.push({ symbol: item?.symbol || "?", reason: detail });
+    continue;
+  }
+
+  const evaluated = await evaluateCandidate({ item });
+  if (evaluated.winner) triggered.push(evaluated.winner);
+}
+
+     
 // ---- Render DM ----
 
 const lines = [];
 lines.push(`⚡️TRADE ENTRY`);
 lines.push("");
-// Independent random baseline observation
+const randomGroupId = `${now}_random`;
+
 if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 0) {
   const roll = Math.floor(Math.random() * 100) + 1;
 
@@ -2701,67 +2732,32 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
 
     if (eligible.length > 0) {
       const pick = eligible[Math.floor(Math.random() * eligible.length)];
-
       const side = Math.random() < 0.5 ? "long" : "short";
       const modePick = modes[Math.floor(Math.random() * modes.length)];
-      const randomExtAdj = getExternalContextAdj({
-  mode: modePick,
-  side,
-  bias: externalContext?.bias,
-});
-      const horizonMin = horizonMinForMode(modePick);
-const evalTiming = buildEvaluationTiming(now, horizonMin);
-const anomaly = getAnomalyEventFields(pick.symbol);
-analyticsEvents.push({
-        alert_id: `${now}_random_${pick.symbol}_${side}`,
-        source: "gateway",
-        ts: now,
-        due_ts: evalTiming.dueTs,
-        eval_bucket: evalTiming.evalBucket,
-        eval_ts_effective: evalTiming.evalTsEffective,
-        symbol: pick.symbol,
-        instId: pick.instId,
-        driver_tf,
-        mode: modePick,
-        side,
-        entry_price: asNum(pick.price),
-        tp_price: "",
-        stop_loss: "",
-        invalidation_price: "",
-        rr: "",
-        confidence: "",
-        ext_context_adj: randomExtAdj,
-        ext_context_bias: externalContext?.bias ?? "neutral",
-        horizon_min: horizonMin,
-        status: "PENDING",
-        exit_price: "",
-        return_pct: "",
-        abs_return_pct: "",
-        result: "",
-        gateway_version: deployInfo.sha || "",
-        observation_type: "random",
-  ext_context_ok: !!externalContext?.ok,
-ext_context_reason: externalContext?.reason || "",
-coin_day_pct: externalContext?.coinDayPct ?? "",
-vix_day_pct: externalContext?.vixDayPct ?? "",
-        rejection_reason: "",
-        random_group_id: `${now}_random`,
-        random_source: "independent_random",
-        anomaly_tf: anomaly.anomaly_tf,
-anomaly_score: anomaly.anomaly_score,
-anomaly_rank: anomaly.anomaly_rank,
-anomaly_pattern: anomaly.anomaly_pattern,
-anomaly_price_pct: anomaly.anomaly_price_pct,
-anomaly_oi_pct: anomaly.anomaly_oi_pct,
-anomaly_funding_rate: anomaly.anomaly_funding_rate,
-anomaly_basket_price_pct: anomaly.anomaly_basket_price_pct,
-anomaly_basket_oi_pct: anomaly.anomaly_basket_oi_pct,
-anomaly_basket_funding_rate: anomaly.anomaly_basket_funding_rate,
-anomaly_price_oi_gap: anomaly.anomaly_price_oi_gap,
-anomaly_funding_deviation_bps: anomaly.anomaly_funding_deviation_bps,
-anomaly_oi_trend_deviation: anomaly.anomaly_oi_trend_deviation,
-anomaly_price_deviation: anomaly.anomaly_price_deviation,
+
+      const randomEval = await evaluateCandidate({
+        item: pick,
+        modeList: [modePick],
+        forcedBias: side,
+        observationType: "random",
+        randomGroupId,
+        randomSource: "independent_random",
+        analyticsOnly: true,
       });
+
+      if (randomEval.winner) {
+        triggered.push(randomEval.winner);
+      } else {
+        pushRandomRejectedEvent({
+          item: pick,
+          mode: modePick,
+          side,
+          rejectionReason: randomEval.rejectionReason || "random_candidate_rejected",
+          randomGroupId,
+          randomSource: "independent_random",
+          entryPrice: pick.price,
+        });
+      }
     }
   }
 }
@@ -2769,6 +2765,10 @@ anomaly_price_deviation: anomaly.anomaly_price_deviation,
 for (const t of triggered) {
   const mode = String(t.mode || "swing").toLowerCase();
   const modeUp = mode.toUpperCase();
+  const observationType = t.observationType || "fired";
+  const isRandom = observationType === "random";
+  const randomGroupIdForEvent = t.randomGroupId || "";
+  const randomSourceForEvent = t.randomSource || "";
 
   // ENTRY ZONE stays 1h B1 band (per your current spec)
   const levels = t.levels;
@@ -2864,6 +2864,17 @@ if (!force) {
         minLev,
       },
     });
+        if (isRandom) {
+      pushRandomRejectedEvent({
+        item: t._rawItem,
+        mode,
+        side: bias,
+        rejectionReason: "leverage_floor",
+        randomGroupId: randomGroupIdForEvent,
+        randomSource: randomSourceForEvent,
+        entryPrice: price,
+      });
+    }
     continue;
   }
 }
@@ -2889,6 +2900,17 @@ const tpPick = chooseDynamicTp({
 
 if (!tpPick) {
   skipped.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
+  if (isRandom) {
+    pushRandomRejectedEvent({
+      item: t._rawItem,
+      mode,
+      side: bias,
+      rejectionReason: "no_dynamic_tp",
+      randomGroupId: randomGroupIdForEvent,
+      randomSource: randomSourceForEvent,
+      entryPrice: price,
+    });
+  }
   continue;
 }
 
@@ -2911,6 +2933,17 @@ if (mode === "build" && tpPct < CFG.minTpPctByMode.build) {
       },
     });
   }
+    if (isRandom) {
+    pushRandomRejectedEvent({
+      item: t._rawItem,
+      mode,
+      side: bias,
+      rejectionReason: "build_tp_too_small",
+      randomGroupId: randomGroupIdForEvent,
+      randomSource: randomSourceForEvent,
+      entryPrice: price,
+    });
+  }
   continue;
 }
 const buildTargets = mode === "build"
@@ -2927,22 +2960,33 @@ const rrInfo = computeRiskReward({
 });
 
 if (!rrInfo || rrInfo.rr < CFG.minRR) {
- {
-    skipped.push({
-      symbol: t.symbol,
+  skipped.push({
+    symbol: t.symbol,
+    mode,
+    reason: "rr_too_small",
+    detail: {
+      rr: rrInfo?.rr ?? null,
+      minRR: CFG.minRR,
+      rewardPct: rrInfo?.rewardPct ?? null,
+      riskPct: rrInfo?.riskPct ?? null,
+      entryPrice: price,
+      stopLossPx,
+      tp,
+    }
+  });
+
+  if (isRandom) {
+    pushRandomRejectedEvent({
+      item: t._rawItem,
       mode,
-      reason: "rr_too_small",
-      detail: {
-        rr: rrInfo?.rr ?? null,
-        minRR: CFG.minRR,
-        rewardPct: rrInfo?.rewardPct ?? null,
-        riskPct: rrInfo?.riskPct ?? null,
-        entryPrice: price,
-        stopLossPx,
-        tp,
-      }
+      side: bias,
+      rejectionReason: "rr_too_small",
+      randomGroupId: randomGroupIdForEvent,
+      randomSource: randomSourceForEvent,
+      entryPrice: price,
     });
   }
+
   continue;
 }
       console.log("DYNAMIC_RISK", JSON.stringify({
@@ -2959,24 +3003,28 @@ if (!rrInfo || rrInfo.rr < CFG.minRR) {
       baseRiskBudgetPct: lev.baseRiskBudgetPct,
     } : null,
   }));
-lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-lines.push(`Confidence = ${confidence}`);
-if (CFG.extContext.enabled) {
-  lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
+if (!isRandom) {
+  lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
+  lines.push(`Confidence = ${confidence}`);
+  if (CFG.extContext.enabled) {
+    lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
+  }
+  lines.push(
+    `Risk = ${lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct}% ` +
+    `(base ${lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct}%, ` +
+    `mult x${dynamicRisk?.multiplier ?? 1}, score ${dynamicRisk?.score ?? 0})`
+  );
+  lines.push(`Risk drivers = ${(dynamicRisk?.reasons || []).join(", ") || "none"}`);
+  lines.push("");
 }
-lines.push(
-  `Risk = ${lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct}% ` +
-  `(base ${lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct}%, ` +
-  `mult x${dynamicRisk?.multiplier ?? 1}, score ${dynamicRisk?.score ?? 0})`
-);
-lines.push(`Risk drivers = ${(dynamicRisk?.reasons || []).join(", ") || "none"}`);
-lines.push("");
 
 const horizonMin = horizonMinForMode(mode);
 const evalTiming = buildEvaluationTiming(now, horizonMin);
 const anomaly = getAnomalyEventFields(t.symbol);
 analyticsEvents.push({
-  alert_id: `${now}_${t.symbol}_${mode}_${bias}`,
+  alert_id: isRandom
+  ? `${now}_random_${t.symbol}_${mode}_${bias}`
+  : `${now}_${t.symbol}_${mode}_${bias}`,
   source: "gateway",
   ts: now,
   due_ts: evalTiming.dueTs,
@@ -3022,14 +3070,14 @@ breakout_only: breakoutOnly,
   abs_return_pct: "",
   result: "",
   gateway_version: deployInfo.sha || "",
-    observation_type: "fired",
+    observation_type: observationType,
   ext_context_ok: !!t?.ctx?.externalContextOk,
 ext_context_reason: t?.ctx?.externalContextReason || "",
 coin_day_pct: t?.ctx?.coinDayPct ?? "",
 vix_day_pct: t?.ctx?.vixDayPct ?? "",
   rejection_reason: "",
-  random_group_id: "",
-  random_source: "",
+  random_group_id: isRandom ? randomGroupIdForEvent : "",
+  random_source: isRandom ? randomSourceForEvent : "",
   anomaly_tf: anomaly.anomaly_tf,
   anomaly_score: anomaly.anomaly_score,
   anomaly_rank: anomaly.anomaly_rank,
@@ -3046,76 +3094,54 @@ vix_day_pct: t?.ctx?.vixDayPct ?? "",
   anomaly_price_deviation: anomaly.anomaly_price_deviation
 });
 
-// Entry Zone (1h B1 band)
-if (hi1h != null && lo1h != null) {
-  const range1h = hi1h - lo1h;
-  const edge1h = CFG.strongEdgePct1h * range1h;
+if (!isRandom) {
+  // Entry Zone (1h B1 band)
+  if (hi1h != null && lo1h != null) {
+    const range1h = hi1h - lo1h;
+    const edge1h = CFG.strongEdgePct1h * range1h;
 
-  if (bias === "long") lines.push(`Entry Zone: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
-  else if (bias === "short") lines.push(`Entry Zone: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
-}
-
-// Invalidation (mode-aware TF)
-if (invalidationPx != null) lines.push(`Invalidation (${invTf}): ${fmtPrice(invalidationPx)}`);
-else lines.push("Invalidation:");
-
-// Avoid chasing (unchanged)
-if (price != null) {
-  const chaseBuffer = price * 0.0025;
-  if (bias === "long") lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
-  else if (bias === "short") lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
-}
-
-// Leverage (from stop distance)
-if (lev) {
-  lines.push(`Leverage: ${lev.suggestedLow}–${lev.suggestedHigh}x (max ${lev.adjustedMax}x)`);
-}
-
-lines.push("");
-
-// Stop Loss (separate from invalidation now)
-if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
-else lines.push("Stop Loss:");
-
-// MESSAGE
-if (mode === "build" && buildTargets.length) {
-  lines.push(`Targets (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
-  for (const target of buildTargets) {
-    lines.push(`• ${target.label}: ${fmtPrice(target.tp)} (≈ ${target.tpPct.toFixed(2)}%)`);
+    if (bias === "long") lines.push(`Entry Zone: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
+    else if (bias === "short") lines.push(`Entry Zone: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
   }
-} else {
-  lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
-  lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
-}
-  
+
+  // Invalidation (mode-aware TF)
+  if (invalidationPx != null) lines.push(`Invalidation (${invTf}): ${fmtPrice(invalidationPx)}`);
+  else lines.push("Invalidation:");
+
+  // Avoid chasing (unchanged)
+  if (price != null) {
+    const chaseBuffer = price * 0.0025;
+    if (bias === "long") lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
+    else if (bias === "short") lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
+  }
+
+  // Leverage (from stop distance)
+  if (lev) {
+    lines.push(`Leverage: ${lev.suggestedLow}–${lev.suggestedHigh}x (max ${lev.adjustedMax}x)`);
+  }
+
   lines.push("");
+
+  // Stop Loss (separate from invalidation now)
+  if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
+  else lines.push("Stop Loss:");
+
+  // MESSAGE
+  if (mode === "build" && buildTargets.length) {
+    lines.push(`Targets (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
+    for (const target of buildTargets) {
+      lines.push(`• ${target.label}: ${fmtPrice(target.tp)} (≈ ${target.tpPct.toFixed(2)}%)`);
+    }
+  } else {
+    lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
+    lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
+  }
+
+    lines.push("");
+}
 }
 
 const message = lines.join("\n");
-
-for (const s of skipped) {
-  const reason = String(s?.reason || "");
-  if (!shouldLogSkippedReason(reason)) continue;
-  const mode = s?.mode || "";
-    recordSkipEvent({
-    symbol: s?.symbol || "",
-    instId: "",
-    mode,
-    side: s?.bias || "",
-    entryPrice: "",
-    confidence: "",
-    horizonMin: mode ? horizonMinForMode(mode) : "",
-    rejectionReason: reason,
-    extra: {
-      risk_budget_pct: s?.detail?.riskBudgetPct ?? "",
-      risk_budget_base_pct: s?.detail?.baseRiskBudgetPct ?? "",
-      leverage_suggested_low: s?.detail?.suggestedLow ?? "",
-      leverage_suggested_high: s?.detail?.suggestedHigh ?? "",
-      min_lev: s?.detail?.minLev ?? "",
-      dynamic_risk: s?.detail?.dynamicRisk ? JSON.stringify(s.detail.dynamicRisk) : "",
-    },
-  });
-}
 
 const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
