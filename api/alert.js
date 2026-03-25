@@ -2755,6 +2755,7 @@ for (const t of triggered) {
   const isRandom = observationType === "random";
   let rejectionReason = String(t.rejectionReason || "");
   let isRejected = !!rejectionReason;
+  const lateRejectionReasons = [];
   const randomGroupIdForEvent = t.randomGroupId || "";
   const randomSourceForEvent = t.randomSource || "";
 
@@ -2837,7 +2838,7 @@ const minLev = Number(process.env.ALERT_MIN_LEVERAGE || 0);
 if (!force) {
   const effectiveLev = Number(lev?.suggestedHigh || 0);
 
-  if (effectiveLev < minLev) {
+ if (effectiveLev < minLev) {
     skipped.push({
       symbol: t.symbol,
       mode,
@@ -2852,14 +2853,15 @@ if (!force) {
         minLev,
       },
     });
-            if (!isRejected) {
-  if (isRandom) {
-    rejectionReason = "leverage_floor";
-    isRejected = true;
-  } else {
-    continue;
-  }
-}
+    lateRejectionReasons.push("leverage_floor");
+    if (!isRejected) {
+      if (isRandom) {
+        rejectionReason = "leverage_floor";
+        isRejected = true;
+      } else {
+        continue;
+      }
+    }
   }
 }
 
@@ -2884,14 +2886,15 @@ const tpPick = chooseDynamicTp({
 
 if (!tpPick) {
   skipped.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
+  lateRejectionReasons.push("no_dynamic_tp");
   if (!isRejected) {
-  if (isRandom) {
-    rejectionReason = "no_dynamic_tp";
-    isRejected = true;
-  } else {
-    continue;
+    if (isRandom) {
+      rejectionReason = "no_dynamic_tp";
+      isRejected = true;
+    } else {
+      continue;
+    }
   }
-}
 }
 
 const tp = tpPick?.tp ?? null;
@@ -2912,14 +2915,15 @@ if (mode === "build" && tpPct < CFG.minTpPctByMode.build) {
     },
   });
 
+  lateRejectionReasons.push("build_tp_too_small");
   if (!isRejected) {
-  if (isRandom) {
-    rejectionReason = "build_tp_too_small";
-    isRejected = true;
-  } else {
-    continue;
+    if (isRandom) {
+      rejectionReason = "build_tp_too_small";
+      isRejected = true;
+    } else {
+      continue;
+    }
   }
-}
 }
 const buildTargets = mode === "build"
   ? buildTpLadder({ bias, entryPrice: price, tp1: tp })
@@ -2950,14 +2954,15 @@ if (!rrInfo || rrInfo.rr < CFG.minRR) {
     }
   });
 
+  lateRejectionReasons.push("rr_too_small");
   if (!isRejected) {
-  if (isRandom) {
-    rejectionReason = "rr_too_small";
-    isRejected = true;
-  } else {
-    continue;
+    if (isRandom) {
+      rejectionReason = "rr_too_small";
+      isRejected = true;
+    } else {
+      continue;
+    }
   }
-}
 }
       console.log("DYNAMIC_RISK", JSON.stringify({
     symbol: t.symbol,
@@ -2991,6 +2996,10 @@ if (!isRandom) {
 const horizonMin = horizonMinForMode(mode);
 const evalTiming = buildEvaluationTiming(now, horizonMin);
 const anomaly = getAnomalyEventFields(t.symbol);
+const finalRejectionReason = [
+  rejectionReason,
+  ...lateRejectionReasons.filter((x) => x && x !== rejectionReason),
+].filter(Boolean).join("|");
 analyticsEvents.push({
   alert_id: isRandom
   ? `${now}_random_${t.symbol}_${mode}_${bias}`
@@ -3034,18 +3043,18 @@ breakout_only: breakoutOnly,
   risk_budget_score: dynamicRisk?.score ?? "",
   risk_budget_reasons: (dynamicRisk?.reasons || []).join(","),
   horizon_min: horizonMin,
- status: isRejected ? "DONE" : "PENDING",
+ status: finalRejectionReason ? "DONE" : "PENDING",
 exit_price: "",
 return_pct: "",
 abs_return_pct: "",
-result: isRejected ? "SKIPPED" : "",
+result: finalRejectionReason ? "SKIPPED" : "",
 gateway_version: deployInfo.sha || "",
 observation_type: observationType,
   ext_context_ok: !!t?.ctx?.externalContextOk,
 ext_context_reason: t?.ctx?.externalContextReason || "",
 coin_day_pct: t?.ctx?.coinDayPct ?? "",
 vix_day_pct: t?.ctx?.vixDayPct ?? "",
-  rejection_reason: rejectionReason,
+  rejection_reason: finalRejectionReason,
 random_group_id: isRandom ? randomGroupIdForEvent : "",
 random_source: isRandom ? randomSourceForEvent : "",
   anomaly_tf: anomaly.anomaly_tf,
