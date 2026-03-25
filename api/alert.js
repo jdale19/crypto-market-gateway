@@ -2900,7 +2900,7 @@ if (!tpPick) {
 const tp = tpPick?.tp ?? null;
 const tpTf = tpPick?.tf || "";
 const tpPct = tpPick?.tpPct ?? null;
-if (mode === "build" && tpPct < CFG.minTpPctByMode.build) {
+if (mode === "build" && Number.isFinite(tpPct) && tpPct < CFG.minTpPctByMode.build) {
   skipped.push({
     symbol: t.symbol,
     mode,
@@ -2938,7 +2938,7 @@ const rrInfo = computeRiskReward({
   tp: rrAnchorTp,
 });
 
-if (!rrInfo || rrInfo.rr < CFG.minRR) {
+if (tpPick && (!rrInfo || rrInfo.rr < CFG.minRR)) {
   skipped.push({
     symbol: t.symbol,
     mode,
