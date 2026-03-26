@@ -47,6 +47,25 @@ function getDeployInfo() {
 async function postAnalyticsBatch(events, meta = {}) {
   if (!process.env.ANALYTICS_WEBHOOK_URL || !Array.isArray(events) || events.length === 0) return;
 
+  const minPostMinutes = Number(process.env.ANALYTICS_MIN_POST_INTERVAL_MINUTES || 0);
+  const throttleKey = String(
+    process.env.ANALYTICS_POST_THROTTLE_KEY || "alert:analytics:lastPostAt"
+  );
+
+  if (Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
+    try {
+      const lastPostRaw = await redis.get(throttleKey);
+      const lastPostAt = lastPostRaw == null ? null : Number(lastPostRaw);
+
+      if (
+        Number.isFinite(lastPostAt) &&
+        Date.now() - lastPostAt < minPostMinutes * 60 * 1000
+      ) {
+        return;
+      }
+    } catch (_) {}
+  }
+
   try {
     await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
       method: "POST",
@@ -58,6 +77,10 @@ async function postAnalyticsBatch(events, meta = {}) {
         events,
       }),
     });
+
+    if (Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
+      await redis.set(throttleKey, String(Date.now())).catch(() => null);
+    }
   } catch (_) {}
 }
 
