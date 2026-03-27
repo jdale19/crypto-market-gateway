@@ -903,29 +903,154 @@ async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  if (!token || !chatId)
+  if (!token || !chatId) {
     return { ok: false, detail: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
-
-  // Hard guard: Telegram limit is 4096 chars. Keep a safety margin.
-  const maxChars = Number(CFG.telegramMaxChars || 3800);
-  if (text && text.length > maxChars) {
-    const over = text.length - maxChars;
-    text = text.slice(0, Math.max(0, maxChars - 40)) + `\n\n…(truncated ${over} chars)`;
   }
 
-  const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      disable_web_page_preview: true,
-    }),
-  });
+  const maxChars = Number(CFG.telegramMaxChars || 3800);
 
-  const j = await r.json().catch(() => null);
-  if (!r.ok || !j?.ok) return { ok: false, detail: j };
-  return { ok: true };
+  async function sendOne(chunk) {
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: chunk,
+        disable_web_page_preview: true,
+      }),
+    });
+
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j?.ok) return { ok: false, detail: j };
+    return { ok: true };
+  }
+
+  function chunkPlainText(rawText) {
+    const parts = String(rawText || "")
+      .split("\n\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const chunks = [];
+    let current = "";
+
+    for (const part of parts) {
+      const next = current ? `${current}\n\n${part}` : part;
+
+      if (next.length <= maxChars) {
+        current = next;
+        continue;
+      }
+
+      if (current) chunks.push(current);
+
+      if (part.length <= maxChars) {
+        current = part;
+        continue;
+      }
+
+      const lines = part.split("\n");
+      let lineChunk = "";
+
+      for (const line of lines) {
+        const nextLine = lineChunk ? `${lineChunk}\n${line}` : line;
+
+        if (nextLine.length <= maxChars) {
+          lineChunk = nextLine;
+          continue;
+        }
+
+        if (lineChunk) chunks.push(lineChunk);
+
+        if (line.length <= maxChars) {
+          lineChunk = line;
+          continue;
+        }
+
+        for (let i = 0; i < line.length; i += maxChars) {
+          chunks.push(line.slice(i, i + maxChars));
+        }
+
+        lineChunk = "";
+      }
+
+      current = lineChunk;
+    }
+
+    if (current) chunks.push(current);
+    return chunks;
+  }
+
+  function buildTelegramChunks(rawText) {
+    const textValue = String(rawText || "");
+    const marker = "\nPASTE_ROWS_PIPE\n";
+
+    if (!textValue.includes(marker)) {
+      return chunkPlainText(textValue);
+    }
+
+    const [preambleRaw, pipeRaw] = textValue.split(marker);
+    const chunks = [];
+
+    const preambleChunks = chunkPlainText(preambleRaw);
+    chunks.push(...preambleChunks);
+
+    const pipeLines = String(pipeRaw || "").split("\n");
+    const header = pipeLines[0] || "";
+    const rows = pipeLines.slice(1).filter(Boolean);
+
+    const pipePrefix = `PASTE_ROWS_PIPE\n${header}`;
+    let current = pipePrefix;
+
+    for (const row of rows) {
+      const next = `${current}\n${row}`;
+
+      if (next.length <= maxChars) {
+        current = next;
+        continue;
+      }
+
+      if (current && current !== pipePrefix) {
+        chunks.push(current);
+      }
+
+      if ((`${pipePrefix}\n${row}`).length <= maxChars) {
+        current = `${pipePrefix}\n${row}`;
+        continue;
+      }
+
+      const rowLabel = row.split("|")[0] || row.slice(0, 50);
+      const safeRoom = Math.max(500, maxChars - pipePrefix.length - 32);
+      const rowParts = [];
+
+      for (let i = 0; i < row.length; i += safeRoom) {
+        rowParts.push(row.slice(i, i + safeRoom));
+      }
+
+      for (let i = 0; i < rowParts.length; i++) {
+        chunks.push(
+          `${pipePrefix}\n${rowLabel}|row_part_${i + 1}_of_${rowParts.length}|${rowParts[i]}`
+        );
+      }
+
+      current = pipePrefix;
+    }
+
+    if (current && current !== pipePrefix) {
+      chunks.push(current);
+    }
+
+    return chunks.filter(Boolean);
+  }
+
+  const chunks = buildTelegramChunks(text);
+
+  for (const chunk of chunks) {
+    const sent = await sendOne(chunk);
+    if (!sent.ok) return sent;
+  }
+
+  return { ok: true, chunk_count: chunks.length };
 }
 
 // State write helper to satisfy v2.6 seeding rule (mirror legacy for swing/build)
@@ -3057,9 +3182,10 @@ wick_extreme: !!wickMeta?.extreme,
 flow_persists: flowPersists,
 reversal_confirmed: reversalConfirmed,
 breakout_only: breakoutOnly,
-  leverage_suggested_low: lev?.suggestedLow ?? "",
+    leverage_suggested_low: lev?.suggestedLow ?? "",
   leverage_suggested_high: lev?.suggestedHigh ?? "",
   leverage_stop_dist_pct: lev?.stopDistPct ?? "",
+  min_lev: minLev ?? "",
   risk_budget_pct: lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct ?? "",
   risk_budget_base_pct: lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct ?? "",
   risk_budget_multiplier: dynamicRisk?.multiplier ?? "",
@@ -3148,6 +3274,8 @@ const telegramRowFields = [
   "source",
   "ts",
   "due_ts",
+  "eval_bucket",
+  "eval_ts_effective",
   "symbol",
   "instId",
   "driver_tf",
@@ -3199,6 +3327,7 @@ const telegramRowFields = [
   "leverage_suggested_low",
   "leverage_suggested_high",
   "leverage_stop_dist_pct",
+  "min_lev",
   "horizon_min",
   "status",
   "exit_price",
@@ -3211,7 +3340,7 @@ const telegramRowFields = [
   "random_group_id",
   "random_source",
 ];
-
+    
 const telegramDelimiter = "|";
 
 const telegramRows = analyticsEvents
