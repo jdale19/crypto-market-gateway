@@ -3172,23 +3172,25 @@ const telegramRowFields = [
   "random_source",
 ];
 
+const telegramDelimiter = "|";
+
 const telegramRows = analyticsEvents
   .filter((e) => e.observation_type === "fired" || e.observation_type === "random")
   .map((e) =>
     telegramRowFields
       .map((k) => {
         const v = e?.[k];
-        return v == null ? "" : String(v).replace(/\t|\n|\r/g, " ");
+        return v == null ? "" : String(v).replace(/\||\t|\n|\r/g, " ");
       })
-      .join("\t")
+      .join(telegramDelimiter)
   );
 
 const message = telegramRows.length
   ? [
       lines.join("\n"),
       "",
-      "PASTE_ROWS_TSV",
-      telegramRowFields.join("\t"),
+      "PASTE_ROWS_PIPE",
+      telegramRowFields.join(telegramDelimiter),
       ...telegramRows,
     ].join("\n")
   : lines.join("\n");
