@@ -3143,7 +3143,55 @@ if (!isRandom) {
 }
 }
 
-const message = lines.join("\n");
+const telegramRowFields = [
+  "alert_id",
+  "source",
+  "ts",
+  "due_ts",
+  "symbol",
+  "instId",
+  "driver_tf",
+  "mode",
+  "side",
+  "entry_price",
+  "tp_price",
+  "stop_loss",
+  "invalidation_price",
+  "rr",
+  "confidence",
+  "horizon_min",
+  "status",
+  "exit_price",
+  "return_pct",
+  "abs_return_pct",
+  "result",
+  "gateway_version",
+  "observation_type",
+  "rejection_reason",
+  "random_group_id",
+  "random_source",
+];
+
+const telegramRows = analyticsEvents
+  .filter((e) => e.observation_type === "fired" || e.observation_type === "random")
+  .map((e) =>
+    telegramRowFields
+      .map((k) => {
+        const v = e?.[k];
+        return v == null ? "" : String(v).replace(/\t|\n|\r/g, " ");
+      })
+      .join("\t")
+  );
+
+const message = telegramRows.length
+  ? [
+      lines.join("\n"),
+      "",
+      "PASTE_ROWS_TSV",
+      telegramRowFields.join("\t"),
+      ...telegramRows,
+    ].join("\n")
+  : lines.join("\n");
 
 const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
