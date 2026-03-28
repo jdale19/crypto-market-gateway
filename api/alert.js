@@ -1559,8 +1559,8 @@ function computeConfidenceBase(t) {
   const wickStrong = !!wickMeta?.strong;
   const wickExtreme = !!wickMeta?.extreme;
 
-  if (flowPersists && oiAligned && oneHourAligned) return "A";
-  if (flowPersists && (oiAligned || oneHourAligned)) return "B";
+  if (flowPersists && oiAligned && oneHourAligned) return "B";
+  if (flowPersists && (oiAligned || oneHourAligned)) return "C";
   if (b1Strong && wickDriven && wickExtreme && oiAligned && oneHourAligned) return "A";
   if (b1Strong && wickDriven && wickStrong && oiAligned) return "A";
   if (b1Strong && reversalConfirmed && oiAligned && oneHourAligned) return "A";
@@ -1587,7 +1587,27 @@ function computeConfidence(t) {
   const extAdjRaw = Number(t?.ctx?.externalContextAdj || 0);
   const extAdj = Number.isFinite(extAdjRaw) ? extAdjRaw : 0;
   const baseScore = confidenceScoreFromLabel(baseConfidence);
-  const finalScore = Number((baseScore + extAdj).toFixed(2));
+
+  const execReason = String(t?.execReason || "").toLowerCase();
+
+  const flowPersists =
+    execReason.includes("flow_persists_long") ||
+    execReason.includes("flow_persists_short") ||
+    execReason.includes("flow_persists");
+
+  const reversalConfirmed =
+    execReason.includes("b1_reversal") ||
+    execReason.includes("wick_reclaim") ||
+    execReason.includes("wick_reject") ||
+    execReason.includes("wick_flush_reclaim") ||
+    execReason.includes("wick_spike_reject") ||
+    execReason.includes("liquidity_snap_reversal");
+
+  const b1Strong = !!t?.b1?.strong;
+
+  const rawFinalScore = Number((baseScore + extAdj).toFixed(2));
+  const continuationOnly = flowPersists && !b1Strong && !reversalConfirmed;
+  const finalScore = continuationOnly ? Math.min(rawFinalScore, 2.49) : rawFinalScore;
   const finalConfidence = confidenceLabelFromScore(finalScore);
 
   return {
