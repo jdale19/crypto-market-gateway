@@ -3619,6 +3619,8 @@ const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
 ).length;
 
+const renderedRowCount = telegramRows.length;
+
 const firedKeys = [
   ...new Set(
     analyticsEvents
@@ -3629,7 +3631,7 @@ const firedKeys = [
 
 const { itemErrors, topSkips } = summarizeSkips(skipped);
 
-if (!force && renderedTradeCount === 0) {
+if (!force && renderedRowCount === 0) {
   if (!dry) {
     await postAnalyticsBatch(analyticsEvents, {
       deploy_sha:
