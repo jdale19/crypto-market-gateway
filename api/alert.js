@@ -136,10 +136,24 @@ minRangePctByMode: {
   swingReversalMin5mMovePct: Number(process.env.ALERT_SWING_REVERSAL_MIN_5M_MOVE_PCT || 0.05),
  
   // Directional Pull Score (swing/build only, neutral-rescue only)
-  dps: {
+    dps: {
     enabled: String(process.env.ALERT_DPS_ENABLED || "1") === "1",
     threshold: Number(process.env.ALERT_DPS_THRESHOLD || 0.35),
     favoredReversalMult: Number(process.env.ALERT_DPS_FAVORED_REVERSAL_MULT || 0.85),
+  },
+
+  bottoming: {
+    enabled: String(process.env.ALERT_BOTTOMING_ENABLED || "1") === "1",
+    lookbackCandles: Number(process.env.ALERT_BOTTOMING_LOOKBACK_CANDLES || 6),
+    repeatLookback: Number(process.env.ALERT_BOTTOM_WICK_LOOKBACK || 3),
+    repeatWickCount: Number(process.env.ALERT_BOTTOM_WICK_REPEAT_COUNT || 2),
+    pricePct: Number(process.env.ALERT_EXHAUSTION_PRICE_PCT || 0.35),
+    oiPct: Number(process.env.ALERT_EXHAUSTION_OI_PCT || 0.25),
+    nonConfirmOiPct: Number(process.env.ALERT_EXHAUSTION_NONCONFIRM_OI_PCT || 0.1),
+    decelMult: Number(process.env.ALERT_BOTTOMING_DECEL_MULT || 0.8),
+    scoreMin: Number(process.env.ALERT_BOTTOMING_SCORE_MIN || 2.5),
+    shortPenaltyScoreMin: Number(process.env.ALERT_BOTTOMING_SHORT_PENALTY_SCORE_MIN || 2.5),
+    shortBlockScoreMin: Number(process.env.ALERT_BOTTOMING_SHORT_BLOCK_SCORE_MIN || 3.5),
   },
   
   telegramMaxChars: 3900,
@@ -1232,6 +1246,124 @@ function computeDps({ levels, price, lastPoint }) {
 
   return { score, bias, pos01, wickEdge, locationScore };
 }
+
+function computeBottomingSignal({ item, points }) {
+  const cfg = CFG.bottoming;
+  if (!cfg?.enabled) {
+    return { ok: false, triggered: false, score: 0, reasons: ["bottoming_disabled"] };
+  }
+
+  const need = Math.max(4, cfg.lookbackCandles);
+  if (!Array.isArray(points) || points.length < need) {
+    return { ok: false, triggered: false, score: 0, reasons: ["bottoming_warmup"] };
+  }
+
+  const recent = points.slice(-need);
+  const last = recent[recent.length - 1];
+  const prev = recent.slice(0, -1);
+
+  const d5 = asNum(item?.deltas?.["5m"]?.price_change_pct);
+  const d15 = asNum(item?.deltas?.["15m"]?.price_change_pct);
+  const oi5 = asNum(item?.deltas?.["5m"]?.oi_change_pct);
+  const oi15 = asNum(item?.deltas?.["15m"]?.oi_change_pct);
+
+  let score = 0;
+  const reasons = [];
+
+  const downsideStress =
+    (Number.isFinite(d15) && d15 <= -Math.abs(cfg.pricePct)) ||
+    (Number.isFinite(d5) && d5 <= -(Math.abs(cfg.pricePct) * 0.5));
+
+  if (downsideStress) {
+    score += 1;
+    reasons.push("downside_stress");
+  }
+
+  const oiStress =
+    (Number.isFinite(oi5) && oi5 >= cfg.oiPct) ||
+    (Number.isFinite(oi15) && oi15 >= cfg.oiPct);
+
+  if (downsideStress && oiStress) {
+    score += 1;
+    reasons.push("oi_stress");
+  }
+
+  const wickWindow = recent.slice(-Math.max(2, cfg.repeatLookback));
+  const lowerWickCount = wickWindow.reduce((count, pt) => {
+    const meta = wickQuality(pt, "long");
+    return count + (meta.strong || meta.extreme ? 1 : 0);
+  }, 0);
+
+  if (lowerWickCount >= cfg.repeatWickCount) {
+    score += 1;
+    reasons.push("repeat_lower_wicks");
+  } else if (lowerWickCount >= 1) {
+    score += 0.5;
+    reasons.push("lower_wick_reject");
+  }
+
+  const barMoves = [];
+  for (let i = 1; i < recent.length; i++) {
+    const move = priceChangePctBetweenPoints(recent[i - 1], recent[i]);
+    if (Number.isFinite(move)) barMoves.push(move);
+  }
+
+  const lastMove = barMoves.length ? barMoves[barMoves.length - 1] : null;
+  const priorDownAbs = barMoves.slice(0, -1).filter((x) => x < 0).map((x) => Math.abs(x));
+  const priorDownAvg = avg(priorDownAbs);
+
+  const downsideDecel =
+    Number.isFinite(lastMove) &&
+    lastMove < 0 &&
+    Number.isFinite(priorDownAvg) &&
+    priorDownAvg > 0 &&
+    Math.abs(lastMove) <= priorDownAvg * cfg.decelMult;
+
+  if (downsideDecel) {
+    score += 1;
+    reasons.push("downside_decelerating");
+  }
+
+  const prevLows = prev.map((pt) => asNum(pt?.l ?? pt?.p)).filter((x) => x != null);
+  const prevLow = prevLows.length ? Math.min(...prevLows) : null;
+  const lastLow = asNum(last?.l ?? last?.p);
+  const lastClose = asNum(last?.p ?? last?.c ?? last?.close);
+
+  const positioningNonConfirm =
+    Number.isFinite(lastLow) &&
+    Number.isFinite(prevLow) &&
+    lastLow < prevLow &&
+    Number.isFinite(lastClose) &&
+    lastClose > lastLow &&
+    (
+      !Number.isFinite(oi5) ||
+      oi5 <= cfg.nonConfirmOiPct ||
+      !Number.isFinite(oi15) ||
+      oi15 <= cfg.nonConfirmOiPct
+    );
+
+  if (positioningNonConfirm) {
+    score += 1;
+    reasons.push("positioning_non_confirm");
+  }
+
+  const finalScore = Number(score.toFixed(2));
+
+  return {
+    ok: true,
+    triggered: finalScore >= cfg.scoreMin,
+    score: finalScore,
+    reasons,
+    downsideStress,
+    oiStress,
+    lowerWickCount,
+    downsideDecel,
+    positioningNonConfirm,
+    lastMove,
+    priorDownAvg,
+  };
+}
+
 function avg(nums) {
   const vals = (nums || []).filter((x) => Number.isFinite(x));
   if (!vals.length) return null;
@@ -1555,10 +1687,26 @@ function computeConfidenceBase(t) {
   const oneHourAligned = lean1h === bias;
   const counter1hLean = lean1h && lean1h !== "neutral" && !oneHourAligned;
 
-  const wickMeta = t?.ctx?.wickMeta || {};
+    const wickMeta = t?.ctx?.wickMeta || {};
   const wickStrong = !!wickMeta?.strong;
   const wickExtreme = !!wickMeta?.extreme;
 
+  const bottoming = t?.ctx?.bottoming || {};
+  const bottomingScore = asNum(bottoming?.score);
+  const strongBottoming =
+    !!bottoming?.triggered &&
+    Number.isFinite(bottomingScore) &&
+    bottomingScore >= CFG.bottoming.scoreMin;
+
+  const shortBottomingPenalty =
+    bias === "short" &&
+    flowPersists &&
+    strongBottoming &&
+    !b1Strong &&
+    !reversalConfirmed;
+
+  if (shortBottomingPenalty) return "C";
+  if (bias === "long" && b1Strong && reversalConfirmed && oiAligned && (oneHourAligned || strongBottoming)) return "A";
   if (flowPersists && oiAligned && oneHourAligned) return "B";
   if (flowPersists && (oiAligned || oneHourAligned)) return "C";
   if (b1Strong && wickDriven && wickExtreme && oiAligned && oneHourAligned) return "A";
@@ -1588,6 +1736,7 @@ function computeConfidence(t) {
   const extAdj = Number.isFinite(extAdjRaw) ? extAdjRaw : 0;
   const baseScore = confidenceScoreFromLabel(baseConfidence);
 
+  const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
 
   const flowPersists =
@@ -1604,10 +1753,28 @@ function computeConfidence(t) {
     execReason.includes("liquidity_snap_reversal");
 
   const b1Strong = !!t?.b1?.strong;
+  const bottoming = t?.ctx?.bottoming || {};
+  const bottomingScore = asNum(bottoming?.score);
+  const strongBottoming =
+    !!bottoming?.triggered &&
+    Number.isFinite(bottomingScore) &&
+    bottomingScore >= CFG.bottoming.shortPenaltyScoreMin;
 
   const rawFinalScore = Number((baseScore + extAdj).toFixed(2));
   const continuationOnly = flowPersists && !b1Strong && !reversalConfirmed;
-  const finalScore = continuationOnly ? Math.min(rawFinalScore, 2.49) : rawFinalScore;
+  const cappedContinuationScore = continuationOnly ? Math.min(rawFinalScore, 2.49) : rawFinalScore;
+
+  const shortIntoBottoming =
+    bias === "short" &&
+    flowPersists &&
+    strongBottoming &&
+    !b1Strong &&
+    !reversalConfirmed;
+
+  const finalScore = shortIntoBottoming
+    ? Math.min(cappedContinuationScore, 1.49)
+    : cappedContinuationScore;
+
   const finalConfidence = confidenceLabelFromScore(finalScore);
 
   return {
@@ -1619,7 +1786,6 @@ function computeConfidence(t) {
     externalBias: String(t?.ctx?.externalBias || "neutral").toLowerCase(),
   };
 }
-
 function computeDynamicRiskBudget({ mode, t, confidence }) {
   const m = String(mode || "scalp").toLowerCase();
   const baseRiskPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
@@ -1661,18 +1827,33 @@ function computeDynamicRiskBudget({ mode, t, confidence }) {
   const wickStrong = !!wickMeta?.strong;
   const wickExtreme = !!wickMeta?.extreme;
 
+  const bottoming = t?.ctx?.bottoming || {};
+  const bottomingScore = asNum(bottoming?.score);
+  const strongBottoming =
+    !!bottoming?.triggered &&
+    Number.isFinite(bottomingScore) &&
+    bottomingScore >= CFG.bottoming.shortPenaltyScoreMin;
+
+  const shortIntoBottoming =
+    bias === "short" &&
+    flowPersists &&
+    strongBottoming &&
+    !b1Strong &&
+    !reversalConfirmed;
+
   if (confidence === "A") { score += 2; reasons.push("conf_A"); }
   else if (confidence === "B") { score += 1; reasons.push("conf_B"); }
 
   if (b1Strong) { score += 1; reasons.push("b1_strong"); }
-  if (flowPersists) { score += 1; reasons.push("flow_persists"); }
-  if (oneHourAligned) { score += 1; reasons.push("aligned_1h"); }
+  if (flowPersists && !shortIntoBottoming) { score += 1; reasons.push("flow_persists"); }
+  if (oneHourAligned && !shortIntoBottoming) { score += 1; reasons.push("aligned_1h"); }
   if (wickExtreme) { score += 0.5; reasons.push("wick_extreme"); }
   else if (wickStrong) { score += 0.25; reasons.push("wick_strong"); }
 
   if (reversalConfirmed) { score += 0.25; reasons.push("reversal_confirmed"); }
   if (breakoutOnly) { score -= 0.5; reasons.push("breakout_only"); }
   if (counter1hLean) { score -= 1; reasons.push("counter_1h"); }
+  if (shortIntoBottoming) { score -= 1; reasons.push("bottoming_penalty"); }
 
   let multiplier = 1.0;
   if (score >= 5) multiplier = 2.0;
@@ -2044,12 +2225,19 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
     CFG.entryIdeas.slowLeverageSqueeze.oiCandles + 1,
     CFG.entryIdeas.slowShortBreak.breakLookbackCandles + 1,
     CFG.entryIdeas.slowShortBreak.oiRiseCandles + 1,
+    CFG.bottoming.lookbackCandles,
     10
   );
   const recentPts = await getIdeaWindow(instId, maxIdeaLookback);
   const lastPt = recentPts.length ? recentPts[recentPts.length - 1] : null;
   const wickMeta = wickQuality(lastPt, bias);
   const lastWickPct = wickMeta.wickPct;
+  const bottoming = computeBottomingSignal({ item, points: recentPts });
+  const bottomingScore = asNum(bottoming?.score);
+  const strongBottomingBlock =
+    !!bottoming?.triggered &&
+    Number.isFinite(bottomingScore) &&
+    bottomingScore >= CFG.bottoming.shortBlockScoreMin;
 
   const range = hi - lo;
   if (!(range > 0)) return { ok: false, reason: "bad_range" };
@@ -2063,7 +2251,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   const inHighBand = p >= highBandLo;
   const lowBandTxt = `${fmtPrice(lowBandLo)}–${fmtPrice(lowBandHi)}`;
   const highBandTxt = `${fmtPrice(highBandLo)}–${fmtPrice(highBandHi)}`;
-    let reversalMin = CFG.swingReversalMin5mMovePct;
+  let reversalMin = CFG.swingReversalMin5mMovePct;
   const dpsBias = String(dps?.bias || "neutral").toLowerCase();
   if (dpsBias === bias) reversalMin *= CFG.dps.favoredReversalMult;
 
@@ -2075,6 +2263,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         reason: `${modeLabel.toLowerCase()}_${ignition.reason}`,
         entryLine: ignition.entryLine,
         detail: ignition.detail,
+        bottoming,
       };
     }
 
@@ -2086,6 +2275,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         entryLine: liqSnap.entryLine,
         wickMeta: liqSnap.wickMeta,
         detail: liqSnap.detail,
+        bottoming,
       };
     }
 
@@ -2096,6 +2286,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         reason: `${modeLabel.toLowerCase()}_${slowSqueeze.reason}`,
         entryLine: slowSqueeze.entryLine,
         detail: slowSqueeze.detail,
+        bottoming,
       };
     }
 
@@ -2104,6 +2295,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         ok: true,
         reason: `${modeLabel.toLowerCase()}_break_above_${contTf}_high`,
         entryLine: `break above ${contTf} high (${fmtPrice(contHi)}) → continuation`,
+        bottoming,
       };
     }
 
@@ -2113,6 +2305,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_long`,
         entryLine: `bounce in B1 low band (${lowBandTxt}) + 5m turned up (≥ ${fmtPct(reversalMin)})`,
+        bottoming,
       };
     }
 
@@ -2130,6 +2323,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         reason: `${modeLabel.toLowerCase()}_wick_reclaim_long`,
         entryLine: `wick reclaim in B1 low band (${lowBandTxt}) + 5m turned up`,
         wickMeta,
+        bottoming,
       };
     }
 
@@ -2140,32 +2334,26 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         reason: `${modeLabel.toLowerCase()}_flow_persists_long`,
         entryLine: `flow persists across TFs (${flowPersist.matchedTfs.join("/")}) + OI aligned`,
         detail: flowPersist,
+        bottoming,
       };
     }
 
     return {
       ok: false,
       reason: "no_entry_trigger",
-      detail: { p, hi, lo, inLowBand, p5, lastWickPct, flowPersists: flowPersist },
+      detail: { p, hi, lo, inLowBand, p5, lastWickPct, flowPersists: flowPersist, bottoming },
     };
   }
 
   if (bias === "short") {
     const slowShort = slowShortBreakdownCheck(recentPts, p, asNum(item?.funding_rate));
-    if (slowShort.ok) {
+    if (slowShort.ok && !strongBottomingBlock) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_${slowShort.reason}`,
         entryLine: slowShort.entryLine,
         detail: slowShort.detail,
-      };
-    }
-
-    if (p < contLo) {
-      return {
-        ok: true,
-        reason: `${modeLabel.toLowerCase()}_break_below_${contTf}_low`,
-        entryLine: `break below ${contTf} low (${fmtPrice(contLo)}) → continuation`,
+        bottoming,
       };
     }
 
@@ -2175,6 +2363,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         ok: true,
         reason: `${modeLabel.toLowerCase()}_b1_reversal_short`,
         entryLine: `reject in B1 high band (${highBandTxt}) + 5m turned down (≤ -${fmtPct(reversalMin)})`,
+        bottoming,
       };
     }
 
@@ -2192,6 +2381,24 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         reason: `${modeLabel.toLowerCase()}_wick_reject_short`,
         entryLine: `wick reject in B1 high band (${highBandTxt}) + 5m turned down`,
         wickMeta,
+        bottoming,
+      };
+    }
+
+    if (strongBottomingBlock) {
+      return {
+        ok: false,
+        reason: "bottoming_exhaustion_block",
+        detail: { bottoming },
+      };
+    }
+
+    if (p < contLo) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_break_below_${contTf}_low`,
+        entryLine: `break below ${contTf} low (${fmtPrice(contLo)}) → continuation`,
+        bottoming,
       };
     }
 
@@ -2202,13 +2409,14 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
         reason: `${modeLabel.toLowerCase()}_flow_persists_short`,
         entryLine: `flow persists across TFs (${flowPersist.matchedTfs.join("/")}) + OI aligned`,
         detail: flowPersist,
+        bottoming,
       };
     }
 
     return {
       ok: false,
       reason: "no_entry_trigger",
-      detail: { p, hi, lo, inHighBand, p5, lastWickPct, flowPersists: flowPersist },
+      detail: { p, hi, lo, inHighBand, p5, lastWickPct, flowPersists: flowPersist, bottoming },
     };
   }
 
@@ -2597,6 +2805,7 @@ async function evaluateCandidate({
     curState = null,
     dps = null,
     wickMeta = null,
+    bottoming = null,
     rejectionReason = "",
   }) {
     const externalContextAdj = getExternalContextAdj({
@@ -2630,6 +2839,7 @@ async function evaluateCandidate({
         lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
         wickMeta: wickMeta || null,
         dps: dps || null,
+        bottoming: bottoming || null,
         externalBias: String(externalContext?.bias || "neutral").toLowerCase(),
         externalContextAdj,
         externalContextOk: !!externalContext?.ok,
@@ -2783,6 +2993,7 @@ async function evaluateCandidate({
     let entryLine = null;
     let execReason = null;
     let execWickMeta = null;
+    let execBottoming = null;
 
     if (!force) {
       if (mode === "scalp") {
@@ -2810,6 +3021,7 @@ async function evaluateCandidate({
         entryLine = g.entryLine || null;
         execReason = g.reason || null;
         execWickMeta = g.wickMeta || null;
+        execBottoming = g.bottoming || null;
       } else {
         if (mode === "build") {
           const br = item?.build_regime;
@@ -2839,6 +3051,8 @@ async function evaluateCandidate({
 
         entryLine = g.entryLine || null;
         execReason = g.reason || null;
+        execWickMeta = g.wickMeta || null;
+        execBottoming = g.bottoming || null;
       }
     }
 
@@ -2853,6 +3067,7 @@ async function evaluateCandidate({
       curState,
       dps,
       wickMeta: execWickMeta,
+      bottoming: execBottoming,
     });
 
     break;
