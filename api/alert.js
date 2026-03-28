@@ -1827,34 +1827,37 @@ function computeDynamicRiskBudget({ mode, t, confidence }) {
   const wickStrong = !!wickMeta?.strong;
   const wickExtreme = !!wickMeta?.extreme;
 
-  const bottoming = t?.ctx?.bottoming || {};
+    const bottoming = t?.ctx?.bottoming || {};
   const bottomingScore = asNum(bottoming?.score);
   const strongBottoming =
     !!bottoming?.triggered &&
     Number.isFinite(bottomingScore) &&
     bottomingScore >= CFG.bottoming.shortPenaltyScoreMin;
 
-  const shortIntoBottoming =
+  const pureContinuationShort =
     bias === "short" &&
     flowPersists &&
-    strongBottoming &&
     !b1Strong &&
     !reversalConfirmed;
+
+  const shortIntoBottoming =
+    pureContinuationShort &&
+    strongBottoming;
 
   if (confidence === "A") { score += 2; reasons.push("conf_A"); }
   else if (confidence === "B") { score += 1; reasons.push("conf_B"); }
 
   if (b1Strong) { score += 1; reasons.push("b1_strong"); }
-  if (flowPersists && !shortIntoBottoming) { score += 1; reasons.push("flow_persists"); }
-  if (oneHourAligned && !shortIntoBottoming) { score += 1; reasons.push("aligned_1h"); }
+  if (flowPersists && !pureContinuationShort) { score += 1; reasons.push("flow_persists"); }
+  if (oneHourAligned && !pureContinuationShort) { score += 1; reasons.push("aligned_1h"); }
   if (wickExtreme) { score += 0.5; reasons.push("wick_extreme"); }
   else if (wickStrong) { score += 0.25; reasons.push("wick_strong"); }
 
   if (reversalConfirmed) { score += 0.25; reasons.push("reversal_confirmed"); }
   if (breakoutOnly) { score -= 0.5; reasons.push("breakout_only"); }
   if (counter1hLean) { score -= 1; reasons.push("counter_1h"); }
+  if (pureContinuationShort) { reasons.push("continuation_short_base_size"); }
   if (shortIntoBottoming) { score -= 1; reasons.push("bottoming_penalty"); }
-
   let multiplier = 1.0;
   if (score >= 5) multiplier = 2.0;
   else if (score >= 4) multiplier = 1.75;
