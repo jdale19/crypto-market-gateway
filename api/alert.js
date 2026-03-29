@@ -3088,8 +3088,6 @@ for (const item of j.results || []) {
 // ---- Render DM ----
 
 const lines = [];
-lines.push(`⚡️TRADE ENTRY`);
-lines.push("");
 const randomGroupId = `${now}_random`;
 
 if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 0) {
@@ -3596,15 +3594,11 @@ const telegramRows = analyticsEvents
       .join(telegramDelimiter)
   );
 
-const message = telegramRows.length
-  ? [
-      lines.join("\n"),
-      "",
-      "PASTE_ROWS_PIPE",
-      telegramRowFields.join(telegramDelimiter),
-      ...telegramRows,
-    ].join("\n")
-  : lines.join("\n");
+const messageHeader = renderedTradeCount > 0
+  ? "⚡️TRADE ENTRY"
+  : randomRowCount > 0
+  ? "🎲 RANDOM BASELINE"
+  : "";
 
 const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
@@ -3615,6 +3609,24 @@ const renderedRowCount = telegramRows.length;
 const randomRowCount = analyticsEvents.filter(
   (e) => e.observation_type === "random"
 ).length;
+
+const messageHeader = renderedTradeCount > 0
+  ? "⚡️TRADE ENTRY"
+  : randomRowCount > 0
+  ? "🎲 RANDOM BASELINE"
+  : "";
+
+const message = telegramRows.length
+  ? [
+      messageHeader,
+      lines.join("\n"),
+      "PASTE_ROWS_PIPE",
+      telegramRowFields.join(telegramDelimiter),
+      ...telegramRows,
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+  : lines.join("\n");
 
 const firedKeys = [
   ...new Set(
