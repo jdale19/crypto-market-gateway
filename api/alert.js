@@ -2235,12 +2235,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   const lastPt = recentPts.length ? recentPts[recentPts.length - 1] : null;
   const wickMeta = wickQuality(lastPt, bias);
   const lastWickPct = wickMeta.wickPct;
-  const bottoming = computeBottomingSignal({ item, points: recentPts });
-  const bottomingScore = asNum(bottoming?.score);
-  const strongBottomingBlock =
-    !!bottoming?.triggered &&
-    Number.isFinite(bottomingScore) &&
-    bottomingScore >= CFG.bottoming.shortBlockScoreMin;
+    const bottoming = computeBottomingSignal({ item, points: recentPts });
 
   const range = hi - lo;
   if (!(range > 0)) return { ok: false, reason: "bad_range" };
@@ -2349,8 +2344,8 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
   }
 
   if (bias === "short") {
-    const slowShort = slowShortBreakdownCheck(recentPts, p, asNum(item?.funding_rate));
-    if (slowShort.ok && !strongBottomingBlock) {
+        const slowShort = slowShortBreakdownCheck(recentPts, p, asNum(item?.funding_rate));
+    if (slowShort.ok) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_${slowShort.reason}`,
@@ -2388,13 +2383,6 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-    if (strongBottomingBlock) {
-      return {
-        ok: false,
-        reason: "bottoming_exhaustion_block",
-        detail: { bottoming },
-      };
-    }
 
     if (p < contLo) {
       return {
