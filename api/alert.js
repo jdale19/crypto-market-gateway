@@ -3612,6 +3612,10 @@ const renderedTradeCount = analyticsEvents.filter(
 
 const renderedRowCount = telegramRows.length;
 
+const randomRowCount = analyticsEvents.filter(
+  (e) => e.observation_type === "random"
+).length;
+
 const firedKeys = [
   ...new Set(
     analyticsEvents
@@ -3674,6 +3678,9 @@ if (!force && renderedRowCount === 0) {
           anomalyRanking,
           skipped,
           triggered,
+          rendered_trade_count: renderedTradeCount,
+          rendered_row_count: renderedRowCount,
+          random_row_count: randomRowCount,
           modes,
           debug_build_regimes,
           risk_profile,
@@ -3781,14 +3788,17 @@ const summary = debug
             macro: macroByMode,
             externalContext,
             anomalyRanking,
-            skipped,
-            triggered,
-            modes,
-            debug_build_regimes,
-            risk_profile,
-            summary,
-            renderedMessage: message,
-            heartbeat_last_run,
+                      skipped,
+          triggered,
+          rendered_trade_count: renderedTradeCount,
+          rendered_row_count: renderedRowCount,
+          random_row_count: randomRowCount,
+          modes,
+          debug_build_regimes,
+          risk_profile,
+          summary,
+          renderedMessage: message,
+          heartbeat_last_run,
           }
         : {}),
     });
