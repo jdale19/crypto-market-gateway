@@ -3594,11 +3594,6 @@ const telegramRows = analyticsEvents
       .join(telegramDelimiter)
   );
 
-const messageHeader = renderedTradeCount > 0
-  ? "⚡️TRADE ENTRY"
-  : randomRowCount > 0
-  ? "🎲 RANDOM BASELINE"
-  : "";
 
 const renderedTradeCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
