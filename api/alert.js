@@ -3607,13 +3607,13 @@ const randomRowCount = analyticsEvents.filter(
 
 const messageHeader = renderedTradeCount > 0
   ? "⚡️TRADE ENTRY"
-  : randomRowCount > 0
-  ? "🎲 RANDOM BASELINE"
   : "";
 
-const message = [messageHeader, lines.join("\n")]
-  .filter(Boolean)
-  .join("\n\n");
+const message = renderedTradeCount > 0
+  ? [messageHeader, lines.join("\n")]
+      .filter(Boolean)
+      .join("\n\n")
+  : "";
 
 const firedKeys = [
   ...new Set(
