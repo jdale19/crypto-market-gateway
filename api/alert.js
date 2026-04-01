@@ -3611,17 +3611,9 @@ const messageHeader = renderedTradeCount > 0
   ? "🎲 RANDOM BASELINE"
   : "";
 
-const message = telegramRows.length
-  ? [
-      messageHeader,
-      lines.join("\n"),
-      "PASTE_ROWS_PIPE",
-      telegramRowFields.join(telegramDelimiter),
-      ...telegramRows,
-    ]
-      .filter(Boolean)
-      .join("\n\n")
-  : lines.join("\n");
+const message = [messageHeader, lines.join("\n")]
+  .filter(Boolean)
+  .join("\n\n");
 
 const firedKeys = [
   ...new Set(
