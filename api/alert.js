@@ -3376,7 +3376,7 @@ const anomalyOiDisplay =
 if (!isRandom) {
   lines.push(`Anomaly OI (${anomaly.anomaly_tf || "15m"}): ${anomalyOiDisplay}`);
   lines.push(`Setup = ${t?.execReason || "n/a"}`);
-  lines.push(`Reversal confirmed = ${bias === "long" && reversalConfirmed ? "yes" : "no"}`);
+  lines.push(`Reversal Confirmed = ${reversalConfirmed ? "yes" : "no"}`);
   lines.push("");
 }
 
