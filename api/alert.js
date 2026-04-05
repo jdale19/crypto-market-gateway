@@ -1783,10 +1783,11 @@ function computeConfidence(t) {
 
   let adjustedScore = Number((baseScore + extAdj).toFixed(2));
 
-  if (mode === "swing" && bias === "long" && reversalConfirmed) {
-    adjustedScore += 0.25;
-    if (liquiditySnap) adjustedScore += 0.25;
-  }
+  if (mode === "swing" && bias === "long" && liquiditySnap) {
+  adjustedScore += 0.5;
+} else if (mode === "swing" && bias === "long" && reversalConfirmed) {
+  adjustedScore += 0.25;
+}
 
   if (shortContinuationStyle && Number.isFinite(anomalyOiPct) && anomalyOiPct >= 0) {
     adjustedScore -= 0.5;
@@ -1881,8 +1882,7 @@ function computeDynamicRiskBudget({ mode, t, confidence }) {
   if (oneHourAligned && !pureContinuationShort) { score += 1; reasons.push("aligned_1h"); }
   if (wickExtreme) { score += 0.5; reasons.push("wick_extreme"); }
   else if (wickStrong) { score += 0.25; reasons.push("wick_strong"); }
-
-  if (m === "swing" && bias === "long" && liquiditySnap) { score += 1; reasons.push("liquidity_snap_long"); }
+  
   if (breakoutOnly) { score -= 0.5; reasons.push("breakout_only"); }
   if (counter1hLean) { score -= 1; reasons.push("counter_1h"); }
   if (pureContinuationShort) { reasons.push("continuation_short_base_size"); }
