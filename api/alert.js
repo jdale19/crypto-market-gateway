@@ -1698,17 +1698,17 @@ function computeConfidenceBase(t) {
     Number.isFinite(bottomingScore) &&
     bottomingScore >= CFG.bottoming.scoreMin;
 
+  const continuationOnly = flowPersists && !b1Strong && !reversalConfirmed;
+
   const shortBottomingPenalty =
     bias === "short" &&
-    flowPersists &&
-    strongBottoming &&
-    !b1Strong &&
-    !reversalConfirmed;
+    continuationOnly &&
+    strongBottoming;
 
   if (shortBottomingPenalty) return "C";
   if (bias === "long" && b1Strong && reversalConfirmed && oiAligned && (oneHourAligned || strongBottoming)) return "A";
-  if (flowPersists && oiAligned && oneHourAligned) return "B";
-  if (flowPersists && (oiAligned || oneHourAligned)) return "C";
+  if (continuationOnly && oiAligned && oneHourAligned) return "C";
+  if (continuationOnly && (oiAligned || oneHourAligned)) return "C";
   if (b1Strong && wickDriven && wickExtreme && oiAligned && oneHourAligned) return "A";
   if (b1Strong && wickDriven && wickStrong && oiAligned) return "A";
   if (b1Strong && reversalConfirmed && oiAligned && oneHourAligned) return "A";
@@ -1736,6 +1736,7 @@ function computeConfidence(t) {
   const extAdj = Number.isFinite(extAdjRaw) ? extAdjRaw : 0;
   const baseScore = confidenceScoreFromLabel(baseConfidence);
 
+  const mode = String(t?.mode || "").toLowerCase();
   const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
 
@@ -1752,6 +1753,17 @@ function computeConfidence(t) {
     execReason.includes("wick_spike_reject") ||
     execReason.includes("liquidity_snap_reversal");
 
+  const liquiditySnap = execReason.includes("liquidity_snap_reversal");
+
+  const breakoutOnly =
+    execReason.includes("break_above") ||
+    execReason.includes("break_below") ||
+    execReason.includes("breakout") ||
+    execReason.includes("breakdown") ||
+    execReason.includes("ignition_breakout") ||
+    execReason.includes("slow_leverage_squeeze") ||
+    execReason.includes("slow_short_breakdown");
+
   const b1Strong = !!t?.b1?.strong;
   const bottoming = t?.ctx?.bottoming || {};
   const bottomingScore = asNum(bottoming?.score);
@@ -1760,16 +1772,32 @@ function computeConfidence(t) {
     Number.isFinite(bottomingScore) &&
     bottomingScore >= CFG.bottoming.shortPenaltyScoreMin;
 
-  const rawFinalScore = Number((baseScore + extAdj).toFixed(2));
+  const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
+
   const continuationOnly = flowPersists && !b1Strong && !reversalConfirmed;
-  const cappedContinuationScore = continuationOnly ? Math.min(rawFinalScore, 2.49) : rawFinalScore;
+  const shortContinuationStyle =
+    mode === "swing" &&
+    bias === "short" &&
+    !reversalConfirmed &&
+    (flowPersists || breakoutOnly);
+
+  let adjustedScore = Number((baseScore + extAdj).toFixed(2));
+
+  if (mode === "swing" && bias === "long" && reversalConfirmed) {
+    adjustedScore += 0.25;
+    if (liquiditySnap) adjustedScore += 0.25;
+  }
+
+  if (shortContinuationStyle && Number.isFinite(anomalyOiPct) && anomalyOiPct >= 0) {
+    adjustedScore -= 0.5;
+  }
+
+  const cappedContinuationScore = continuationOnly ? Math.min(adjustedScore, 2.49) : adjustedScore;
 
   const shortIntoBottoming =
     bias === "short" &&
-    flowPersists &&
-    strongBottoming &&
-    !b1Strong &&
-    !reversalConfirmed;
+    continuationOnly &&
+    strongBottoming;
 
   const finalScore = shortIntoBottoming
     ? Math.min(cappedContinuationScore, 1.49)
@@ -1814,6 +1842,8 @@ function computeDynamicRiskBudget({ mode, t, confidence }) {
     execReason.includes("wick_spike_reject") ||
     execReason.includes("liquidity_snap_reversal");
 
+  const liquiditySnap = execReason.includes("liquidity_snap_reversal");
+
   const breakoutOnly =
     execReason.includes("break_above") ||
     execReason.includes("break_below") ||
@@ -1848,12 +1878,11 @@ function computeDynamicRiskBudget({ mode, t, confidence }) {
   else if (confidence === "B") { score += 1; reasons.push("conf_B"); }
 
   if (b1Strong) { score += 1; reasons.push("b1_strong"); }
-  if (flowPersists && !pureContinuationShort) { score += 1; reasons.push("flow_persists"); }
   if (oneHourAligned && !pureContinuationShort) { score += 1; reasons.push("aligned_1h"); }
   if (wickExtreme) { score += 0.5; reasons.push("wick_extreme"); }
   else if (wickStrong) { score += 0.25; reasons.push("wick_strong"); }
 
-  if (reversalConfirmed) { score += 0.25; reasons.push("reversal_confirmed"); }
+  if (m === "swing" && bias === "long" && liquiditySnap) { score += 1; reasons.push("liquidity_snap_long"); }
   if (breakoutOnly) { score -= 0.5; reasons.push("breakout_only"); }
   if (counter1hLean) { score -= 1; reasons.push("counter_1h"); }
   if (pureContinuationShort) { reasons.push("continuation_short_base_size"); }
@@ -2343,14 +2372,34 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
     };
   }
 
-  if (bias === "short") {
-        const slowShort = slowShortBreakdownCheck(recentPts, p, asNum(item?.funding_rate));
+    if (bias === "short") {
+    const slowShort = slowShortBreakdownCheck(recentPts, p, asNum(item?.funding_rate));
     if (slowShort.ok) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_${slowShort.reason}`,
         entryLine: slowShort.entryLine,
         detail: slowShort.detail,
+        bottoming,
+      };
+    }
+
+    if (modeLabel === "SWING" && p < contLo) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_break_below_${contTf}_low`,
+        entryLine: `break below ${contTf} low (${fmtPrice(contLo)}) → continuation`,
+        bottoming,
+      };
+    }
+
+    const flowPersist = flowPersistsAcrossTfs(item, "short");
+    if (modeLabel === "SWING" && flowPersist.ok) {
+      return {
+        ok: true,
+        reason: `${modeLabel.toLowerCase()}_flow_persists_short`,
+        entryLine: `flow persists across TFs (${flowPersist.matchedTfs.join("/")}) + OI aligned`,
+        detail: flowPersist,
         bottoming,
       };
     }
@@ -2383,8 +2432,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-
-    if (p < contLo) {
+    if (modeLabel !== "SWING" && p < contLo) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_break_below_${contTf}_low`,
@@ -2393,8 +2441,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-    const flowPersist = flowPersistsAcrossTfs(item, "short");
-    if (flowPersist.ok) {
+    if (modeLabel !== "SWING" && flowPersist.ok) {
       return {
         ok: true,
         reason: `${modeLabel.toLowerCase()}_flow_persists_short`,
@@ -2404,7 +2451,7 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
       };
     }
 
-    return {
+        return {
       ok: false,
       reason: "no_entry_trigger",
       detail: { p, hi, lo, inHighBand, p5, lastWickPct, flowPersists: flowPersist, bottoming },
@@ -3138,9 +3185,18 @@ for (const t of triggered) {
   const lo1h = l1h && !l1h.warmup ? asNum(l1h.lo) : null;
   const mid1h = hi1h != null && lo1h != null ? (hi1h + lo1h) / 2 : null;
 
-  const price = asNum(t.price);
+    const price = asNum(t.price);
   const bias = String(t.bias || "neutral").toLowerCase();
   const biasUp = bias.toUpperCase();
+
+  const anomalyCtx = getAnomalyEventFields(t.symbol);
+  t.ctx = {
+    ...(t.ctx || {}),
+    anomalyTf: anomalyCtx.anomaly_tf || "",
+    anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
+    anomalyPattern: anomalyCtx.anomaly_pattern || "",
+  };
+
   const confidenceMeta = computeConfidence(t);
   const confidence = confidenceMeta.finalConfidence;
   const execReasonLc = String(t?.execReason || "").toLowerCase();
