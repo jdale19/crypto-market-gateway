@@ -2966,18 +2966,39 @@ async function evaluateCandidate({
 
     const { minRangePct } = getModeCfg(mode);
     const rPct = rangePct1h({ levels, price: item.price });
+    const deferRangeFloorForSwingShort = mode === "swing" && bias === "short";
 
     if (!force && Number.isFinite(minRangePct) && minRangePct > 0) {
       if (!Number.isFinite(rPct) || rPct < minRangePct) {
-        if (debug) skipped.push({
-          symbol,
-          mode,
-          reason: "range_floor",
-          detail: { rangePct1h: rPct, minRangePct },
-        });
-        lastReject = { reason: "range_floor", mode, bias, detail: { rangePct1h: rPct, minRangePct } };
-        candidate = { ...candidate, rejectionReason: "range_floor" };
-        continue;
+        if (deferRangeFloorForSwingShort) {
+          if (debug) skipped.push({
+            symbol,
+            mode,
+            reason: "range_floor_deferred",
+            detail: { rangePct1h: rPct, minRangePct },
+          });
+          candidate = {
+            ...candidate,
+            ctx: {
+              ...(candidate.ctx || {}),
+              deferredRangeFloor: {
+                hit: true,
+                rangePct1h: rPct,
+                minRangePct,
+              },
+            },
+          };
+        } else {
+          if (debug) skipped.push({
+            symbol,
+            mode,
+            reason: "range_floor",
+            detail: { rangePct1h: rPct, minRangePct },
+          });
+          lastReject = { reason: "range_floor", mode, bias, detail: { rangePct1h: rPct, minRangePct } };
+          candidate = { ...candidate, rejectionReason: "range_floor" };
+          continue;
+        }
       }
     }
 
@@ -3385,6 +3406,50 @@ if (tpPick && (!rrInfo || rrInfo.rr < CFG.minRR)) {
       isRejected = true;
     } else {
       continue;
+    }
+  }
+}
+  const deferredRangeFloor = t?.ctx?.deferredRangeFloor;
+const shouldApplyDeferredRangeFloor =
+  !force &&
+  mode === "swing" &&
+  bias === "short" &&
+  !!deferredRangeFloor?.hit;
+
+if (shouldApplyDeferredRangeFloor) {
+  const onlyHadLocal1hTarget = tpTf === "1h";
+  const stillFailsCompletedTrade =
+    !tpPick ||
+    !rrInfo ||
+    rrInfo.rr < CFG.minRR ||
+    onlyHadLocal1hTarget;
+
+  if (stillFailsCompletedTrade) {
+    skipped.push({
+      symbol: t.symbol,
+      mode,
+      reason: "range_floor",
+      detail: {
+        rangePct1h: deferredRangeFloor?.rangePct1h ?? null,
+        minRangePct: deferredRangeFloor?.minRangePct ?? null,
+        tpTf: tpTf || "",
+        rr: rrInfo?.rr ?? null,
+        rewardPct: rrInfo?.rewardPct ?? null,
+        riskPct: rrInfo?.riskPct ?? null,
+        entryPrice: price,
+        stopLossPx,
+        tp: tp ?? null,
+      },
+    });
+
+    lateRejectionReasons.push("range_floor");
+    if (!isRejected) {
+      if (isRandom) {
+        rejectionReason = "range_floor";
+        isRejected = true;
+      } else {
+        continue;
+      }
     }
   }
 }
