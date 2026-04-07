@@ -1622,27 +1622,14 @@ function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item, dynamicRi
 /**
  * CONFIDENCE ENGINE (rule-based, mechanical)
  *
- * A:
- *  - B1 zone strong
- *  - 5m reversal confirmed
- *  - 15m OI aligned (we interpret this mechanically as 15m "lean" aligned)
- *  - 1h lean aligned
- *
- * B:
- *  - B1 zone strong
- *  - 5m reversal confirmed
- *  - OI neutral
- *
- * C:
- *  - Breakout-only entry
- *  - Weak OI
- *  - Counter 1h lean
- *
- * No subjective scoring.
- * No string-parsing vibes.
- * Only execReason + ctx fields.
+ * Goals for swing confidence:
+ * - reversal long > continuation long
+ * - liquidity-snap reversal long > generic reversal long
+ * - supportive external context can still upgrade, but does not create A continuation longs
+ * - do not assume the same ladder should be symmetric for shorts
  */
 function computeConfidenceBase(t) {
+  const mode = String(t?.mode || "").toLowerCase();
   const bias = String(t?.bias || "").toLowerCase();
   const b1Strong = !!t?.b1?.strong;
 
@@ -1656,6 +1643,7 @@ function computeConfidenceBase(t) {
     execReason.includes("wick_spike_reject") ||
     execReason.includes("liquidity_snap_reversal");
 
+  const liquiditySnap = execReason.includes("liquidity_snap_reversal");
   const wickDriven = execReason.includes("wick");
 
   const flowPersists =
@@ -1687,7 +1675,7 @@ function computeConfidenceBase(t) {
   const oneHourAligned = lean1h === bias;
   const counter1hLean = lean1h && lean1h !== "neutral" && !oneHourAligned;
 
-    const wickMeta = t?.ctx?.wickMeta || {};
+  const wickMeta = t?.ctx?.wickMeta || {};
   const wickStrong = !!wickMeta?.strong;
   const wickExtreme = !!wickMeta?.extreme;
 
@@ -1699,19 +1687,27 @@ function computeConfidenceBase(t) {
     bottomingScore >= CFG.bottoming.scoreMin;
 
   const continuationOnly = flowPersists && !b1Strong && !reversalConfirmed;
-
   const shortBottomingPenalty =
     bias === "short" &&
     continuationOnly &&
     strongBottoming;
 
+  const swingLongReversal = mode === "swing" && bias === "long" && reversalConfirmed;
+
   if (shortBottomingPenalty) return "C";
+
   if (bias === "long" && b1Strong && reversalConfirmed && oiAligned && (oneHourAligned || strongBottoming)) return "A";
-  if (continuationOnly && oiAligned && oneHourAligned) return "C";
-  if (continuationOnly && (oiAligned || oneHourAligned)) return "C";
   if (b1Strong && wickDriven && wickExtreme && oiAligned && oneHourAligned) return "A";
   if (b1Strong && wickDriven && wickStrong && oiAligned) return "A";
   if (b1Strong && reversalConfirmed && oiAligned && oneHourAligned) return "A";
+
+  if (swingLongReversal && liquiditySnap && oiAligned && (oneHourAligned || b1Strong || strongBottoming)) return "B";
+  if (swingLongReversal && oiAligned && (oneHourAligned || wickStrong || strongBottoming)) return "B";
+  if (swingLongReversal && !counter1hLean && (oiAligned || oneHourAligned)) return "B";
+
+  if (continuationOnly && oiAligned && oneHourAligned) return "C";
+  if (continuationOnly && (oiAligned || oneHourAligned)) return "C";
+
   if (b1Strong && wickDriven && wickStrong && oiNeutral) return "B";
   if (b1Strong && reversalConfirmed && oiNeutral) return "B";
   if (breakoutOnly || oiWeak || counter1hLean) return "C";
@@ -1784,10 +1780,10 @@ function computeConfidence(t) {
   let adjustedScore = Number((baseScore + extAdj).toFixed(2));
 
   if (mode === "swing" && bias === "long" && liquiditySnap) {
-  adjustedScore += 0.5;
-} else if (mode === "swing" && bias === "long" && reversalConfirmed) {
-  adjustedScore += 0.25;
-}
+    adjustedScore += 0.75;
+  } else if (mode === "swing" && bias === "long" && reversalConfirmed) {
+    adjustedScore += 0.25;
+  }
 
   if (shortContinuationStyle && Number.isFinite(anomalyOiPct) && anomalyOiPct >= 0) {
     adjustedScore -= 0.5;
