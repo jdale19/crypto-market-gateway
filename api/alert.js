@@ -3125,6 +3125,13 @@ async function evaluateCandidate({
       bottoming: execBottoming,
     });
 
+    if (candidate?.ctx) {
+      winner.ctx = {
+        ...(winner.ctx || {}),
+        ...candidate.ctx,
+      };
+    }
+
     break;
   }
 
