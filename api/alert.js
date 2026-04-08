@@ -3554,6 +3554,12 @@ if (!isRandom) {
   if (CFG.extContext.enabled) {
     lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
   }
+    lines.push(
+    `BTC Tape = ${String(btcTapeContext?.tapeState || "neutral")} | ` +
+    `BTC 30m = ${fmtPct(btcTapeContext?.price30mPct)} | ` +
+    `BTC OI 30m = ${fmtPct(btcTapeContext?.oi30mPct)} | ` +
+    `Funding = ${fmtPct(btcTapeContext?.funding, 4)}`
+  );
   lines.push(
     `Risk = ${lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct}% ` +
     `(base ${lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct}%, ` +
