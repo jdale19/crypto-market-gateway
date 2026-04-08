@@ -1131,6 +1131,68 @@ async function getRecentSeriesPoints(instId, n) {
   const raw = await redis.lrange(CFG.keys.series5m(instId), -Math.max(1, n), -1);
   return (raw || []).map(safeJsonParse).filter(Boolean);
 }
+function btcInstIdFromSymbol(symbol = "BTCUSDT") {
+  const sym = String(symbol || "BTCUSDT").toUpperCase();
+  if (sym.endsWith("USDT") && sym.length > 4) {
+    return `${sym.slice(0, -4)}-USDT-SWAP`;
+  }
+  return "BTC-USDT-SWAP";
+}
+
+function pctChangeFromValues(first, last) {
+  if (!Number.isFinite(first) || !Number.isFinite(last) || first <= 0) return null;
+  return ((last - first) / first) * 100;
+}
+
+async function loadBtcTapeContext(instId) {
+  const out = {
+    ok: false,
+    reason: "warmup",
+    instId: instId || "",
+    price30mPct: null,
+    price60mPct: null,
+    oi30mPct: null,
+    oi60mPct: null,
+    funding: null,
+    funding30mAvg: null,
+    tapeState: "neutral",
+  };
+
+  if (!instId) {
+    out.reason = "missing_instid";
+    return out;
+  }
+
+  const pts = await getRecentSeriesPoints(instId, 13);
+  if (!Array.isArray(pts) || pts.length < 7) {
+    out.reason = "warmup";
+    return out;
+  }
+
+  const latest = pts[pts.length - 1] || {};
+  const latestPrice = asNum(latest?.p);
+  const latestOi = asNum(latest?.oi);
+  const fundingNow = asNum(latest?.fr);
+
+  const point6 = pts.length >= 7 ? pts[pts.length - 7] : null;
+  const point12 = pts.length >= 13 ? pts[pts.length - 13] : null;
+
+  out.price30mPct = pctChangeFromValues(asNum(point6?.p), latestPrice);
+  out.price60mPct = pctChangeFromValues(asNum(point12?.p), latestPrice);
+  out.oi30mPct = pctChangeFromValues(asNum(point6?.oi), latestOi);
+  out.oi60mPct = pctChangeFromValues(asNum(point12?.oi), latestOi);
+  out.funding = fundingNow;
+  out.funding30mAvg = avg(pts.slice(-6).map((p) => asNum(p?.fr)));
+
+  if (Number.isFinite(out.funding) && Number.isFinite(out.price30mPct)) {
+    if (out.funding > 0 && out.price30mPct > 0) out.tapeState = "short_hostile";
+    else if (out.funding < 0 && out.price30mPct < 0) out.tapeState = "long_hostile";
+  }
+
+  out.ok = true;
+  out.reason = "ok";
+  return out;
+}
 
 function wickPct(point, bias) {
   const h = asNum(point?.h ?? point?.p);
@@ -2770,6 +2832,11 @@ module.exports = async function handler(req, res) {
 const deployInfo = getDeployInfo();
 const cooldownMs = CFG.cooldownMinutes * 60000;
 const externalContext = await loadExternalContext();
+const btcTapeInstId =
+  (j.results || []).find(
+    (it) => String(it?.symbol || "").toUpperCase() === String(CFG.macro.btcSymbol || "BTCUSDT").toUpperCase()
+  )?.instId || btcInstIdFromSymbol(CFG.macro.btcSymbol);
+const btcTapeContext = await loadBtcTapeContext(btcTapeInstId);
 const anomalyRanking = buildCrossAssetAnomaly({
   items: j.results || [],
 });
@@ -2880,6 +2947,13 @@ async function evaluateCandidate({
         externalContextReason: String(externalContext?.reason || ""),
         coinDayPct: externalContext?.coinDayPct ?? null,
         vixDayPct: externalContext?.vixDayPct ?? null,
+        btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
+        btc5mPrice60mPct: btcTapeContext?.price60mPct ?? null,
+        btc5mOi30mPct: btcTapeContext?.oi30mPct ?? null,
+        btc5mOi60mPct: btcTapeContext?.oi60mPct ?? null,
+        btc5mFunding: btcTapeContext?.funding ?? null,
+        btc5mFunding30mAvg: btcTapeContext?.funding30mAvg ?? null,
+        btcTapeState: String(btcTapeContext?.tapeState || "neutral"),
       },
     };
   }
@@ -3563,6 +3637,13 @@ observation_type: observationType,
 ext_context_reason: t?.ctx?.externalContextReason || "",
 coin_day_pct: t?.ctx?.coinDayPct ?? "",
 vix_day_pct: t?.ctx?.vixDayPct ?? "",
+btc_5m_price_30m_pct: t?.ctx?.btc5mPrice30mPct ?? "",
+btc_5m_price_60m_pct: t?.ctx?.btc5mPrice60mPct ?? "",
+btc_5m_oi_30m_pct: t?.ctx?.btc5mOi30mPct ?? "",
+btc_5m_oi_60m_pct: t?.ctx?.btc5mOi60mPct ?? "",
+btc_5m_funding: t?.ctx?.btc5mFunding ?? "",
+btc_5m_funding_30m_avg: t?.ctx?.btc5mFunding30mAvg ?? "",
+btc_tape_state: t?.ctx?.btcTapeState || "",
 bottoming_triggered: !!t?.ctx?.bottoming?.triggered,
 bottoming_score: t?.ctx?.bottoming?.score ?? "",
 bottoming_reasons: Array.isArray(t?.ctx?.bottoming?.reasons) ? t.ctx.bottoming.reasons.join(",") : "",
