@@ -1149,11 +1149,17 @@ async function loadBtcTapeContext(instId) {
     ok: false,
     reason: "warmup",
     instId: instId || "",
+    price5mPct: null,
+    price15mPct: null,
     price30mPct: null,
     price60mPct: null,
+    oi5mPct: null,
+    oi15mPct: null,
     oi30mPct: null,
     oi60mPct: null,
     funding: null,
+    funding5mAvg: null,
+    funding15mAvg: null,
     funding30mAvg: null,
     tapeState: "neutral",
   };
@@ -1174,14 +1180,24 @@ async function loadBtcTapeContext(instId) {
   const latestOi = asNum(latest?.oi);
   const fundingNow = asNum(latest?.fr);
 
+  const point1 = pts.length >= 2 ? pts[pts.length - 2] : null;
+  const point3 = pts.length >= 4 ? pts[pts.length - 4] : null;
   const point6 = pts.length >= 7 ? pts[pts.length - 7] : null;
   const point12 = pts.length >= 13 ? pts[pts.length - 13] : null;
 
+  out.price5mPct = pctChangeFromValues(asNum(point1?.p), latestPrice);
+  out.price15mPct = pctChangeFromValues(asNum(point3?.p), latestPrice);
   out.price30mPct = pctChangeFromValues(asNum(point6?.p), latestPrice);
   out.price60mPct = pctChangeFromValues(asNum(point12?.p), latestPrice);
+
+  out.oi5mPct = pctChangeFromValues(asNum(point1?.oi), latestOi);
+  out.oi15mPct = pctChangeFromValues(asNum(point3?.oi), latestOi);
   out.oi30mPct = pctChangeFromValues(asNum(point6?.oi), latestOi);
   out.oi60mPct = pctChangeFromValues(asNum(point12?.oi), latestOi);
+
   out.funding = fundingNow;
+  out.funding5mAvg = avg(pts.slice(-1).map((p) => asNum(p?.fr)));
+  out.funding15mAvg = avg(pts.slice(-3).map((p) => asNum(p?.fr)));
   out.funding30mAvg = avg(pts.slice(-6).map((p) => asNum(p?.fr)));
 
   if (Number.isFinite(out.funding) && Number.isFinite(out.price30mPct)) {
@@ -2947,11 +2963,17 @@ async function evaluateCandidate({
         externalContextReason: String(externalContext?.reason || ""),
         coinDayPct: externalContext?.coinDayPct ?? null,
         vixDayPct: externalContext?.vixDayPct ?? null,
+        btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
+        btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
         btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
         btc5mPrice60mPct: btcTapeContext?.price60mPct ?? null,
+        btc5mOi5mPct: btcTapeContext?.oi5mPct ?? null,
+        btc5mOi15mPct: btcTapeContext?.oi15mPct ?? null,
         btc5mOi30mPct: btcTapeContext?.oi30mPct ?? null,
         btc5mOi60mPct: btcTapeContext?.oi60mPct ?? null,
         btc5mFunding: btcTapeContext?.funding ?? null,
+        btc5mFunding5mAvg: btcTapeContext?.funding5mAvg ?? null,
+        btc5mFunding15mAvg: btcTapeContext?.funding15mAvg ?? null,
         btc5mFunding30mAvg: btcTapeContext?.funding30mAvg ?? null,
         btcTapeState: String(btcTapeContext?.tapeState || "neutral"),
       },
@@ -3643,11 +3665,17 @@ observation_type: observationType,
 ext_context_reason: t?.ctx?.externalContextReason || "",
 coin_day_pct: t?.ctx?.coinDayPct ?? "",
 vix_day_pct: t?.ctx?.vixDayPct ?? "",
+btc_5m_price_5m_pct: t?.ctx?.btc5mPrice5mPct ?? "",
+btc_5m_price_15m_pct: t?.ctx?.btc5mPrice15mPct ?? "",
 btc_5m_price_30m_pct: t?.ctx?.btc5mPrice30mPct ?? "",
 btc_5m_price_60m_pct: t?.ctx?.btc5mPrice60mPct ?? "",
+btc_5m_oi_5m_pct: t?.ctx?.btc5mOi5mPct ?? "",
+btc_5m_oi_15m_pct: t?.ctx?.btc5mOi15mPct ?? "",
 btc_5m_oi_30m_pct: t?.ctx?.btc5mOi30mPct ?? "",
 btc_5m_oi_60m_pct: t?.ctx?.btc5mOi60mPct ?? "",
 btc_5m_funding: t?.ctx?.btc5mFunding ?? "",
+btc_5m_funding_5m_avg: t?.ctx?.btc5mFunding5mAvg ?? "",
+btc_5m_funding_15m_avg: t?.ctx?.btc5mFunding15mAvg ?? "",
 btc_5m_funding_30m_avg: t?.ctx?.btc5mFunding30mAvg ?? "",
 btc_tape_state: t?.ctx?.btcTapeState || "",
 bottoming_triggered: !!t?.ctx?.bottoming?.triggered,
@@ -3760,11 +3788,17 @@ const telegramRowFields = [
   "ext_context_reason",
   "coin_day_pct",
   "vix_day_pct",
+  "btc_5m_price_5m_pct",
+  "btc_5m_price_15m_pct",
   "btc_5m_price_30m_pct",
   "btc_5m_price_60m_pct",
+  "btc_5m_oi_5m_pct",
+  "btc_5m_oi_15m_pct",
   "btc_5m_oi_30m_pct",
   "btc_5m_oi_60m_pct",
   "btc_5m_funding",
+  "btc_5m_funding_5m_avg",
+  "btc_5m_funding_15m_avg",
   "btc_5m_funding_30m_avg",
   "btc_tape_state",
   "bottoming_triggered",
