@@ -160,12 +160,25 @@ minRangePctByMode: {
 
   extContext: {
     enabled: String(process.env.ALERT_EXT_CONTEXT_ENABLED || "0") === "1",
+    useRawFieldsLive: String(process.env.ALERT_EXT_CONTEXT_USE_RAW_FIELDS_LIVE || "1") === "1",
     swingWeight: Number(process.env.ALERT_EXT_CONTEXT_SWING_WEIGHT || 1),
     scalpWeight: Number(process.env.ALERT_EXT_CONTEXT_SCALP_WEIGHT || 0.5),
     buildWeight: Number(process.env.ALERT_EXT_CONTEXT_BUILD_WEIGHT || 0.25),
     timeoutMs: Number(process.env.ALERT_EXT_CONTEXT_TIMEOUT_MS || 4000),
     coinUrl: String(process.env.ALERT_EXT_CONTEXT_COIN_URL || "https://stooq.com/q/l/?s=coin.us&i=d"),
     vixUrl: String(process.env.ALERT_EXT_CONTEXT_VIX_URL || "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"),
+    dxyUrl: String(process.env.ALERT_EXT_CONTEXT_DXY_URL || ""),
+    qqqUrl: String(process.env.ALERT_EXT_CONTEXT_QQQ_URL || ""),
+    spxUrl: String(process.env.ALERT_EXT_CONTEXT_SPX_URL || ""),
+    us2yUrl: String(process.env.ALERT_EXT_CONTEXT_US2Y_URL || ""),
+    metricWeights: {
+      coin: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_COIN || 1.0),
+      vix: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_VIX || 1.0),
+      dxy: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_DXY || 0.7),
+      qqq: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_QQQ || 0.8),
+      spx: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_SPX || 0.6),
+      us2y: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_US2Y || 0.6),
+    },
   },
   
   anomaly: {
@@ -542,12 +555,51 @@ function parseFredDailyPct(text) {
   return computePctChange(vals[vals.length - 1], vals[vals.length - 2]);
 }
 
+function parseFredLatestDelta(text) {
+  const lines = String(text || "").trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 3) throw new Error("fred_rows_missing");
+
+  const vals = [];
+  for (const line of lines.slice(1)) {
+    const parts = line.split(",");
+    const raw = parts[1];
+    if (raw == null || raw === ".") continue;
+    const n = Number(raw);
+    if (Number.isFinite(n)) vals.push(n);
+  }
+
+  if (vals.length < 2) throw new Error("fred_values_missing");
+  return vals[vals.length - 1] - vals[vals.length - 2];
+}
+
+function computeDerivedExternalBias({ coinDayPct, vixDayPct }) {
+  if (Number.isFinite(coinDayPct) && Number.isFinite(vixDayPct)) {
+    if (coinDayPct > 0 && vixDayPct < 0) return "supportive";
+    if (coinDayPct < 0 && vixDayPct > 0) return "defensive";
+  }
+  return "neutral";
+}
+
+function metricFailureReason(label, res) {
+  if (!res) return `${label}_missing`;
+  if (res.status === "rejected") {
+    return res.reason?.name === "AbortError"
+      ? `${label}_timeout`
+      : `${label}_${res.reason?.message || "fetch_failed"}`;
+  }
+  return `${label}_non_finite`;
+}
+
 async function loadExternalContext() {
   const out = {
     ok: false,
     bias: "neutral",
     coinDayPct: null,
     vixDayPct: null,
+    dxyDayPct: null,
+    qqqDayPct: null,
+    spxDayPct: null,
+    us2yDelta: null,
     reason: null,
   };
 
@@ -556,52 +608,51 @@ async function loadExternalContext() {
     return out;
   }
 
-  const [coinRes, vixRes] = await Promise.allSettled([
-    fetchTextWithTimeout(CFG.extContext.coinUrl, CFG.extContext.timeoutMs).then(parseStooqDayPct),
-    fetchTextWithTimeout(CFG.extContext.vixUrl, CFG.extContext.timeoutMs).then(parseFredDailyPct),
-  ]);
+  const tasks = [
+    ["coin", CFG.extContext.coinUrl, parseStooqDayPct],
+    ["vix", CFG.extContext.vixUrl, parseFredDailyPct],
+    ["dxy", CFG.extContext.dxyUrl, parseStooqDayPct],
+    ["qqq", CFG.extContext.qqqUrl, parseStooqDayPct],
+    ["spx", CFG.extContext.spxUrl, parseStooqDayPct],
+    ["us2y", CFG.extContext.us2yUrl, parseFredLatestDelta],
+  ];
 
-  if (coinRes.status === "fulfilled" && Number.isFinite(coinRes.value)) {
-    out.coinDayPct = coinRes.value;
-  }
+  const settled = await Promise.allSettled(
+    tasks.map(([_, url, parser]) => {
+      if (!String(url || "").trim()) return Promise.resolve(null);
+      return fetchTextWithTimeout(url, CFG.extContext.timeoutMs).then(parser);
+    })
+  );
 
-  if (vixRes.status === "fulfilled" && Number.isFinite(vixRes.value)) {
-    out.vixDayPct = vixRes.value;
-  }
+  const metricMap = Object.fromEntries(tasks.map(([label], idx) => [label, settled[idx]]));
+
+  const coinRes = metricMap.coin;
+  const vixRes = metricMap.vix;
+  const dxyRes = metricMap.dxy;
+  const qqqRes = metricMap.qqq;
+  const spxRes = metricMap.spx;
+  const us2yRes = metricMap.us2y;
+
+  if (coinRes?.status === "fulfilled" && Number.isFinite(coinRes.value)) out.coinDayPct = coinRes.value;
+  if (vixRes?.status === "fulfilled" && Number.isFinite(vixRes.value)) out.vixDayPct = vixRes.value;
+  if (dxyRes?.status === "fulfilled" && Number.isFinite(dxyRes.value)) out.dxyDayPct = dxyRes.value;
+  if (qqqRes?.status === "fulfilled" && Number.isFinite(qqqRes.value)) out.qqqDayPct = qqqRes.value;
+  if (spxRes?.status === "fulfilled" && Number.isFinite(spxRes.value)) out.spxDayPct = spxRes.value;
+  if (us2yRes?.status === "fulfilled" && Number.isFinite(us2yRes.value)) out.us2yDelta = us2yRes.value;
 
   const reasons = [];
+  if (!Number.isFinite(out.coinDayPct)) reasons.push(metricFailureReason("coin", coinRes));
+  if (!Number.isFinite(out.vixDayPct)) reasons.push(metricFailureReason("vix", vixRes));
+  if (String(CFG.extContext.dxyUrl || "").trim() && !Number.isFinite(out.dxyDayPct)) reasons.push(metricFailureReason("dxy", dxyRes));
+  if (String(CFG.extContext.qqqUrl || "").trim() && !Number.isFinite(out.qqqDayPct)) reasons.push(metricFailureReason("qqq", qqqRes));
+  if (String(CFG.extContext.spxUrl || "").trim() && !Number.isFinite(out.spxDayPct)) reasons.push(metricFailureReason("spx", spxRes));
+  if (String(CFG.extContext.us2yUrl || "").trim() && !Number.isFinite(out.us2yDelta)) reasons.push(metricFailureReason("us2y", us2yRes));
 
-  if (!Number.isFinite(out.coinDayPct)) {
-    if (coinRes.status === "rejected") {
-      reasons.push(
-        coinRes.reason?.name === "AbortError"
-          ? "coin_timeout"
-          : `coin_${coinRes.reason?.message || "fetch_failed"}`
-      );
-    } else {
-      reasons.push("coin_non_finite");
-    }
-  }
-
-  if (!Number.isFinite(out.vixDayPct)) {
-    if (vixRes.status === "rejected") {
-      reasons.push(
-        vixRes.reason?.name === "AbortError"
-          ? "vix_timeout"
-          : `vix_${vixRes.reason?.message || "fetch_failed"}`
-      );
-    } else {
-      reasons.push("vix_non_finite");
-    }
-  }
+  out.bias = computeDerivedExternalBias(out);
 
   if (Number.isFinite(out.coinDayPct) && Number.isFinite(out.vixDayPct)) {
-    if (out.coinDayPct > 0 && out.vixDayPct < 0) out.bias = "supportive";
-    else if (out.coinDayPct < 0 && out.vixDayPct > 0) out.bias = "defensive";
-    else out.bias = "neutral";
-
     out.ok = true;
-    out.reason = "ok";
+    out.reason = reasons.length ? `ok|${reasons.join("|")}` : "ok";
     return out;
   }
 
@@ -749,31 +800,65 @@ function buildCrossAssetAnomaly({
     ranking,
   };
 }
-function getExternalContextAdj({ mode, side, bias })
-{
+function getExternalWeightForMode(mode) {
   const m = String(mode || "").toLowerCase();
-  const s = String(side || "").toLowerCase();
-  const b = String(bias || "neutral").toLowerCase();
-
-  const weight =
+  return (
     m === "swing" ? CFG.extContext.swingWeight :
     m === "scalp" ? CFG.extContext.scalpWeight :
     m === "build" ? CFG.extContext.buildWeight :
-    0;
+    0
+  );
+}
 
-  if (!Number.isFinite(weight) || weight === 0) return 0;
+function metricAlignmentFromValue(value, side, polarity = "risk_on") {
+  if (!Number.isFinite(value)) return null;
+  if (value === 0) return 0;
 
-  if (b === "supportive") {
-    if (s === "long") return weight;
-    if (s === "short") return -weight;
-  }
+  const sign = value > 0 ? 1 : -1;
+  const longAligned = polarity === "risk_on" ? sign : -sign;
+  return String(side || "").toLowerCase() === "long" ? longAligned : -longAligned;
+}
 
-  if (b === "defensive") {
-    if (s === "short") return weight;
-    if (s === "long") return -weight;
-  }
+function getExternalContextComponents({ side, ctx = {} }) {
+  const weights = CFG.extContext.metricWeights || {};
+  const out = [];
 
-  return 0;
+  const pushMetric = (key, value, weight, polarity) => {
+    const align = metricAlignmentFromValue(value, side, polarity);
+    if (align == null || !Number.isFinite(weight) || weight <= 0) return;
+    out.push({ key, value, weight, align });
+  };
+
+  pushMetric("coin", asNum(ctx?.coinDayPct), weights.coin, "risk_on");
+  pushMetric("vix", asNum(ctx?.vixDayPct), weights.vix, "risk_off");
+  pushMetric("dxy", asNum(ctx?.dxyDayPct), weights.dxy, "risk_off");
+  pushMetric("qqq", asNum(ctx?.qqqDayPct), weights.qqq, "risk_on");
+  pushMetric("spx", asNum(ctx?.spxDayPct), weights.spx, "risk_on");
+  pushMetric("us2y", asNum(ctx?.us2yDelta), weights.us2y, "risk_off");
+
+  return out;
+}
+
+function getExternalContextAdj({ mode, side, ctx = {} }) {
+  if (!CFG.extContext?.enabled || !CFG.extContext?.useRawFieldsLive) return 0;
+
+  const modeWeight = getExternalWeightForMode(mode);
+  if (!Number.isFinite(modeWeight) || modeWeight <= 0) return 0;
+
+  const components = getExternalContextComponents({ side, ctx });
+  if (!components.length) return 0;
+
+  const totalWeight = components.reduce((sum, item) => sum + item.weight, 0);
+  if (!(totalWeight > 0)) return 0;
+
+  const weighted = components.reduce((sum, item) => sum + item.align * item.weight, 0) / totalWeight;
+  return Number((Math.max(-1, Math.min(1, weighted)) * modeWeight).toFixed(2));
+}
+
+function getExternalContextComponentSummary({ side, ctx = {} }) {
+  return getExternalContextComponents({ side, ctx })
+    .map((item) => `${item.key}:${item.align > 0 ? "+" : item.align < 0 ? "-" : "0"}`)
+    .join(",");
 }
 
 function computeRiskReward({ entryPrice, stopLossPx, tp }) {
@@ -1700,18 +1785,16 @@ function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item, dynamicRi
 /**
  * CONFIDENCE ENGINE (rule-based, mechanical)
  *
- * Goals for swing confidence:
- * - reversal long > continuation long
- * - liquidity-snap reversal long > generic reversal long
- * - supportive external context can still upgrade, but does not create A continuation longs
- * - do not assume the same ladder should be symmetric for shorts
+ * Architecture:
+ * - selectors decide whether an archetype is allowed to fire
+ * - modifiers shape score only after a selector is valid
+ * - raw external fields are live; derived external bias is explainability-only
  */
-function computeConfidenceBase(t) {
+function getTradeProfile(t) {
   const mode = String(t?.mode || "").toLowerCase();
   const bias = String(t?.bias || "").toLowerCase();
-  const b1Strong = !!t?.b1?.strong;
-
   const execReason = String(t?.execReason || "").toLowerCase();
+  const b1Strong = !!t?.b1?.strong;
 
   const reversalConfirmed =
     execReason.includes("b1_reversal") ||
@@ -1723,33 +1806,29 @@ function computeConfidenceBase(t) {
 
   const liquiditySnap = execReason.includes("liquidity_snap_reversal");
   const wickDriven = execReason.includes("wick");
-
   const flowPersists =
     execReason.includes("flow_persists_long") ||
     execReason.includes("flow_persists_short") ||
     execReason.includes("flow_persists");
 
-  const breakoutOnly =
-    execReason.includes("break_above") ||
-    execReason.includes("break_below") ||
-    execReason.includes("breakout") ||
-    execReason.includes("breakdown") ||
+  const pureBreakoutOnly =
+    execReason.includes("break_above_") ||
+    execReason.includes("break_below_");
+
+  const structuredBreakout =
     execReason.includes("ignition_breakout") ||
     execReason.includes("slow_leverage_squeeze") ||
     execReason.includes("slow_short_breakdown");
 
   const lean15m = String(t?.ctx?.lean15m || "").toLowerCase();
-  const oiAligned = lean15m === bias;
-
+  const lean1h = String(t?.ctx?.lean1h || "").toLowerCase();
   const oi15 = asNum(t?.ctx?.oi15);
+  const oiAligned = lean15m === bias;
   const oiNeutral =
     lean15m === "neutral" ||
     lean15m === "" ||
     (Number.isFinite(oi15) && Math.abs(oi15) < CFG.shockOi15mPct);
-
   const oiWeak = !oiAligned && !oiNeutral;
-
-  const lean1h = String(t?.ctx?.lean1h || "").toLowerCase();
   const oneHourAligned = lean1h === bias;
   const counter1hLean = lean1h && lean1h !== "neutral" && !oneHourAligned;
 
@@ -1764,31 +1843,123 @@ function computeConfidenceBase(t) {
     Number.isFinite(bottomingScore) &&
     bottomingScore >= CFG.bottoming.scoreMin;
 
-  const continuationOnly = flowPersists && !b1Strong && !reversalConfirmed;
-  const shortBottomingPenalty =
-    bias === "short" &&
-    continuationOnly &&
-    strongBottoming;
+  const externalRawScore = Number(t?.ctx?.externalContextAdj || 0) || 0;
+  const btcTapeState = String(t?.ctx?.btcTapeState || "neutral").toLowerCase();
+  const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
+  const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
 
-  const swingLongReversal = mode === "swing" && bias === "long" && reversalConfirmed;
+  return {
+    mode,
+    bias,
+    execReason,
+    b1Strong,
+    reversalConfirmed,
+    liquiditySnap,
+    wickDriven,
+    flowPersists,
+    pureBreakoutOnly,
+    structuredBreakout,
+    lean15m,
+    lean1h,
+    oi15,
+    oiAligned,
+    oiNeutral,
+    oiWeak,
+    oneHourAligned,
+    counter1hLean,
+    wickStrong,
+    wickExtreme,
+    strongBottoming,
+    externalRawScore,
+    btcTapeState,
+    anomalyPattern,
+    anomalyOiPct,
+  };
+}
 
-  if (shortBottomingPenalty) return "C";
+function classifySelectorFamily(profile) {
+  const p = profile || {};
+  if (p.mode === "swing" && p.bias === "long" && p.liquiditySnap) return "swing_long_liquidity_snap";
+  if (p.mode === "swing" && p.bias === "long" && p.reversalConfirmed) return "swing_long_reversal";
+  if (p.mode === "swing" && p.bias === "long" && p.flowPersists) return "swing_long_flow_persists";
+  if (p.mode === "swing" && p.bias === "short" && p.flowPersists) return "swing_short_flow_persists";
+  if (p.mode === "swing" && p.bias === "short" && p.structuredBreakout) return "swing_short_continuation";
+  if (p.mode === "swing" && p.bias === "short" && p.reversalConfirmed) return "swing_short_reversal";
+  if (p.pureBreakoutOnly) return "pure_breakout_only";
+  if (p.structuredBreakout) return "structured_breakout";
+  return "generic";
+}
 
-  if (bias === "long" && b1Strong && reversalConfirmed && oiAligned && (oneHourAligned || strongBottoming)) return "A";
-  if (b1Strong && wickDriven && wickExtreme && oiAligned && oneHourAligned) return "A";
-  if (b1Strong && wickDriven && wickStrong && oiAligned) return "A";
-  if (b1Strong && reversalConfirmed && oiAligned && oneHourAligned) return "A";
+function evaluateSelectorPolicy(t) {
+  const profile = getTradeProfile(t);
+  const family = classifySelectorFamily(profile);
+  const reasons = [];
 
-  if (swingLongReversal && liquiditySnap && oiAligned && (oneHourAligned || b1Strong || strongBottoming)) return "B";
-  if (swingLongReversal && oiAligned && (oneHourAligned || wickStrong || strongBottoming)) return "B";
-  if (swingLongReversal && !counter1hLean && (oiAligned || oneHourAligned)) return "B";
+  if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed && !profile.flowPersists && !profile.structuredBreakout) {
+    reasons.push("short_reversal_disabled");
+  }
 
-  if (continuationOnly && oiAligned && oneHourAligned) return "C";
-  if (continuationOnly && (oiAligned || oneHourAligned)) return "C";
+  if (profile.pureBreakoutOnly) {
+    reasons.push("pure_breakout_only_disabled");
+  }
 
-  if (b1Strong && wickDriven && wickStrong && oiNeutral) return "B";
-  if (b1Strong && reversalConfirmed && oiNeutral) return "B";
-  if (breakoutOnly || oiWeak || counter1hLean) return "C";
+  if (profile.mode === "swing" && profile.bias === "long" && profile.flowPersists && !profile.reversalConfirmed) {
+    if (!(profile.externalRawScore > 0)) reasons.push("flow_persists_long_needs_supportive_external");
+    if (profile.btcTapeState === "long_hostile") reasons.push("flow_persists_long_btc_hostile");
+  }
+
+  return {
+    allowed: reasons.length === 0,
+    family,
+    profile,
+    reasons,
+    reason: reasons.join("|"),
+  };
+}
+
+function getAnomalyPatternAdj(profile) {
+  const p = String(profile?.anomalyPattern || "").toLowerCase();
+  const side = String(profile?.bias || "").toLowerCase();
+  if (side === "short") {
+    if (p === "long_liq") return 0.4;
+    if (p === "short_build") return -0.35;
+    if (p === "long_build") return -0.2;
+    if (p === "short_squeeze") return 0.05;
+    return 0;
+  }
+
+  if (p === "long_liq") return 0.2;
+  if (p === "short_build") return -0.2;
+  if (p === "long_build") return -0.05;
+  if (p === "short_squeeze") return 0.05;
+  return 0;
+}
+
+function computeConfidenceBase(t) {
+  const p = getTradeProfile(t);
+
+  if (p.bias === "short" && p.flowPersists && p.strongBottoming) return "C";
+
+  if (p.mode === "swing" && p.bias === "long") {
+    if (p.liquiditySnap && p.b1Strong && p.oiAligned && p.oneHourAligned) return "A";
+    if (p.reversalConfirmed && p.b1Strong && p.oiAligned && (p.oneHourAligned || p.strongBottoming)) return "A";
+    if (p.liquiditySnap && (p.oiAligned || p.oneHourAligned)) return "B";
+    if (p.reversalConfirmed && !p.counter1hLean && (p.oiAligned || p.oneHourAligned || p.wickStrong)) return "B";
+    if ((p.flowPersists || p.structuredBreakout) && p.oiAligned && p.oneHourAligned) return "C";
+    if ((p.flowPersists || p.structuredBreakout) && (p.oiAligned || p.oneHourAligned)) return "C";
+    return "C";
+  }
+
+  if (p.mode === "swing" && p.bias === "short") {
+    if (p.reversalConfirmed) return "C";
+    if ((p.flowPersists || p.structuredBreakout) && p.oiAligned && p.oneHourAligned) return "B";
+    if ((p.flowPersists || p.structuredBreakout) && (p.oiAligned || p.oneHourAligned)) return "C";
+    return "C";
+  }
+
+  if (p.b1Strong && p.reversalConfirmed && p.oiAligned && p.oneHourAligned) return "A";
+  if (p.b1Strong && p.reversalConfirmed && (p.oiAligned || p.oneHourAligned)) return "B";
+  if ((p.flowPersists || p.structuredBreakout) && (p.oiAligned || p.oneHourAligned)) return "C";
   return "C";
 }
 
@@ -1805,88 +1976,79 @@ function confidenceLabelFromScore(score) {
 }
 
 function computeConfidence(t) {
+  const profile = getTradeProfile(t);
+  const selectorPolicy = evaluateSelectorPolicy(t);
   const baseConfidence = computeConfidenceBase(t);
+  const baseScore = confidenceScoreFromLabel(baseConfidence);
   const extAdjRaw = Number(t?.ctx?.externalContextAdj || 0);
   const extAdj = Number.isFinite(extAdjRaw) ? extAdjRaw : 0;
-  const baseScore = confidenceScoreFromLabel(baseConfidence);
+  const anomalyPatternAdj = getAnomalyPatternAdj(profile);
 
-  const mode = String(t?.mode || "").toLowerCase();
-  const bias = String(t?.bias || "").toLowerCase();
-  const execReason = String(t?.execReason || "").toLowerCase();
+  let adjustedScore = Number((baseScore + extAdj + anomalyPatternAdj).toFixed(2));
 
-  const flowPersists =
-    execReason.includes("flow_persists_long") ||
-    execReason.includes("flow_persists_short") ||
-    execReason.includes("flow_persists");
-
-  const reversalConfirmed =
-    execReason.includes("b1_reversal") ||
-    execReason.includes("wick_reclaim") ||
-    execReason.includes("wick_reject") ||
-    execReason.includes("wick_flush_reclaim") ||
-    execReason.includes("wick_spike_reject") ||
-    execReason.includes("liquidity_snap_reversal");
-
-  const liquiditySnap = execReason.includes("liquidity_snap_reversal");
-
-  const breakoutOnly =
-    execReason.includes("break_above") ||
-    execReason.includes("break_below") ||
-    execReason.includes("breakout") ||
-    execReason.includes("breakdown") ||
-    execReason.includes("ignition_breakout") ||
-    execReason.includes("slow_leverage_squeeze") ||
-    execReason.includes("slow_short_breakdown");
-
-  const b1Strong = !!t?.b1?.strong;
-  const bottoming = t?.ctx?.bottoming || {};
-  const bottomingScore = asNum(bottoming?.score);
-  const strongBottoming =
-    !!bottoming?.triggered &&
-    Number.isFinite(bottomingScore) &&
-    bottomingScore >= CFG.bottoming.shortPenaltyScoreMin;
-
-  const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
-
-  const continuationOnly = flowPersists && !b1Strong && !reversalConfirmed;
-  const shortContinuationStyle =
-    mode === "swing" &&
-    bias === "short" &&
-    !reversalConfirmed &&
-    (flowPersists || breakoutOnly);
-
-  let adjustedScore = Number((baseScore + extAdj).toFixed(2));
-
-  if (mode === "swing" && bias === "long" && liquiditySnap) {
-    adjustedScore += 0.75;
-  } else if (mode === "swing" && bias === "long" && reversalConfirmed) {
+  if (profile.mode === "swing" && profile.bias === "long" && profile.liquiditySnap) {
+    adjustedScore += 0.5;
+  } else if (profile.mode === "swing" && profile.bias === "long" && profile.reversalConfirmed) {
     adjustedScore += 0.25;
   }
 
-  if (shortContinuationStyle && Number.isFinite(anomalyOiPct) && anomalyOiPct >= 0) {
-    adjustedScore -= 0.5;
+  if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed) {
+    adjustedScore -= 0.75;
   }
 
-  const cappedContinuationScore = continuationOnly ? Math.min(adjustedScore, 2.49) : adjustedScore;
+  if (profile.mode === "swing" && profile.bias === "short" && profile.flowPersists && profile.oiAligned && profile.oneHourAligned) {
+    adjustedScore += 0.25;
+  }
 
-  const shortIntoBottoming =
-    bias === "short" &&
-    continuationOnly &&
-    strongBottoming;
+  if (profile.mode === "swing" && profile.bias === "long" && profile.flowPersists && !profile.reversalConfirmed) {
+    if (profile.externalRawScore > 0) adjustedScore += 0.25;
+    else adjustedScore -= 0.35;
+  }
 
-  const finalScore = shortIntoBottoming
-    ? Math.min(cappedContinuationScore, 1.49)
-    : cappedContinuationScore;
+  if (profile.pureBreakoutOnly) adjustedScore -= 0.5;
+  if (profile.bias === "long" && profile.btcTapeState === "long_hostile") adjustedScore -= 0.25;
+  if (profile.bias === "short" && profile.btcTapeState === "short_hostile") adjustedScore -= 0.25;
 
+  const shortContinuationStyle =
+    profile.mode === "swing" &&
+    profile.bias === "short" &&
+    !profile.reversalConfirmed &&
+    (profile.flowPersists || profile.structuredBreakout || profile.pureBreakoutOnly);
+
+  if (shortContinuationStyle && Number.isFinite(profile.anomalyOiPct) && profile.anomalyOiPct >= 0) {
+    adjustedScore -= 0.35;
+  }
+
+  if (profile.mode === "swing" && profile.bias === "long" && profile.flowPersists && !profile.reversalConfirmed) {
+    adjustedScore = Math.min(adjustedScore, 2.49);
+  }
+
+  if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed) {
+    adjustedScore = Math.min(adjustedScore, 1.49);
+  }
+
+  if (profile.bias === "short" && profile.flowPersists && profile.strongBottoming) {
+    adjustedScore = Math.min(adjustedScore, 1.49);
+  }
+
+  if (!selectorPolicy.allowed) {
+    adjustedScore = Math.min(adjustedScore, 1.49);
+  }
+
+  const finalScore = Number(adjustedScore.toFixed(2));
   const finalConfidence = confidenceLabelFromScore(finalScore);
 
   return {
     baseConfidence,
     baseScore,
     extAdj,
+    anomalyPatternAdj,
     finalScore,
     finalConfidence,
     externalBias: String(t?.ctx?.externalBias || "neutral").toLowerCase(),
+    selectorFamily: selectorPolicy.family,
+    selectorAllowed: selectorPolicy.allowed,
+    selectorReason: selectorPolicy.reason,
   };
 }
 function computeDynamicRiskBudget({ mode, t, confidence }) {
@@ -1896,48 +2058,18 @@ function computeDynamicRiskBudget({ mode, t, confidence }) {
   let score = 0;
   const reasons = [];
 
-  const execReason = String(t?.execReason || "").toLowerCase();
-  const lean1h = String(t?.ctx?.lean1h || "").toLowerCase();
-  const bias = String(t?.bias || "").toLowerCase();
-  const oneHourAligned = lean1h === bias;
-  const counter1hLean = lean1h && lean1h !== "neutral" && !oneHourAligned;
-
-  const b1Strong = !!t?.b1?.strong;
-
-  const flowPersists =
-    execReason.includes("flow_persists_long") ||
-    execReason.includes("flow_persists_short") ||
-    execReason.includes("flow_persists");
-
-  const reversalConfirmed =
-    execReason.includes("b1_reversal") ||
-    execReason.includes("wick_reclaim") ||
-    execReason.includes("wick_reject") ||
-    execReason.includes("wick_flush_reclaim") ||
-    execReason.includes("wick_spike_reject") ||
-    execReason.includes("liquidity_snap_reversal");
-
-  const liquiditySnap = execReason.includes("liquidity_snap_reversal");
-
-  const breakoutOnly =
-    execReason.includes("break_above") ||
-    execReason.includes("break_below") ||
-    execReason.includes("breakout") ||
-    execReason.includes("breakdown") ||
-    execReason.includes("ignition_breakout") ||
-    execReason.includes("slow_leverage_squeeze") ||
-    execReason.includes("slow_short_breakdown");
-
-  const wickMeta = t?.ctx?.wickMeta || {};
-  const wickStrong = !!wickMeta?.strong;
-  const wickExtreme = !!wickMeta?.extreme;
-
-    const bottoming = t?.ctx?.bottoming || {};
-  const bottomingScore = asNum(bottoming?.score);
-  const strongBottoming =
-    !!bottoming?.triggered &&
-    Number.isFinite(bottomingScore) &&
-    bottomingScore >= CFG.bottoming.shortPenaltyScoreMin;
+  const profile = getTradeProfile(t);
+  const bias = profile.bias;
+  const oneHourAligned = profile.oneHourAligned;
+  const counter1hLean = profile.counter1hLean;
+  const b1Strong = profile.b1Strong;
+  const flowPersists = profile.flowPersists;
+  const reversalConfirmed = profile.reversalConfirmed;
+  const liquiditySnap = profile.liquiditySnap;
+  const breakoutOnly = profile.pureBreakoutOnly;
+  const wickStrong = profile.wickStrong;
+  const wickExtreme = profile.wickExtreme;
+  const strongBottoming = profile.strongBottoming;
 
   const pureContinuationShort =
     bias === "short" &&
@@ -2928,7 +3060,7 @@ async function evaluateCandidate({
     const externalContextAdj = getExternalContextAdj({
       mode,
       side: bias,
-      bias: externalContext?.bias,
+      ctx: externalContext,
     });
 
     return {
@@ -2961,8 +3093,13 @@ async function evaluateCandidate({
         externalContextAdj,
         externalContextOk: !!externalContext?.ok,
         externalContextReason: String(externalContext?.reason || ""),
+        externalContextComponentSummary: getExternalContextComponentSummary({ side: bias, ctx: externalContext }),
         coinDayPct: externalContext?.coinDayPct ?? null,
         vixDayPct: externalContext?.vixDayPct ?? null,
+        dxyDayPct: externalContext?.dxyDayPct ?? null,
+        qqqDayPct: externalContext?.qqqDayPct ?? null,
+        spxDayPct: externalContext?.spxDayPct ?? null,
+        us2yDelta: externalContext?.us2yDelta ?? null,
         btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
         btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
         btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
@@ -3228,6 +3365,36 @@ async function evaluateCandidate({
       };
     }
 
+    const selectorPolicy = evaluateSelectorPolicy(winner);
+    winner.ctx = {
+      ...(winner.ctx || {}),
+      selectorFamily: selectorPolicy.family,
+      selectorAllowed: selectorPolicy.allowed,
+      selectorRejectionReason: selectorPolicy.reason,
+    };
+
+    if (!force && !selectorPolicy.allowed) {
+      if (debug) skipped.push({
+        symbol,
+        mode,
+        reason: `selector_policy:${selectorPolicy.reason}`,
+        bias,
+        detail: { family: selectorPolicy.family, reasons: selectorPolicy.reasons },
+      });
+      lastReject = {
+        reason: `selector_policy:${selectorPolicy.reason}`,
+        mode,
+        bias,
+        detail: { family: selectorPolicy.family, reasons: selectorPolicy.reasons },
+      };
+      candidate = {
+        ...winner,
+        rejectionReason: `selector_policy:${selectorPolicy.reason}`,
+      };
+      winner = null;
+      continue;
+    }
+
     break;
   }
 
@@ -3319,30 +3486,11 @@ for (const t of triggered) {
 
   const confidenceMeta = computeConfidence(t);
   const confidence = confidenceMeta.finalConfidence;
-  const execReasonLc = String(t?.execReason || "").toLowerCase();
-const wickMeta = t?.ctx?.wickMeta || {};
-
-const flowPersists =
-  execReasonLc.includes("flow_persists_long") ||
-  execReasonLc.includes("flow_persists_short") ||
-  execReasonLc.includes("flow_persists");
-
-const reversalConfirmed =
-  execReasonLc.includes("b1_reversal") ||
-  execReasonLc.includes("wick_reclaim") ||
-  execReasonLc.includes("wick_reject") ||
-  execReasonLc.includes("wick_flush_reclaim") ||
-  execReasonLc.includes("wick_spike_reject") ||
-  execReasonLc.includes("liquidity_snap_reversal");
-
-const breakoutOnly =
-  execReasonLc.includes("break_above") ||
-  execReasonLc.includes("break_below") ||
-  execReasonLc.includes("breakout") ||
-  execReasonLc.includes("breakdown") ||
-  execReasonLc.includes("ignition_breakout") ||
-  execReasonLc.includes("slow_leverage_squeeze") ||
-  execReasonLc.includes("slow_short_breakdown");
+  const profile = getTradeProfile(t);
+  const wickMeta = t?.ctx?.wickMeta || {};
+  const flowPersists = profile.flowPersists;
+  const reversalConfirmed = profile.reversalConfirmed;
+  const breakoutOnly = profile.pureBreakoutOnly;
   const dynamicRisk =
   mode === "swing"
     ? computeDynamicRiskBudget({ mode, t, confidence })
@@ -3575,6 +3723,15 @@ if (!isRandom) {
   lines.push(`Confidence = ${confidence}`);
   if (CFG.extContext.enabled) {
     lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
+    const rawBits = [
+      Number.isFinite(t?.ctx?.coinDayPct) ? `COIN ${fmtPct(t.ctx.coinDayPct)}` : null,
+      Number.isFinite(t?.ctx?.vixDayPct) ? `VIX ${fmtPct(t.ctx.vixDayPct)}` : null,
+      Number.isFinite(t?.ctx?.dxyDayPct) ? `DXY ${fmtPct(t.ctx.dxyDayPct)}` : null,
+      Number.isFinite(t?.ctx?.qqqDayPct) ? `QQQ ${fmtPct(t.ctx.qqqDayPct)}` : null,
+      Number.isFinite(t?.ctx?.spxDayPct) ? `SPX ${fmtPct(t.ctx.spxDayPct)}` : null,
+      Number.isFinite(t?.ctx?.us2yDelta) ? `US2Y Δ ${t.ctx.us2yDelta.toFixed(2)}` : null,
+    ].filter(Boolean);
+    if (rawBits.length) lines.push(`External raw = ${rawBits.join(" | ")}`);
   }
     lines.push(
     `BTC Tape = ${String(btcTapeContext?.tapeState || "neutral")} | ` +
@@ -3602,6 +3759,7 @@ const anomalyOiDisplay =
 if (!isRandom) {
   lines.push(`Anomaly OI (${anomaly.anomaly_tf || "15m"}): ${anomalyOiDisplay}`);
   lines.push(`Setup = ${t?.execReason || "n/a"}`);
+  if (confidenceMeta.selectorFamily) lines.push(`Selector family = ${confidenceMeta.selectorFamily}`);
   lines.push(`Reversal Confirmed = ${reversalConfirmed ? "yes" : "no"}`);
   lines.push("");
 }
@@ -3632,6 +3790,10 @@ analyticsEvents.push({
   confidence,
   confidence_base: confidenceMeta.baseConfidence,
   confidence_score: confidenceMeta.finalScore,
+  selector_family: confidenceMeta.selectorFamily || t?.ctx?.selectorFamily || "",
+  selector_allowed: confidenceMeta.selectorAllowed,
+  selector_rejection_reason: confidenceMeta.selectorReason || t?.ctx?.selectorRejectionReason || "",
+  anomaly_pattern_adj: confidenceMeta.anomalyPatternAdj ?? "",
   ext_context_adj: confidenceMeta.extAdj,
   ext_context_bias: confidenceMeta.externalBias,
   exec_reason: t?.execReason || "",
@@ -3663,8 +3825,13 @@ gateway_version: deployInfo.sha || "",
 observation_type: observationType,
     ext_context_ok: !!t?.ctx?.externalContextOk,
 ext_context_reason: t?.ctx?.externalContextReason || "",
+ext_context_component_summary: t?.ctx?.externalContextComponentSummary || "",
 coin_day_pct: t?.ctx?.coinDayPct ?? "",
 vix_day_pct: t?.ctx?.vixDayPct ?? "",
+dxy_day_pct: t?.ctx?.dxyDayPct ?? "",
+qqq_day_pct: t?.ctx?.qqqDayPct ?? "",
+spx_day_pct: t?.ctx?.spxDayPct ?? "",
+us2y_delta: t?.ctx?.us2yDelta ?? "",
 btc_5m_price_5m_pct: t?.ctx?.btc5mPrice5mPct ?? "",
 btc_5m_price_15m_pct: t?.ctx?.btc5mPrice15mPct ?? "",
 btc_5m_price_30m_pct: t?.ctx?.btc5mPrice30mPct ?? "",
@@ -3772,6 +3939,10 @@ const telegramRowFields = [
   "confidence",
   "confidence_base",
   "confidence_score",
+  "selector_family",
+  "selector_allowed",
+  "selector_rejection_reason",
+  "anomaly_pattern_adj",
   "exec_reason",
   "b1_strong",
   "lean_15m",
@@ -3786,8 +3957,13 @@ const telegramRowFields = [
   "ext_context_bias",
   "ext_context_ok",
   "ext_context_reason",
+  "ext_context_component_summary",
   "coin_day_pct",
   "vix_day_pct",
+  "dxy_day_pct",
+  "qqq_day_pct",
+  "spx_day_pct",
+  "us2y_delta",
   "btc_5m_price_5m_pct",
   "btc_5m_price_15m_pct",
   "btc_5m_price_30m_pct",
