@@ -1895,9 +1895,9 @@ function evaluateSelectorPolicy(t) {
   const family = classifySelectorFamily(profile);
   const reasons = [];
 
-  if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed && !profile.flowPersists && !profile.structuredBreakout) {
-    reasons.push("short_reversal_disabled");
-  }
+ if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed) {
+  reasons.push("short_reversal_disabled");
+}
 
   if (profile.pureBreakoutOnly) {
     reasons.push("pure_breakout_only_disabled");
