@@ -1895,9 +1895,10 @@ function evaluateSelectorPolicy(t) {
   const family = classifySelectorFamily(profile);
   const reasons = [];
 
-  if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed) {
-  reasons.push("short_reversal_disabled");
-}
+  if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed && !profile.flowPersists && !profile.structuredBreakout) {
+    reasons.push("short_reversal_disabled");
+  }
+
   if (profile.pureBreakoutOnly) {
     reasons.push("pure_breakout_only_disabled");
   }
@@ -2050,6 +2051,71 @@ function computeConfidence(t) {
     selectorReason: selectorPolicy.reason,
   };
 }
+function prettifyDecisionToken(value) {
+  return String(value || "")
+    .replace(/_/g, " ")
+    .replace(/\|/g, " + ")
+    .trim();
+}
+
+function describeSelectorFamily(family, profile) {
+  const f = String(family || "").toLowerCase();
+  if (f === "swing_long_liquidity_snap") return "liquidity snap long";
+  if (f === "swing_long_reversal") return "reversal long";
+  if (f === "swing_long_flow_persists") return "flow persists long";
+  if (f === "swing_short_flow_persists") return "flow persists short";
+  if (f === "swing_short_continuation") return "short continuation";
+  if (f === "swing_short_reversal") return "short reversal";
+  if (f === "pure_breakout_only") return "pure breakout only";
+  if (f === "structured_breakout") return "structured breakout";
+  if (profile?.bias === "long") return "long setup";
+  if (profile?.bias === "short") return "short setup";
+  return "setup";
+}
+
+function getModelDecisionLabel(confidenceMeta) {
+  if (confidenceMeta?.selectorAllowed === false) return "REJECTED";
+  const label = String(confidenceMeta?.finalConfidence || "").toUpperCase();
+  if (label === "A") return "PROMOTED";
+  if (label === "B") return "VALID";
+  return "CAPPED";
+}
+
+function buildModelDecisionReason(t, confidenceMeta) {
+  const profile = getTradeProfile(t);
+  if (confidenceMeta?.selectorAllowed === false && confidenceMeta?.selectorReason) {
+    return prettifyDecisionToken(confidenceMeta.selectorReason);
+  }
+
+  const parts = [];
+  parts.push(describeSelectorFamily(confidenceMeta?.selectorFamily, profile));
+
+  const extAdj = Number(confidenceMeta?.extAdj || 0);
+  const externalBias = String(confidenceMeta?.externalBias || "neutral").toLowerCase();
+  if (extAdj > 0.15) parts.push(`${externalBias} external`);
+  else if (extAdj < -0.15) parts.push(`${externalBias} external cap`);
+
+  const anomalyAdj = Number(confidenceMeta?.anomalyPatternAdj || 0);
+  if (anomalyAdj > 0.1) parts.push("anomaly support");
+  else if (anomalyAdj < -0.1) parts.push("anomaly drag");
+
+  if (profile.oneHourAligned) parts.push("1h aligned");
+  else if (profile.counter1hLean) parts.push("counter 1h lean");
+
+  if (profile.mode === "swing" && profile.bias === "long" && profile.reversalConfirmed) {
+    parts.push("reversal confirmed");
+  }
+
+  const unique = [];
+  for (const part of parts) {
+    const text = String(part || "").trim();
+    if (!text || unique.includes(text)) continue;
+    unique.push(text);
+  }
+
+  return unique.slice(0, 3).join(" + ") || "base setup";
+}
+
 function computeDynamicRiskBudget({ mode, t, confidence }) {
   const m = String(mode || "scalp").toLowerCase();
   const baseRiskPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
@@ -3718,21 +3784,16 @@ if (shouldApplyDeferredRangeFloor) {
     } : null,
   }));
 if (!isRandom) {
+  const modelDecision = getModelDecisionLabel(confidenceMeta);
+  const modelWhy = buildModelDecisionReason(t, confidenceMeta);
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
+  lines.push(`Decision = ${modelDecision}`);
+  lines.push(`Why = ${modelWhy}`);
   lines.push(`Confidence = ${confidence}`);
   if (CFG.extContext.enabled) {
     lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
-    const rawBits = [
-      Number.isFinite(t?.ctx?.coinDayPct) ? `COIN ${fmtPct(t.ctx.coinDayPct)}` : null,
-      Number.isFinite(t?.ctx?.vixDayPct) ? `VIX ${fmtPct(t.ctx.vixDayPct)}` : null,
-      Number.isFinite(t?.ctx?.dxyDayPct) ? `DXY ${fmtPct(t.ctx.dxyDayPct)}` : null,
-      Number.isFinite(t?.ctx?.qqqDayPct) ? `QQQ ${fmtPct(t.ctx.qqqDayPct)}` : null,
-      Number.isFinite(t?.ctx?.spxDayPct) ? `SPX ${fmtPct(t.ctx.spxDayPct)}` : null,
-      Number.isFinite(t?.ctx?.us2yDelta) ? `US2Y Δ ${t.ctx.us2yDelta.toFixed(2)}` : null,
-    ].filter(Boolean);
-    if (rawBits.length) lines.push(`External raw = ${rawBits.join(" | ")}`);
   }
-    lines.push(
+  lines.push(
     `BTC Tape = ${String(btcTapeContext?.tapeState || "neutral")} | ` +
     `BTC 30m = ${fmtPct(btcTapeContext?.price30mPct)} | ` +
     `BTC OI 30m = ${fmtPct(btcTapeContext?.oi30mPct)} | ` +
@@ -3758,8 +3819,6 @@ const anomalyOiDisplay =
 if (!isRandom) {
   lines.push(`Anomaly OI (${anomaly.anomaly_tf || "15m"}): ${anomalyOiDisplay}`);
   lines.push(`Setup = ${t?.execReason || "n/a"}`);
-  if (confidenceMeta.selectorFamily) lines.push(`Selector family = ${confidenceMeta.selectorFamily}`);
-  lines.push(`Reversal Confirmed = ${reversalConfirmed ? "yes" : "no"}`);
   lines.push("");
 }
 
