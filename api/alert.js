@@ -3142,6 +3142,8 @@ async function evaluateCandidate({
       ctx: externalContext,
     });
 
+        const anomalyCtx = getAnomalyEventFields(symbol);
+
     return {
       mode,
       instId,
@@ -3162,6 +3164,9 @@ async function evaluateCandidate({
       analyticsOnly,
       rejectionReason,
       ctx: {
+        anomalyTf: anomalyCtx.anomaly_tf || "",
+        anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
+        anomalyPattern: anomalyCtx.anomaly_pattern || "",
         oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
         lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
         lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
