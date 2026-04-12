@@ -1908,6 +1908,20 @@ function evaluateSelectorPolicy(t) {
     if (profile.btcTapeState === "long_hostile") reasons.push("flow_persists_long_btc_hostile");
   }
 
+    const shortContinuationStyle =
+    profile.mode === "swing" &&
+    profile.bias === "short" &&
+    !profile.reversalConfirmed &&
+    (profile.flowPersists || profile.structuredBreakout || profile.pureBreakoutOnly);
+
+  if (shortContinuationStyle) {
+    if (!Number.isFinite(profile.anomalyOiPct)) {
+      reasons.push("short_continuation_needs_anomaly_oi");
+    } else if (profile.anomalyOiPct >= 0) {
+      reasons.push("short_continuation_needs_negative_anomaly_oi");
+    }
+  }
+
   return {
     allowed: reasons.length === 0,
     family,
