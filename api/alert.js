@@ -3998,12 +3998,14 @@ const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal
 if (!isRandom) {
   const modelDecision = getModelDecisionLabel(confidenceMeta);
 
-  lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-  lines.push(`Trade Read = ${tradeRead.label} ${tradeRead.emoji}`);
-  lines.push(`Read Why = ${tradeRead.summary}`);
-  if (tradeCautions !== "none") lines.push(`Cautions = ${tradeCautions}`);
-  lines.push(`Decision = ${modelDecision} | Confidence = ${confidence}`);
-  lines.push(`Setup = ${t?.execReason || "n/a"}`);
+const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
+
+lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
+lines.push(`Trade Read: ${tradeRead.label} ${tradeRead.emoji}`);
+lines.push(`Why: ${tradeRead.summary}`);
+lines.push(`Main Edge: ${mainEdge}`);
+lines.push(`Cautions: ${tradeCautions}`);
+lines.push(`Decision: ${modelDecision} | Confidence: ${confidence}`);
 
   if (CFG.extContext.enabled) {
     lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
