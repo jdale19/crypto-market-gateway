@@ -3993,6 +3993,7 @@ if (shouldApplyDeferredRangeFloor) {
   }));
 const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
 const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
+const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
 
 if (!isRandom) {
   const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
