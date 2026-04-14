@@ -888,28 +888,40 @@ function computeRiskReward({ entryPrice, stopLossPx, tp }) {
   };
 }
 
-function buildTpLadder({ bias, entryPrice, tp1 }) {
+function buildTpLadder({ bias, entryPrice, levels }) {
   const entry = asNum(entryPrice);
-  const first = asNum(tp1);
-  if (entry == null || first == null || entry <= 0) return [];
+  const dir = String(bias || "").toLowerCase();
+  const lvl = levels?.["4h"];
 
-  const dist = Math.abs(first - entry);
-  if (!(dist > 0)) return [];
+  if (entry == null || entry <= 0 || (dir !== "long" && dir !== "short")) return [];
+  if (!lvl || lvl.warmup) return [];
 
-  const dir = String(bias || '').toLowerCase();
-  if (!['long', 'short'].includes(dir)) return [];
+  const hi = asNum(lvl.hi);
+  const lo = asNum(lvl.lo);
+  const mid = asNum(lvl.mid);
+  if (hi == null || lo == null || mid == null || !(hi > lo)) return [];
 
-  const mults = [1, 2, 3, 5];
+  const range = hi - lo;
+  const rawTargets = dir === "long"
+    ? [mid, hi, hi + range * 0.5, hi + range]
+    : [mid, lo, lo - range * 0.5, lo - range];
 
-  return mults.map((m, idx) => {
-    const tp = dir === 'long' ? entry + dist * m : entry - dist * m;
-    const tpPct = (Math.abs(tp - entry) / entry) * 100;
-    return {
-      label: `TP${idx + 1}`,
+  const targets = [];
+  for (const raw of rawTargets) {
+    const tp = asNum(raw);
+    if (tp == null) continue;
+    if (dir === "long" && tp <= entry) continue;
+    if (dir === "short" && tp >= entry) continue;
+    if (targets.some((x) => Math.abs(x.tp - tp) <= Math.max(entry * 0.000001, 0.00000001))) continue;
+
+    targets.push({
+      label: `TP${targets.length + 1}`,
       tp,
-      tpPct,
-    };
-  });
+      tpPct: (Math.abs(tp - entry) / entry) * 100,
+    });
+  }
+
+  return targets;
 }
 
 function safeJsonParse(v) {
@@ -2936,77 +2948,104 @@ async function swingExecutionGate({ instId, bias, levels, item, modeLabel = "SWI
 }
 
 
-function modeTpTfOrder(mode) {
-  mode = String(mode || "").toLowerCase();
-  if (mode === "scalp") return ["15m", "1h", "4h"];
-  if (mode === "swing") return ["1h", "4h"];
-  if (mode === "build") return ["4h"];
-  return ["1h"];
-}
-
-function tpCandidatesForBias(bias, lvl) {
+function structuralTpCandidatesForTf({ bias, price, levels, tf }) {
+  const entry = asNum(price);
+  const dir = String(bias || "").toLowerCase();
+  const lvl = levels?.[tf];
+  if (entry == null || entry <= 0 || (dir !== "long" && dir !== "short")) return [];
   if (!lvl || lvl.warmup) return [];
-  const mid = lvl.mid != null ? Number(lvl.mid) : null;
-  const hi  = lvl.hi  != null ? Number(lvl.hi)  : null;
-  const lo  = lvl.lo  != null ? Number(lvl.lo)  : null;
 
-  if (bias === "long") return [mid, hi].filter((x) => x != null);
-  if (bias === "short") return [mid, lo].filter((x) => x != null);
-  return [];
+  const mid = asNum(lvl.mid);
+  const hi = asNum(lvl.hi);
+  const lo = asNum(lvl.lo);
+  const rawTargets = dir === "long"
+    ? [{ level: "mid", tp: mid }, { level: "high", tp: hi }]
+    : [{ level: "mid", tp: mid }, { level: "low", tp: lo }];
+
+  return rawTargets
+    .map((target) => {
+      const tp = asNum(target.tp);
+      if (tp == null) return null;
+      if (dir === "long" && tp <= entry) return null;
+      if (dir === "short" && tp >= entry) return null;
+      return {
+        tf,
+        level: target.level,
+        tp,
+        tpPct: (Math.abs(tp - entry) / entry) * 100,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.tpPct - b.tpPct);
 }
 
-// for SWING mode only, chooses the FURTHEST TF that gives you “enough room”; for SCALP or BUILD, chooses the FIRST TF; if none give enough room, picks farthest TF available
-function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0 }) {
-  const order = modeTpTfOrder(mode);
-  const pctMove = (a, b) => (Math.abs(b - a) / a) * 100;
+function tpCandidatePasses({ candidate, entryPrice, stopLossPx, minTpPct = 0 }) {
+  if (!candidate) return false;
+  if (Number.isFinite(Number(minTpPct)) && candidate.tpPct < Number(minTpPct)) return false;
 
-  const isValidDir = (entry, tp) => {
-    if (bias === "long") return tp > entry;
-    if (bias === "short") return tp < entry;
-    return false;
-  };
+  const sl = asNum(stopLossPx);
+  if (sl == null) return true;
 
-  const candidates = [];
+  const rrInfo = computeRiskReward({
+    entryPrice,
+    stopLossPx: sl,
+    tp: candidate.tp,
+  });
 
-  for (const tf of order) {
-    const lvl = levels?.[tf];
-    for (const tp of tpCandidatesForBias(bias, lvl)) {
-      if (!isValidDir(price, tp)) continue;
-      const tpPct = pctMove(price, tp);
-      candidates.push({ tf, tp, tpPct });
+  return !!rrInfo && rrInfo.rr >= CFG.minRR;
+}
+
+function firstPassingCandidate(candidates, args) {
+  for (const candidate of candidates || []) {
+    if (tpCandidatePasses({ candidate, ...args })) return { ...candidate, forced: false };
+  }
+  return null;
+}
+
+function firstFallbackCandidate(candidates = []) {
+  return candidates.length ? { ...candidates[0], forced: true } : null;
+}
+
+function chooseDynamicTp({ mode, bias, price, levels, minTpPct = 0, stopLossPx = null }) {
+  const m = String(mode || "").toLowerCase();
+  const args = { entryPrice: price, stopLossPx, minTpPct };
+
+  if (m === "scalp") {
+    const ordered = ["15m", "1h", "4h"];
+    const all = [];
+    for (const tf of ordered) {
+      const candidates = structuralTpCandidatesForTf({ bias, price, levels, tf });
+      all.push(...candidates);
+      const picked = firstPassingCandidate(candidates, args);
+      if (picked) return picked;
     }
+    return firstFallbackCandidate(all);
   }
 
-  if (!candidates.length) return null;
+  if (m === "swing") {
+    const oneHour = structuralTpCandidatesForTf({ bias, price, levels, tf: "1h" });
+    const oneHourPick = firstPassingCandidate(oneHour, args);
+    if (oneHourPick) return oneHourPick;
 
-  // For swing, choose the FARTHER valid structural target.
-  // This aligns better with the fixed 1h structural stop.
-  if (String(mode || "").toLowerCase() === "swing") {
-    let best = null;
-    for (const c of candidates) {
-      if (c.tpPct < minTpPct) continue;
-      if (!best || c.tpPct > best.tpPct) best = { ...c, forced: false };
-    }
-    if (best) return best;
+    const fourHour = structuralTpCandidatesForTf({ bias, price, levels, tf: "4h" });
+    const fourHourPick = firstPassingCandidate(fourHour, args);
+    if (fourHourPick) return fourHourPick;
 
-    // fallback: still return the farthest valid target
-    for (const c of candidates) {
-      if (!best || c.tpPct > best.tpPct) best = { ...c, forced: true };
-    }
-    return best;
+    return firstFallbackCandidate([...oneHour, ...fourHour]);
   }
 
-  // Existing behavior for scalp/build:
-  // first TF with enough room, else farthest valid fallback
-  for (const c of candidates) {
-    if (c.tpPct >= minTpPct) return { ...c, forced: false };
+  if (m === "build") {
+    const ladder = buildTpLadder({ bias, entryPrice: price, levels });
+    const picked = firstPassingCandidate(
+      ladder.map((target) => ({ ...target, tf: "4h", level: target.label })),
+      args
+    );
+    if (picked) return picked;
+    return firstFallbackCandidate(ladder.map((target) => ({ ...target, tf: "4h", level: target.label })));
   }
 
-  let best = null;
-  for (const c of candidates) {
-    if (!best || c.tpPct > best.tpPct) best = { ...c, forced: true };
-  }
-  return best;
+  const fallback = structuralTpCandidatesForTf({ bias, price, levels, tf: "1h" });
+  return firstPassingCandidate(fallback, args) || firstFallbackCandidate(fallback);
 }
 function summarizeMacroBias(macroByMode, modes) {
   const ordered = (modes || MODE_PRIORITY).filter(Boolean);
@@ -3851,6 +3890,7 @@ const tpPick = chooseDynamicTp({
   price,
   levels,
   minTpPct,
+  stopLossPx,
 });
 
 if (!tpPick) {
@@ -3895,11 +3935,9 @@ if (mode === "build" && Number.isFinite(tpPct) && tpPct < CFG.minTpPctByMode.bui
   }
 }
 const buildTargets = mode === "build"
-  ? buildTpLadder({ bias, entryPrice: price, tp1: tp })
+  ? buildTpLadder({ bias, entryPrice: price, levels })
   : [];
-const rrAnchorTp = mode === "build" && buildTargets.length >= 2
-  ? buildTargets[1].tp
-  : tp;
+const rrAnchorTp = tp;
 
 const rrInfo = computeRiskReward({
   entryPrice: price,
