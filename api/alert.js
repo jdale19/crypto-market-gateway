@@ -3991,11 +3991,12 @@ if (shouldApplyDeferredRangeFloor) {
       baseRiskBudgetPct: lev.baseRiskBudgetPct,
     } : null,
   }));
+const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
+const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
+const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
+
 if (!isRandom) {
   const modelDecision = getModelDecisionLabel(confidenceMeta);
-  const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
-  const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
-  const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
 
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
   lines.push(`Trade Read = ${tradeRead.label} ${tradeRead.emoji}`);
@@ -4064,6 +4065,14 @@ analyticsEvents.push({
   confidence,
   confidence_base: confidenceMeta.baseConfidence,
   confidence_score: confidenceMeta.finalScore,
+  trade_read_label: tradeRead.label,
+  trade_read_score: tradeRead.score,
+  trade_read_summary: tradeRead.summary,
+  trade_read_cautions: tradeRead.cautions.join(","),
+  btc_short_tf_state: btcShortTfSignal.state,
+  btc_short_tf_confidence_adj: btcShortTfSignal.confidenceAdj,
+  btc_short_tf_reasons: btcShortTfSignal.reasons.join(","),
+  btc_short_tf_cautions: btcShortTfSignal.cautions.join(","),
   selector_family: confidenceMeta.selectorFamily || t?.ctx?.selectorFamily || "",
   selector_allowed: confidenceMeta.selectorAllowed,
   selector_rejection_reason: confidenceMeta.selectorReason || t?.ctx?.selectorRejectionReason || "",
@@ -4213,6 +4222,14 @@ const telegramRowFields = [
   "confidence",
   "confidence_base",
   "confidence_score",
+  "trade_read_label",
+  "trade_read_score",
+  "trade_read_summary",
+  "trade_read_cautions",
+  "btc_short_tf_state",
+  "btc_short_tf_confidence_adj",
+  "btc_short_tf_reasons",
+  "btc_short_tf_cautions",
   "selector_family",
   "selector_allowed",
   "selector_rejection_reason",
