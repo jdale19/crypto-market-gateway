@@ -4128,17 +4128,7 @@ random_source: isRandom ? randomSourceForEvent : "",
 });
 
 if (!isRandom) {
-  if (hi1h != null && lo1h != null) {
-    const range1h = hi1h - lo1h;
-    const edge1h = CFG.strongEdgePct1h * range1h;
-
-    if (bias === "long") lines.push(`Entry: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
-    else if (bias === "short") lines.push(`Entry: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
-    else lines.push("Entry:");
-  } else {
-    lines.push("Entry:");
-  }
-
+  lines.push(`Entry: ${price != null ? fmtPrice(price) : ""}`);
   lines.push(`Invalidation: ${invalidationPx != null ? fmtPrice(invalidationPx) : ""}`);
 
   if (mode === "build" && buildTargets.length) {
