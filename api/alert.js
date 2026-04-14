@@ -210,6 +210,14 @@ macro: {
 
   blockShortsOnAltsWhenBtcBull: String(process.env.ALERT_MACRO_BLOCK_SHORTS_ON_ALTS || "1") === "1",
 },
+    // Short-TF BTC tape is a soft signal only. It is used for confidence/read quality, not hard entry gating.
+  btcShortTf: {
+    enabled: String(process.env.ALERT_BTC_SHORT_TF_ENABLED || "1") === "1",
+    price5mMinPct: Number(process.env.ALERT_BTC_SHORT_TF_PRICE_5M_MIN_PCT || 0.10),
+    price15mMinPct: Number(process.env.ALERT_BTC_SHORT_TF_PRICE_15M_MIN_PCT || 0.20),
+    confidenceBoost: Number(process.env.ALERT_BTC_SHORT_TF_CONFIDENCE_BOOST || 0.15),
+    confidencePenalty: Number(process.env.ALERT_BTC_SHORT_TF_CONFIDENCE_PENALTY || 0.25),
+  },
 
   // Optional regime adjust (kept; does not bypass entry rules)
   regime: {
@@ -1845,6 +1853,10 @@ function getTradeProfile(t) {
 
   const externalRawScore = Number(t?.ctx?.externalContextAdj || 0) || 0;
   const btcTapeState = String(t?.ctx?.btcTapeState || "neutral").toLowerCase();
+  const btcPrice5mPct = asNum(t?.ctx?.btc5mPrice5mPct);
+  const btcPrice15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
+  const btcOi5mPct = asNum(t?.ctx?.btc5mOi5mPct);
+  const btcOi15mPct = asNum(t?.ctx?.btc5mOi15mPct);
   const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
   const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
 
@@ -1872,6 +1884,10 @@ function getTradeProfile(t) {
     strongBottoming,
     externalRawScore,
     btcTapeState,
+    btcPrice5mPct,
+    btcPrice15mPct,
+    btcOi5mPct,
+    btcOi15mPct,
     anomalyPattern,
     anomalyOiPct,
   };
@@ -1997,8 +2013,9 @@ function computeConfidence(t) {
   const extAdjRaw = Number(t?.ctx?.externalContextAdj || 0);
   const extAdj = Number.isFinite(extAdjRaw) ? extAdjRaw : 0;
   const anomalyPatternAdj = getAnomalyPatternAdj(profile);
+  const btcShortTfSignal = getBtcShortTfSignal(profile);
 
-  let adjustedScore = Number((baseScore + extAdj + anomalyPatternAdj).toFixed(2));
+  let adjustedScore = Number((baseScore + extAdj + anomalyPatternAdj + btcShortTfSignal.confidenceAdj).toFixed(2));
 
   if (profile.mode === "swing" && profile.bias === "long" && profile.liquiditySnap) {
     adjustedScore += 0.5;
@@ -2057,6 +2074,7 @@ function computeConfidence(t) {
     baseScore,
     extAdj,
     anomalyPatternAdj,
+    btcShortTfSignal,
     finalScore,
     finalConfidence,
     externalBias: String(t?.ctx?.externalBias || "neutral").toLowerCase(),
@@ -2128,6 +2146,177 @@ function buildModelDecisionReason(t, confidenceMeta) {
   }
 
   return unique.slice(0, 3).join(" + ") || "base setup";
+}
+
+function sideSignedMove(value, side) {
+  const n = asNum(value);
+  if (!Number.isFinite(n)) return null;
+  return String(side || "").toLowerCase() === "short" ? -n : n;
+}
+
+function getBtcShortTfSignal(profile) {
+  if (!CFG.btcShortTf?.enabled) {
+    return { state: "off", label: "off", confidenceAdj: 0, reasons: [], cautions: [] };
+  }
+
+  const side = String(profile?.bias || "").toLowerCase();
+  if (side !== "long" && side !== "short") {
+    return { state: "neutral", label: "BTC short-TF neutral", confidenceAdj: 0, reasons: [], cautions: [] };
+  }
+
+  const p5 = sideSignedMove(profile?.btcPrice5mPct, side);
+  const p15 = sideSignedMove(profile?.btcPrice15mPct, side);
+  const min5 = Number(CFG.btcShortTf.price5mMinPct || 0);
+  const min15 = Number(CFG.btcShortTf.price15mMinPct || 0);
+  const reasons = [];
+  const cautions = [];
+
+  if (Number.isFinite(p15)) {
+    if (p15 >= min15) reasons.push("BTC 15m aligned");
+    else if (p15 <= -min15) cautions.push("BTC 15m hostile");
+  }
+
+  if (Number.isFinite(p5)) {
+    if (p5 >= min5) reasons.push("BTC 5m aligned");
+    else if (p5 <= -min5) cautions.push("BTC 5m hostile");
+  }
+
+  let state = "neutral";
+  let confidenceAdj = 0;
+
+  if (cautions.some((x) => x.includes("15m"))) {
+    state = "hostile";
+    confidenceAdj = -Math.abs(Number(CFG.btcShortTf.confidencePenalty || 0));
+  } else if (reasons.some((x) => x.includes("15m")) && cautions.length === 0) {
+    state = reasons.some((x) => x.includes("5m")) ? "strong_support" : "support";
+    confidenceAdj = Math.abs(Number(CFG.btcShortTf.confidenceBoost || 0));
+  } else if (cautions.length > 0) {
+    state = "minor_hostile";
+    confidenceAdj = -Math.abs(Number(CFG.btcShortTf.confidencePenalty || 0)) / 2;
+  } else if (reasons.length > 0) {
+    state = "minor_support";
+    confidenceAdj = Math.abs(Number(CFG.btcShortTf.confidenceBoost || 0)) / 2;
+  }
+
+  return {
+    state,
+    label: state.replace(/_/g, " "),
+    confidenceAdj: Number(confidenceAdj.toFixed(2)),
+    reasons,
+    cautions,
+  };
+}
+
+function computeTradeRead({ t, confidenceMeta, rrInfo }) {
+  const profile = getTradeProfile(t);
+  const btcShortTf = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
+  const modelDecision = getModelDecisionLabel(confidenceMeta);
+  const positives = [];
+  const cautions = [];
+  let score = 0;
+
+  if (confidenceMeta?.selectorAllowed === false) {
+    return {
+      label: "WEAK",
+      emoji: "❌",
+      summary: "selector rejected",
+      positives: [],
+      cautions: [prettifyDecisionToken(confidenceMeta?.selectorReason || "selector rejected")],
+    };
+  }
+
+  if (modelDecision === "PROMOTED") score += 1;
+  else if (modelDecision === "VALID") score += 0.5;
+
+  if (profile.mode === "swing" && profile.bias === "long") {
+    if (profile.liquiditySnap) {
+      score += 2;
+      positives.push("liquidity snap reversal");
+    } else if (profile.reversalConfirmed) {
+      score += 1.5;
+      positives.push("reversal confirmed");
+    } else if (profile.flowPersists) {
+      score -= 0.5;
+      cautions.push("generic continuation");
+    }
+
+    if (profile.externalRawScore > 0.15) {
+      score += 1.5;
+      positives.push("supportive external");
+    } else if (profile.externalRawScore < -0.15) {
+      score -= 1.5;
+      cautions.push("external drag");
+    }
+
+    if (profile.oneHourAligned) {
+      score += 1;
+      positives.push("1h aligned");
+    } else if (profile.counter1hLean) {
+      score -= 1;
+      cautions.push("counter 1h lean");
+    }
+  } else if (profile.mode === "swing" && profile.bias === "short") {
+    if (Number.isFinite(profile.anomalyOiPct) && profile.anomalyOiPct < 0) {
+      score += 2;
+      positives.push("negative anomaly OI");
+    } else {
+      score -= 2;
+      cautions.push("no negative anomaly OI");
+    }
+
+    if (profile.strongBottoming) {
+      score -= 2;
+      cautions.push("bottoming warning");
+    }
+
+    if (profile.oneHourAligned) {
+      score += 1;
+      positives.push("1h aligned");
+    } else if (profile.counter1hLean) {
+      score -= 1;
+      cautions.push("counter 1h lean");
+    }
+
+    if (profile.externalRawScore > 0.15) {
+      score += 1;
+      positives.push("external supports side");
+    } else if (profile.externalRawScore < -0.15) {
+      score -= 1;
+      cautions.push("external fights side");
+    }
+  }
+
+  if (btcShortTf.state === "strong_support") {
+    score += 1.5;
+    positives.push("BTC 5/15 aligned");
+  } else if (btcShortTf.state === "support") {
+    score += 1;
+    positives.push("BTC 15m aligned");
+  } else if (btcShortTf.state === "hostile") {
+    score -= 1.5;
+    cautions.push("BTC 15m hostile");
+  } else if (btcShortTf.state === "minor_hostile") {
+    score -= 0.75;
+    cautions.push("BTC 5m hostile");
+  }
+
+  let label = "MIXED";
+  let emoji = "⚠️";
+  if (score >= 4 && cautions.length <= 1) {
+    label = "GOOD";
+    emoji = "✅";
+  } else if (score <= 1 || cautions.length >= 3) {
+    label = "WEAK";
+    emoji = "❌";
+  }
+
+  return {
+    label,
+    emoji,
+    score: Number(score.toFixed(2)),
+    summary: positives.slice(0, 3).join(" + ") || "limited confirmed edge",
+    cautions: [...new Set(cautions)].slice(0, 3),
+  };
 }
 
 function computeDynamicRiskBudget({ mode, t, confidence }) {
@@ -3804,20 +3993,29 @@ if (shouldApplyDeferredRangeFloor) {
   }));
 if (!isRandom) {
   const modelDecision = getModelDecisionLabel(confidenceMeta);
-  const modelWhy = buildModelDecisionReason(t, confidenceMeta);
+  const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
+  const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
+  const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
+
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-  lines.push(`Decision = ${modelDecision}`);
-  lines.push(`Why = ${modelWhy}`);
-  lines.push(`Confidence = ${confidence}`);
+  lines.push(`Trade Read = ${tradeRead.label} ${tradeRead.emoji}`);
+  lines.push(`Read Why = ${tradeRead.summary}`);
+  if (tradeCautions !== "none") lines.push(`Cautions = ${tradeCautions}`);
+  lines.push(`Decision = ${modelDecision} | Confidence = ${confidence}`);
+  lines.push(`Setup = ${t?.execReason || "n/a"}`);
+
   if (CFG.extContext.enabled) {
     lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
   }
+
   lines.push(
     `BTC Tape = ${String(btcTapeContext?.tapeState || "neutral")} | ` +
+    `BTC 5m = ${fmtPct(btcTapeContext?.price5mPct)} | ` +
+    `BTC 15m = ${fmtPct(btcTapeContext?.price15mPct)} | ` +
     `BTC 30m = ${fmtPct(btcTapeContext?.price30mPct)} | ` +
-    `BTC OI 30m = ${fmtPct(btcTapeContext?.oi30mPct)} | ` +
-    `Funding = ${fmtPct(btcTapeContext?.funding, 4)}`
+    `ShortTF = ${btcShortTfSignal.label}`
   );
+
   lines.push(
     `Risk = ${lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct}% ` +
     `(base ${lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct}%, ` +
@@ -3837,7 +4035,6 @@ const anomalyOiDisplay =
 
 if (!isRandom) {
   lines.push(`Anomaly OI (${anomaly.anomaly_tf || "15m"}): ${anomalyOiDisplay}`);
-  lines.push(`Setup = ${t?.execReason || "n/a"}`);
   lines.push("");
 }
 
