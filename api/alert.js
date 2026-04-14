@@ -4007,24 +4007,18 @@ lines.push(`Main Edge: ${mainEdge}`);
 lines.push(`Cautions: ${tradeCautions}`);
 lines.push(`Decision: ${modelDecision} | Confidence: ${confidence}`);
 
-  if (CFG.extContext.enabled) {
-    lines.push(`External = ${confidenceMeta.externalBias} (${Number(confidenceMeta.extAdj).toFixed(2)})`);
-  }
+const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
+const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
+const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
 
-  lines.push(
-    `BTC Tape = ${String(btcTapeContext?.tapeState || "neutral")} | ` +
-    `BTC 5m = ${fmtPct(btcTapeContext?.price5mPct)} | ` +
-    `BTC 15m = ${fmtPct(btcTapeContext?.price15mPct)} | ` +
-    `BTC 30m = ${fmtPct(btcTapeContext?.price30mPct)} | ` +
-    `ShortTF = ${btcShortTfSignal.label}`
-  );
+if (!isRandom) {
+  const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
 
-  lines.push(
-    `Risk = ${lev?.riskBudgetPct ?? dynamicRisk?.effectiveRiskPct}% ` +
-    `(base ${lev?.baseRiskBudgetPct ?? dynamicRisk?.baseRiskPct}%, ` +
-    `mult x${dynamicRisk?.multiplier ?? 1}, score ${dynamicRisk?.score ?? 0})`
-  );
-  lines.push(`Risk drivers = ${(dynamicRisk?.reasons || []).join(", ") || "none"}`);
+  lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
+  lines.push(`Trade Read: ${tradeRead.label} ${tradeRead.emoji}`);
+  lines.push(`Why: ${tradeRead.summary}`);
+  lines.push(`Main Edge: ${mainEdge}`);
+  lines.push(`Cautions: ${tradeCautions}`);
   lines.push("");
 }
 
@@ -4036,10 +4030,6 @@ const anomalyOiDisplay =
     ? "n/a"
     : fmtPct(anomaly.anomaly_oi_pct);
 
-if (!isRandom) {
-  lines.push(`Anomaly OI (${anomaly.anomaly_tf || "15m"}): ${anomalyOiDisplay}`);
-  lines.push("");
-}
 
 const finalRejectionReason = [
   rejectionReason,
@@ -4158,49 +4148,31 @@ random_source: isRandom ? randomSourceForEvent : "",
 });
 
 if (!isRandom) {
-  // Entry Zone (1h B1 band)
   if (hi1h != null && lo1h != null) {
     const range1h = hi1h - lo1h;
     const edge1h = CFG.strongEdgePct1h * range1h;
 
-    if (bias === "long") lines.push(`Entry Zone: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
-    else if (bias === "short") lines.push(`Entry Zone: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
-  }
-
-  // Invalidation (mode-aware TF)
-  if (invalidationPx != null) lines.push(`Invalidation (${invTf}): ${fmtPrice(invalidationPx)}`);
-  else lines.push("Invalidation:");
-
-  // Avoid chasing (unchanged)
-  if (price != null) {
-    const chaseBuffer = price * 0.0025;
-    if (bias === "long") lines.push(`Avoid chasing above: ${fmtPrice(price + chaseBuffer)}`);
-    else if (bias === "short") lines.push(`Avoid chasing below: ${fmtPrice(price - chaseBuffer)}`);
-  }
-
-  // Leverage (from stop distance)
-  if (lev) {
-    lines.push(`Leverage: ${lev.suggestedLow}–${lev.suggestedHigh}x (max ${lev.adjustedMax}x)`);
-  }
-
-  lines.push("");
-
-  // Stop Loss (separate from invalidation now)
-  if (stopLossPx != null) lines.push(`Stop Loss: ${fmtPrice(stopLossPx)}`);
-  else lines.push("Stop Loss:");
-
-  // MESSAGE
-  if (mode === "build" && buildTargets.length) {
-    lines.push(`Targets (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
-    for (const target of buildTargets) {
-      lines.push(`• ${target.label}: ${fmtPrice(target.tp)} (≈ ${target.tpPct.toFixed(2)}%)`);
-    }
+    if (bias === "long") lines.push(`Entry: ${lo1h.toFixed(4)}-${(lo1h + edge1h).toFixed(4)}`);
+    else if (bias === "short") lines.push(`Entry: ${(hi1h - edge1h).toFixed(4)}-${hi1h.toFixed(4)}`);
+    else lines.push("Entry:");
   } else {
-    lines.push(`Take Profit (${tpTf}${tpPick.forced ? ", forced" : ""}):`);
-    lines.push(`• ${tp.toFixed(4)} (≈ ${tpPct.toFixed(2)}%)`);
+    lines.push("Entry:");
   }
 
-    lines.push("");
+  lines.push(`Invalidation: ${invalidationPx != null ? fmtPrice(invalidationPx) : ""}`);
+
+  if (mode === "build" && buildTargets.length) {
+    const targetSummary = buildTargets
+      .map((target) => `${target.label} ${fmtPrice(target.tp)}`)
+      .join(" | ");
+    lines.push(`TP: ${targetSummary}`);
+  } else {
+    lines.push(`TP: ${tp != null ? fmtPrice(tp) : ""}`);
+  }
+
+  lines.push(`Stop: ${stopLossPx != null ? fmtPrice(stopLossPx) : ""}`);
+  lines.push(`Leverage: ${lev ? `${lev.suggestedLow}–${lev.suggestedHigh}x` : ""}`);
+  lines.push("");
 }
 }
 
