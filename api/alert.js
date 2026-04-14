@@ -4009,10 +4009,6 @@ if (!isRandom) {
 const horizonMin = horizonMinForMode(mode);
 const evalTiming = buildEvaluationTiming(now, horizonMin);
 const anomaly = getAnomalyEventFields(t.symbol);
-const anomalyOiDisplay =
-  anomaly.anomaly_oi_pct === "" || anomaly.anomaly_oi_pct == null
-    ? "n/a"
-    : fmtPct(anomaly.anomaly_oi_pct);
 
 
 const finalRejectionReason = [
