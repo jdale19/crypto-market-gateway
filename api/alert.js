@@ -3993,23 +3993,6 @@ if (shouldApplyDeferredRangeFloor) {
   }));
 const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
 const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
-const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
-
-if (!isRandom) {
-  const modelDecision = getModelDecisionLabel(confidenceMeta);
-
-const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
-
-lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-lines.push(`Trade Read: ${tradeRead.label} ${tradeRead.emoji}`);
-lines.push(`Why: ${tradeRead.summary}`);
-lines.push(`Main Edge: ${mainEdge}`);
-lines.push(`Cautions: ${tradeCautions}`);
-lines.push(`Decision: ${modelDecision} | Confidence: ${confidence}`);
-
-const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
-const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
-const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
 
 if (!isRandom) {
   const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
