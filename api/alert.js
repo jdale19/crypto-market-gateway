@@ -3720,20 +3720,7 @@ async function evaluateCandidate({
   };
 }
 
-for (const item of j.results || []) {
-  if (!item?.ok) {
-    const detail = String(item?.error || "item_not_ok");
-    if (debug) skipped.push({ symbol: item?.symbol || "?", reason: detail });
-    continue;
-  }
-
-  const evaluated = await evaluateCandidate({ item });
-  if (evaluated.winner) triggered.push(evaluated.winner);
-}
-
-// ---- Render DM ----
-
-const lines = [];
+let randomEval = null;
 const randomGroupId = `${now}_random`;
 
 if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 0) {
@@ -3747,25 +3734,39 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
       const side = Math.random() < 0.5 ? "long" : "short";
       const modePick = modes[Math.floor(Math.random() * modes.length)];
 
-      const randomEval = await evaluateCandidate({
+      randomEval = await evaluateCandidate({
         item: pick,
         modeList: [modePick],
         forcedBias: side,
         observationType: "random",
         randomGroupId,
-        randomSource: "independent_random",
+        randomSource: "upstream_pre_fired_loop",
         analyticsOnly: true,
       });
-
-      if (randomEval.winner) {
-        triggered.push(randomEval.winner);
-      } else if (randomEval.candidate) {
-        triggered.push(randomEval.candidate);
-      }
     }
   }
 }
 
+for (const item of j.results || []) {
+  if (!item?.ok) {
+    const detail = String(item?.error || "item_not_ok");
+    if (debug) skipped.push({ symbol: item?.symbol || "?", reason: detail });
+    continue;
+  }
+
+  const evaluated = await evaluateCandidate({ item });
+  if (evaluated.winner) triggered.push(evaluated.winner);
+}
+
+if (randomEval?.winner) {
+  triggered.push(randomEval.winner);
+} else if (randomEval?.candidate) {
+  triggered.push(randomEval.candidate);
+}
+
+// ---- Render DM ----
+
+const lines = [];
 for (const t of triggered) {
   const mode = String(t.mode || "swing").toLowerCase();
   const modeUp = mode.toUpperCase();
