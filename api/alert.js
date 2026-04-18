@@ -2349,63 +2349,6 @@ function computeGoodTradeBadge({ t, confidenceMeta }) {
 
   return { isGood: false, summary: "", reason: "recipe_not_matched" };
 }
-
-  if (confidenceMeta?.selectorAllowed === false) {
-    return { isGood: false, summary: "", reason: "selector_rejected" };
-  }
-
-  // Temporary and intentionally conservative:
-  // only tag GOOD TRADE where the current validated live recipes are strongest.
-  if (profile.mode !== "swing") {
-    return { isGood: false, summary: "", reason: "mode_not_swing" };
-  }
-
-  if (!["A", "B"].includes(confidence)) {
-    return { isGood: false, summary: "", reason: "confidence_not_ab" };
-  }
-
-  if (profile.bias === "long") {
-    const reversalStyle = profile.liquiditySnap || profile.reversalConfirmed;
-    const supportiveExternal = profile.externalRawScore > 0.15;
-
-    if (reversalStyle && supportiveExternal) {
-      return {
-        isGood: true,
-        summary: [
-          `${confidence} confidence`,
-          profile.liquiditySnap ? "liquidity snap reversal" : "reversal confirmed",
-          "supportive external",
-        ].join(" + "),
-        reason: "swing_long_good_trade",
-      };
-    }
-
-    return { isGood: false, summary: "", reason: "swing_long_recipe_missing" };
-  }
-
-  if (profile.bias === "short") {
-    const negativeAnomalyOi =
-      Number.isFinite(profile.anomalyOiPct) && profile.anomalyOiPct < 0;
-    const notSupportiveExternal = profile.externalRawScore <= 0.15;
-    const noBottomingWarning = !profile.strongBottoming;
-
-    if (negativeAnomalyOi && notSupportiveExternal && noBottomingWarning) {
-      return {
-        isGood: true,
-        summary: [
-          `${confidence} confidence`,
-          "negative anomaly OI",
-          "no supportive external",
-        ].join(" + "),
-        reason: "swing_short_good_trade",
-      };
-    }
-
-    return { isGood: false, summary: "", reason: "swing_short_recipe_missing" };
-  }
-
-  return { isGood: false, summary: "", reason: "unsupported_side" };
-}
 function computeDynamicRiskBudget({ mode, t, confidence }) {
   const m = String(mode || "scalp").toLowerCase();
   const baseRiskPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
