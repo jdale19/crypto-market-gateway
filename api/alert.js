@@ -2330,7 +2330,66 @@ function computeTradeRead({ t, confidenceMeta, rrInfo }) {
     cautions: [...new Set(cautions)].slice(0, 3),
   };
 }
+function computeGoodTradeBadge({ t, confidenceMeta }) {
+  const profile = getTradeProfile(t);
+  const confidence = String(confidenceMeta?.finalConfidence || "").toUpperCase();
 
+  if (confidenceMeta?.selectorAllowed === false) {
+    return { isGood: false, summary: "", reason: "selector_rejected" };
+  }
+
+  // Temporary and intentionally conservative:
+  // only tag GOOD TRADE where the current validated live recipes are strongest.
+  if (profile.mode !== "swing") {
+    return { isGood: false, summary: "", reason: "mode_not_swing" };
+  }
+
+  if (!["A", "B"].includes(confidence)) {
+    return { isGood: false, summary: "", reason: "confidence_not_ab" };
+  }
+
+  if (profile.bias === "long") {
+    const reversalStyle = profile.liquiditySnap || profile.reversalConfirmed;
+    const supportiveExternal = profile.externalRawScore > 0.15;
+
+    if (reversalStyle && supportiveExternal) {
+      return {
+        isGood: true,
+        summary: [
+          `${confidence} confidence`,
+          profile.liquiditySnap ? "liquidity snap reversal" : "reversal confirmed",
+          "supportive external",
+        ].join(" + "),
+        reason: "swing_long_good_trade",
+      };
+    }
+
+    return { isGood: false, summary: "", reason: "swing_long_recipe_missing" };
+  }
+
+  if (profile.bias === "short") {
+    const negativeAnomalyOi =
+      Number.isFinite(profile.anomalyOiPct) && profile.anomalyOiPct < 0;
+    const notSupportiveExternal = profile.externalRawScore <= 0.15;
+    const noBottomingWarning = !profile.strongBottoming;
+
+    if (negativeAnomalyOi && notSupportiveExternal && noBottomingWarning) {
+      return {
+        isGood: true,
+        summary: [
+          `${confidence} confidence`,
+          "negative anomaly OI",
+          "no supportive external",
+        ].join(" + "),
+        reason: "swing_short_good_trade",
+      };
+    }
+
+    return { isGood: false, summary: "", reason: "swing_short_recipe_missing" };
+  }
+
+  return { isGood: false, summary: "", reason: "unsupported_side" };
+}
 function computeDynamicRiskBudget({ mode, t, confidence }) {
   const m = String(mode || "scalp").toLowerCase();
   const baseRiskPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
@@ -4033,15 +4092,20 @@ if (shouldApplyDeferredRangeFloor) {
 const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
 const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
 const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
+const goodTradeBadge = computeGoodTradeBadge({ t, confidenceMeta });
 
 if (!isRandom) {
   const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
 
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
+  if (goodTradeBadge.isGood) {
+    lines.push(`GOOD TRADE ✅`);
+  }
   lines.push(`Confidence: ${confidence}`);
-  lines.push(`Trade Read: ${tradeRead.label} ${tradeRead.emoji}`);
-  lines.push(`Why: ${tradeRead.summary}`);
   lines.push(`Main Edge: ${mainEdge}`);
+  if (goodTradeBadge.isGood && goodTradeBadge.summary) {
+    lines.push(`Why Good: ${goodTradeBadge.summary}`);
+  }
   lines.push(`Cautions: ${tradeCautions}`);
   lines.push("");
 }
