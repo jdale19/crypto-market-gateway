@@ -2331,8 +2331,24 @@ function computeTradeRead({ t, confidenceMeta, rrInfo }) {
   };
 }
 function computeGoodTradeBadge({ t, confidenceMeta }) {
-  const profile = getTradeProfile(t);
-  const confidence = String(confidenceMeta?.finalConfidence || "").toUpperCase();
+  if (confidenceMeta?.selectorAllowed === false) {
+    return { isGood: false, summary: "", reason: "selector_rejected" };
+  }
+
+  const execReason = String(t?.execReason || "").toLowerCase();
+
+  // Temporary and intentionally very narrow:
+  // only tag GOOD TRADE where the CSV is strongest and most defensible.
+  if (execReason === "build_b1_reversal_long") {
+    return {
+      isGood: true,
+      summary: "build B1 reversal long",
+      reason: "build_b1_reversal_long",
+    };
+  }
+
+  return { isGood: false, summary: "", reason: "recipe_not_matched" };
+}
 
   if (confidenceMeta?.selectorAllowed === false) {
     return { isGood: false, summary: "", reason: "selector_rejected" };
@@ -4102,10 +4118,9 @@ if (!isRandom) {
     lines.push(`GOOD TRADE ✅`);
   }
   lines.push(`Confidence: ${confidence}`);
+  lines.push(`Trade Read: ${tradeRead.label} ${tradeRead.emoji}`);
+  lines.push(`Why: ${tradeRead.summary}`);
   lines.push(`Main Edge: ${mainEdge}`);
-  if (goodTradeBadge.isGood && goodTradeBadge.summary) {
-    lines.push(`Why Good: ${goodTradeBadge.summary}`);
-  }
   lines.push(`Cautions: ${tradeCautions}`);
   lines.push("");
 }
