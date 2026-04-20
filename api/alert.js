@@ -2330,24 +2330,34 @@ function computeTradeRead({ t, confidenceMeta, rrInfo }) {
     cautions: [...new Set(cautions)].slice(0, 3),
   };
 }
-function computeGoodTradeBadge({ t, confidenceMeta }) {
+function computeRecipeStamp({ t, confidenceMeta }) {
   if (confidenceMeta?.selectorAllowed === false) {
-    return { isGood: false, summary: "", reason: "selector_rejected" };
+    return { label: "", emoji: "", reason: "selector_rejected" };
   }
 
   const execReason = String(t?.execReason || "").toLowerCase();
 
-  // Temporary and intentionally very narrow:
-  // only tag GOOD TRADE where the CSV is strongest and most defensible.
+  // Latest analytics-supported PREMIUM recipes only.
   if (execReason === "build_b1_reversal_long") {
     return {
-      isGood: true,
-      summary: "build B1 reversal long",
+      label: "PREMIUM",
+      emoji: "✅",
       reason: "build_b1_reversal_long",
     };
   }
 
-  return { isGood: false, summary: "", reason: "recipe_not_matched" };
+  if (execReason === "build_flow_persists_short") {
+    return {
+      label: "PREMIUM",
+      emoji: "✅",
+      reason: "build_flow_persists_short",
+    };
+  }
+
+  // Intentionally no active AVOID rules yet.
+  // The latest CSV does not give a stable enough currently-firing recipe
+  // that I trust to auto-stamp as AVOID.
+  return { label: "", emoji: "", reason: "no_stamp" };
 }
 function computeDynamicRiskBudget({ mode, t, confidence }) {
   const m = String(mode || "scalp").toLowerCase();
@@ -4051,19 +4061,21 @@ if (shouldApplyDeferredRangeFloor) {
 const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
 const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
 const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
-const goodTradeBadge = computeGoodTradeBadge({ t, confidenceMeta });
+const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
 
 if (!isRandom) {
   const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
 
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-  if (goodTradeBadge.isGood) {
-    lines.push(`GOOD TRADE ✅`);
+
+  if (recipeStamp.label === "PREMIUM") {
+    lines.push(`PREMIUM ${recipeStamp.emoji}`);
+  } else if (recipeStamp.label === "AVOID") {
+    lines.push(`AVOID ${recipeStamp.emoji}`);
   }
-  lines.push(`Confidence: ${confidence}`);
-  lines.push(`Trade Read: ${tradeRead.label} ${tradeRead.emoji}`);
-  lines.push(`Why: ${tradeRead.summary}`);
+
   lines.push(`Main Edge: ${mainEdge}`);
+  lines.push(`Why: ${tradeRead.summary}`);
   lines.push(`Cautions: ${tradeCautions}`);
   lines.push("");
 }
