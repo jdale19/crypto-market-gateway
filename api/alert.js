@@ -28,6 +28,20 @@ const EVAL_BUCKET_MS = 5 * 60 * 1000;
 // Faster always wins
 const MODE_PRIORITY = ["scalp", "swing", "build"]; // fastest -> slowest
 
+const ANALYTICS_VERSION_TAGS = Object.freeze({
+  selector_version: "selector_v2_2026_04_12",
+  confidence_version: "confidence_v2_2026_04_14",
+  trade_read_version: "trade_read_v1_2026_04_14",
+  ext_context_version: "ext_context_v2_2026_04_11",
+  btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
+  entry_idea_version: "entry_ideas_v1_2026_04_20",
+  random_baseline_version: "random_upstream_v2_2026_04_18",
+});
+
+function getAnalyticsVersionTags() {
+  return { ...ANALYTICS_VERSION_TAGS };
+}
+
 function getDeployInfo() {
   return {
     vercel: !!process.env.VERCEL,
@@ -2336,29 +2350,115 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   }
 
   const execReason = String(t?.execReason || "").toLowerCase();
+  const finalConfidence = String(
+    confidenceMeta?.finalConfidence || t?.confidence || ""
+  ).toUpperCase();
 
-  // Latest analytics-supported PREMIUM recipes only.
-  if (execReason === "build_b1_reversal_long") {
+  // PREMIUM = clearly positive, live-usable, and frequent enough to matter.
+  // Reconciled across older cohorts using the note boundaries that materially changed logic.
+  const unconditionalPremiumExecReasons = new Set([
+    "build_b1_reversal_long",
+    "build_flow_persists_short",
+    "swing_flow_persists_long",
+  ]);
+
+  if (unconditionalPremiumExecReasons.has(execReason)) {
     return {
       label: "PREMIUM",
       emoji: "✅",
-      reason: "build_b1_reversal_long",
+      reason: execReason,
     };
   }
 
-  if (execReason === "build_flow_persists_short") {
+  // Ignition breakout long is premium only when the model already rates it at A/B.
+  if (
+    execReason === "swing_ignition_breakout_long" &&
+    (finalConfidence === "A" || finalConfidence === "B")
+  ) {
     return {
       label: "PREMIUM",
       emoji: "✅",
-      reason: "build_flow_persists_short",
+      reason: `${execReason}_${finalConfidence}`,
     };
   }
 
   // Intentionally no active AVOID rules yet.
-  // The latest CSV does not give a stable enough currently-firing recipe
-  // that I trust to auto-stamp as AVOID.
   return { label: "", emoji: "", reason: "no_stamp" };
 }
+
+function getEntryAtoms(t = {}) {
+  const detail = t?.ctx?.execDetail || {};
+  const rawItem = t?._rawItem || {};
+  const levels = t?.levels || {};
+  const mode = String(t?.mode || "").toLowerCase();
+  const bias = String(t?.bias || "").toLowerCase();
+  const price = asNum(t?.price);
+
+  const l1h = levels?.["1h"];
+  const hi1h = asNum(l1h?.hi);
+  const lo1h = asNum(l1h?.lo);
+
+  const contTf = continuationTfForMode(mode);
+  const contLvl = levels?.[contTf];
+  const contHi = asNum(detail?.contHi ?? contLvl?.hi);
+  const contLo = asNum(detail?.contLo ?? contLvl?.lo);
+
+  const p5 = asNum(detail?.p5 ?? rawItem?.deltas?.["5m"]?.price_change_pct);
+  const wickMeta = t?.ctx?.wickMeta || {};
+
+  let reversalMin = CFG.swingReversalMin5mMovePct;
+  const dpsBias = String(t?.ctx?.dps?.bias || "neutral").toLowerCase();
+  if (dpsBias === bias) reversalMin *= CFG.dps.favoredReversalMult;
+
+  let inLowBand = "";
+  let inHighBand = "";
+  if (
+    Number.isFinite(price) &&
+    Number.isFinite(hi1h) &&
+    Number.isFinite(lo1h) &&
+    hi1h > lo1h
+  ) {
+    const edge = CFG.strongEdgePct1h * (hi1h - lo1h);
+    inLowBand = price <= lo1h + edge;
+    inHighBand = price >= hi1h - edge;
+  }
+
+  const numOrBlank = (v) => {
+    const n = asNum(v);
+    return Number.isFinite(n) ? n : "";
+  };
+
+  const boolOrBlank = (v) => (typeof v === "boolean" ? v : "");
+
+  const matchedTfs = Array.isArray(detail?.matchedTfs) ? detail.matchedTfs : [];
+
+  return {
+    entry_atom_cont_tf: contTf || "",
+    entry_atom_hi_1h: numOrBlank(hi1h),
+    entry_atom_lo_1h: numOrBlank(lo1h),
+    entry_atom_cont_hi: numOrBlank(contHi),
+    entry_atom_cont_lo: numOrBlank(contLo),
+    entry_atom_p5: numOrBlank(p5),
+    entry_atom_reversal_min_pct: numOrBlank(reversalMin),
+    entry_atom_in_low_band: boolOrBlank(inLowBand),
+    entry_atom_in_high_band: boolOrBlank(inHighBand),
+    entry_atom_matched_tfs: matchedTfs.join(","),
+    entry_atom_match_count: numOrBlank(detail?.matchCount),
+    entry_atom_recent_low: numOrBlank(detail?.recentLow),
+    entry_atom_recent_high: numOrBlank(detail?.recentHigh),
+    entry_atom_reclaim_pct: numOrBlank(detail?.reclaimPct),
+    entry_atom_body_now_pct: numOrBlank(detail?.bodyNow),
+    entry_atom_avg_body_pct: numOrBlank(detail?.avgBody),
+    entry_atom_oi_rise_count: numOrBlank(detail?.oiRiseCount),
+    entry_atom_price_pct: numOrBlank(detail?.pricePct),
+    entry_atom_funding_rate: numOrBlank(detail?.fundingRate ?? detail?.funding),
+    entry_atom_wick_pct: numOrBlank(wickMeta?.wickPct),
+    entry_atom_wick_quality_score: numOrBlank(wickMeta?.qualityScore),
+    entry_atom_wick_strong: boolOrBlank(wickMeta?.strong),
+    entry_atom_wick_extreme: boolOrBlank(wickMeta?.extreme),
+  };
+}
+
 function computeDynamicRiskBudget({ mode, t, confidence }) {
   const m = String(mode || "scalp").toLowerCase();
   const baseRiskPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
@@ -3386,6 +3486,7 @@ async function evaluateCandidate({
     b1 = null,
     entryLine = null,
     execReason = null,
+    execDetail = null,
     curState = null,
     dps = null,
     wickMeta = null,
@@ -3618,8 +3719,9 @@ async function evaluateCandidate({
       continue;
     }
 
-    let entryLine = null;
+      let entryLine = null;
     let execReason = null;
+    let execDetail = null;
     let execWickMeta = null;
     let execBottoming = null;
 
@@ -3648,6 +3750,7 @@ async function evaluateCandidate({
 
         entryLine = g.entryLine || null;
         execReason = g.reason || null;
+        execDetail = g.detail || null;
         execWickMeta = g.wickMeta || null;
         execBottoming = g.bottoming || null;
       } else {
@@ -3679,11 +3782,11 @@ async function evaluateCandidate({
 
         entryLine = g.entryLine || null;
         execReason = g.reason || null;
+        execDetail = g.detail || null;
         execWickMeta = g.wickMeta || null;
         execBottoming = g.bottoming || null;
       }
     }
-
     winner = buildCandidate({
       mode,
       bias,
@@ -3692,6 +3795,7 @@ async function evaluateCandidate({
       b1,
       entryLine,
       execReason,
+      execDetail,
       curState,
       dps,
       wickMeta: execWickMeta,
@@ -4062,6 +4166,8 @@ const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
 const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
 const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
 const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
+const analyticsVersionTags = getAnalyticsVersionTags();
+const entryAtoms = getEntryAtoms(t);
 
 if (!isRandom) {
   const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
@@ -4110,7 +4216,8 @@ analyticsEvents.push({
   rr: rrInfo?.rr ?? "",
   confidence,
   confidence_base: confidenceMeta.baseConfidence,
-  confidence_score: confidenceMeta.finalScore,
+  confidence_score: confidenceMeta.finalScore,  
+  ...analyticsVersionTags,
   trade_read_label: tradeRead.label,
   trade_read_score: tradeRead.score,
   trade_read_summary: tradeRead.summary,
@@ -4125,7 +4232,8 @@ analyticsEvents.push({
   anomaly_pattern_adj: confidenceMeta.anomalyPatternAdj ?? "",
   ext_context_adj: confidenceMeta.extAdj,
   ext_context_bias: confidenceMeta.externalBias,
-  exec_reason: t?.execReason || "",
+  exec_reason: t?.execReason || "",  
+  ...entryAtoms,
 b1_strong: !!t?.b1?.strong,
 lean_15m: t?.ctx?.lean15m || "",
 lean_1h: t?.ctx?.lean1h || "",
@@ -4240,6 +4348,13 @@ const telegramRowFields = [
   "confidence",
   "confidence_base",
   "confidence_score",
+  "selector_version",
+  "confidence_version",
+  "trade_read_version",
+  "ext_context_version",
+  "btc_short_tf_version",
+  "entry_idea_version",
+  "random_baseline_version",
   "trade_read_label",
   "trade_read_score",
   "trade_read_summary",
@@ -4253,6 +4368,29 @@ const telegramRowFields = [
   "selector_rejection_reason",
   "anomaly_pattern_adj",
   "exec_reason",
+  "entry_atom_cont_tf",
+  "entry_atom_hi_1h",
+  "entry_atom_lo_1h",
+  "entry_atom_cont_hi",
+  "entry_atom_cont_lo",
+  "entry_atom_p5",
+  "entry_atom_reversal_min_pct",
+  "entry_atom_in_low_band",
+  "entry_atom_in_high_band",
+  "entry_atom_matched_tfs",
+  "entry_atom_match_count",
+  "entry_atom_recent_low",
+  "entry_atom_recent_high",
+  "entry_atom_reclaim_pct",
+  "entry_atom_body_now_pct",
+  "entry_atom_avg_body_pct",
+  "entry_atom_oi_rise_count",
+  "entry_atom_price_pct",
+  "entry_atom_funding_rate",
+  "entry_atom_wick_pct",
+  "entry_atom_wick_quality_score",
+  "entry_atom_wick_strong",
+  "entry_atom_wick_extreme",
   "b1_strong",
   "lean_15m",
   "lean_1h",
