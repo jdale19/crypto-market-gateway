@@ -2353,34 +2353,30 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   const finalConfidence = String(
     confidenceMeta?.finalConfidence || t?.confidence || ""
   ).toUpperCase();
+  const extAdj = Number(confidenceMeta?.extAdj || 0);
+  const externalBias = String(confidenceMeta?.externalBias || "neutral").toLowerCase();
+  const supportiveExternal = externalBias === "supportive" && extAdj > 0.15;
 
-  // PREMIUM = clearly positive, live-usable, and frequent enough to matter.
-  // Reconciled across older cohorts using the note boundaries that materially changed logic.
-  const unconditionalPremiumExecReasons = new Set([
-    "build_b1_reversal_long",
-    "build_flow_persists_short",
-    "swing_flow_persists_long",
-  ]);
-
-  if (unconditionalPremiumExecReasons.has(execReason)) {
+  // PREMIUM should be blind-usable, so keep it limited to the long pockets that are
+  // validated as positive returners and tighten them with supportive external.
+  if (execReason === "build_b1_reversal_long" && supportiveExternal) {
     return {
       label: "PREMIUM",
       emoji: "✅",
-      reason: execReason,
+      reason: `${execReason}_supportive_external`,
     };
   }
 
-  // Ignition breakout long is premium only when the model already rates it at A/B.
-  if (
-    execReason === "swing_ignition_breakout_long" &&
-    (finalConfidence === "A" || finalConfidence === "B")
-  ) {
+  if (execReason === "swing_flow_persists_long" && supportiveExternal) {
     return {
       label: "PREMIUM",
       emoji: "✅",
-      reason: `${execReason}_${finalConfidence}`,
+      reason: `${execReason}_supportive_external`,
     };
   }
+
+  // Ignition breakout long remains positive directionally, but the sample is still too
+  // small to treat as a blind-usable premium recipe.
 
   // Intentionally no active AVOID rules yet.
   return { label: "", emoji: "", reason: "no_stamp" };
