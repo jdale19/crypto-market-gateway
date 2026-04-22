@@ -2355,10 +2355,12 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   ).toUpperCase();
   const extAdj = Number(confidenceMeta?.extAdj || 0);
   const externalBias = String(confidenceMeta?.externalBias || "neutral").toLowerCase();
-  const supportiveExternal = externalBias === "supportive" && extAdj > 0.15;
+  const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
 
-  // PREMIUM should be blind-usable, so keep it limited to the long pockets that are
-  // validated as positive returners and tighten them with supportive external.
+  const supportiveExternal = externalBias === "supportive" && extAdj > 0.15;
+  const shortFriendlyExternal = externalBias !== "supportive";
+
+  // PREMIUM should be blind-usable, so keep it limited to the validated pockets only.
   if (execReason === "build_b1_reversal_long" && supportiveExternal) {
     return {
       label: "PREMIUM",
@@ -2372,6 +2374,20 @@ function computeRecipeStamp({ t, confidenceMeta }) {
       label: "PREMIUM",
       emoji: "✅",
       reason: `${execReason}_supportive_external`,
+    };
+  }
+
+  if (
+    execReason === "swing_flow_persists_short" &&
+    finalConfidence === "A" &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct < 0 &&
+    shortFriendlyExternal
+  ) {
+    return {
+      label: "PREMIUM",
+      emoji: "✅",
+      reason: `${execReason}_conf_a_negative_anomaly_oi_no_supportive_external`,
     };
   }
 
