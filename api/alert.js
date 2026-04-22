@@ -2391,8 +2391,13 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     };
   }
 
-  // Ignition breakout long remains positive directionally, but the sample is still too
-  // small to treat as a blind-usable premium recipe.
+  if (execReason === "swing_ignition_breakout_long" && supportiveExternal) {
+    return {
+      label: "PREMIUM",
+      emoji: "✅",
+      reason: `${execReason}_supportive_external`,
+    };
+  }
 
   // Intentionally no active AVOID rules yet.
   return { label: "", emoji: "", reason: "no_stamp" };
