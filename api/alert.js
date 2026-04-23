@@ -2404,7 +2404,7 @@ function computeRecipeStamp({ t, confidenceMeta }) {
 }
 
 function getEntryAtoms(t = {}) {
-  const detail = t?.ctx?.execDetail || {};
+  const detail = t?.execDetail || t?.ctx?.execDetail || {};
   const rawItem = t?._rawItem || {};
   const levels = t?.levels || {};
   const mode = String(t?.mode || "").toLowerCase();
