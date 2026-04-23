@@ -3531,6 +3531,7 @@ async function evaluateCandidate({
       b1,
       entryLine,
       execReason,
+      execDetail,
       curState,
       observationType,
       randomGroupId,
