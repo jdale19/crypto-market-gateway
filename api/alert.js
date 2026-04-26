@@ -2369,6 +2369,14 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     };
   }
 
+  if (execReason === "swing_liquidity_snap_reversal_long" && externalBias !== "neutral") {
+    return {
+      label: "PREMIUM",
+      emoji: "✅",
+      reason: `${execReason}_non_neutral_external`,
+    };
+  }
+
   if (execReason === "swing_flow_persists_long" && supportiveExternal) {
     return {
       label: "PREMIUM",
