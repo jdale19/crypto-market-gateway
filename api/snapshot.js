@@ -22,7 +22,16 @@ function pctChange(now, prev) {
 }
 
 function safeJsonParse(v) {
-  try { return JSON.parse(v); } catch { return null; }
+  if (v == null) return null;
+  if (typeof v === "object") return v;
+  if (typeof v === "string") {
+    try {
+      return JSON.parse(v);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function classifyState(priceChgPct, oiChgPct) {
