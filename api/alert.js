@@ -205,8 +205,8 @@ minRangePctByMode: {
   enabled: String(process.env.ALERT_ANOMALY_ENABLED || "1") === "1",
   tf: String(process.env.ALERT_ANOMALY_TF || "15m").toLowerCase(),
   basketSymbols: normalizeSymbols(
-    process.env.ALERT_ANOMALY_BASKET_SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT,NEARUSDT,SUIUSDT"
-  ),
+  process.env.DEFAULT_SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT,NEARUSDT,SUIUSDT"
+),
   minBasketSize: Number(process.env.ALERT_ANOMALY_MIN_BASKET_SIZE || 3),
   fallbackBasketSize: Number(process.env.ALERT_ANOMALY_FALLBACK_BASKET_SIZE || 5),
 },
