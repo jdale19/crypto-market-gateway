@@ -29,12 +29,13 @@ const EVAL_BUCKET_MS = 5 * 60 * 1000;
 const MODE_PRIORITY = ["scalp", "swing", "build"]; // fastest -> slowest
 
 const ANALYTICS_VERSION_TAGS = Object.freeze({
-  selector_version: "selector_v2_2026_04_12",
+  selector_version: "selector_v3_2026_05_02",
   confidence_version: "confidence_v2_2026_04_14",
   trade_read_version: "trade_read_v1_2026_04_14",
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
+  premium_recipe_version: "premium_v2_2026_05_02",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -103,6 +104,10 @@ const CFG = {
   minRR: Number(process.env.ALERT_MIN_RR || 1.5),
   randomBaselineEnabled: String(process.env.RANDOM_BASELINE_ENABLED || "0") === "1",
   randomBaselinePct: Number(process.env.RANDOM_BASELINE_PCT || 10),
+  premiumRealert: {
+    // Optional, safe default. Controls whether a repeat Premium reminder is still near the original entry.
+    entryTolerancePct: Number(process.env.ALERT_PREMIUM_REALERT_ENTRY_TOLERANCE_PCT || 0.35),
+  },
   stop: {
   // candle flip method for reversals
   reversalUseWick: String(process.env.ALERT_STOP_REVERSAL_USE_WICK || "0") === "1", // 0=body, 1=wick
@@ -352,6 +357,8 @@ macro: {
     lastState: (mode, id) => `alert:lastState:${String(mode || "unknown")}:${id}`,
     last15mState: (id) => `alert:lastState15m:${id}`, // legacy
     lastSentAt: (id, mode) => `alert:lastSentAt:${id}:${String(mode || "unknown")}`,
+    lastFiredAlert: (id, mode) => `alert:lastFiredAlert:${id}:${String(mode || "unknown")}`,
+    lastPremiumAlert: (id, mode) => `alert:lastPremiumAlert:${id}:${String(mode || "unknown")}`,
     series5m: (id) => `series5m:${id}`,
   },
 };
@@ -1937,6 +1944,14 @@ function evaluateSelectorPolicy(t) {
   const family = classifySelectorFamily(profile);
   const reasons = [];
 
+  if (profile.mode === "build" && profile.execReason === "build_b1_reversal_short") {
+    reasons.push("suppressed_build_b1_reversal_short");
+  }
+
+  if (profile.mode === "build" && profile.execReason === "build_flow_persists_long") {
+    reasons.push("suppressed_build_flow_persists_long");
+  }
+
  if (profile.mode === "swing" && profile.bias === "short" && profile.reversalConfirmed) {
   reasons.push("short_reversal_disabled");
 }
@@ -2344,9 +2359,18 @@ function computeTradeRead({ t, confidenceMeta, rrInfo }) {
     cautions: [...new Set(cautions)].slice(0, 3),
   };
 }
+function premiumStamp(label, reason, profile) {
+  return { label, emoji: label === "PREMIUM" ? "✅" : "", reason, profile };
+}
+
+function isFinitePctAtOrBelow(value, maxValue) {
+  const n = asNum(value);
+  return Number.isFinite(n) && n <= maxValue;
+}
+
 function computeRecipeStamp({ t, confidenceMeta }) {
   if (confidenceMeta?.selectorAllowed === false) {
-    return { label: "", emoji: "", reason: "selector_rejected" };
+    return { label: "", emoji: "", reason: "selector_rejected", profile: "" };
   }
 
   const execReason = String(t?.execReason || "").toLowerCase();
@@ -2354,35 +2378,43 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     confidenceMeta?.finalConfidence || t?.confidence || ""
   ).toUpperCase();
   const extAdj = Number(confidenceMeta?.extAdj || 0);
-  const externalBias = String(confidenceMeta?.externalBias || "neutral").toLowerCase();
   const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
+  const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
+  const qqqDayPct = asNum(t?.ctx?.qqqDayPct);
+  const spxDayPct = asNum(t?.ctx?.spxDayPct);
 
-  const supportiveExternal = externalBias === "supportive" && extAdj > 0.15;
-  const shortFriendlyExternal = externalBias !== "supportive";
+  // Use the side-aware signed external adjustment for Premium confirmation.
+  // Positive extAdj supports the trade side; negative extAdj fights the trade side.
+  const sideAwareExternalSupport = extAdj > 0.15;
+  const sideAwareExternalNonNeutral = Math.abs(extAdj) > 0.15;
+  const sideAwareExternalNotHostile = extAdj >= -0.15;
+  const macroEquitiesNotOverheated =
+    isFinitePctAtOrBelow(qqqDayPct, 0.75) &&
+    isFinitePctAtOrBelow(spxDayPct, 0.75);
 
   // PREMIUM should be blind-usable, so keep it limited to the validated pockets only.
-  if (execReason === "build_b1_reversal_long" && supportiveExternal) {
-    return {
-      label: "PREMIUM",
-      emoji: "✅",
-      reason: `${execReason}_supportive_external`,
-    };
+  if (execReason === "build_b1_reversal_long" && sideAwareExternalSupport) {
+    return premiumStamp(
+      "PREMIUM",
+      `${execReason}_side_aware_external_support`,
+      "build B1 reversal long + side-aware external support"
+    );
   }
 
-  if (execReason === "swing_liquidity_snap_reversal_long" && externalBias !== "neutral") {
-    return {
-      label: "PREMIUM",
-      emoji: "✅",
-      reason: `${execReason}_non_neutral_external`,
-    };
+  if (execReason === "swing_liquidity_snap_reversal_long" && sideAwareExternalNonNeutral) {
+    return premiumStamp(
+      "PREMIUM",
+      `${execReason}_side_aware_non_neutral_external`,
+      "swing liquidity snap reversal long + non-neutral side-aware external"
+    );
   }
 
-  if (execReason === "swing_flow_persists_long" && supportiveExternal) {
-    return {
-      label: "PREMIUM",
-      emoji: "✅",
-      reason: `${execReason}_supportive_external`,
-    };
+  if (execReason === "swing_flow_persists_long" && sideAwareExternalSupport) {
+    return premiumStamp(
+      "PREMIUM",
+      `${execReason}_side_aware_external_support`,
+      "swing flow-persist long + side-aware external support"
+    );
   }
 
   if (
@@ -2390,25 +2422,109 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     finalConfidence === "A" &&
     Number.isFinite(anomalyOiPct) &&
     anomalyOiPct < 0 &&
-    shortFriendlyExternal
+    sideAwareExternalNotHostile
   ) {
-    return {
-      label: "PREMIUM",
-      emoji: "✅",
-      reason: `${execReason}_conf_a_negative_anomaly_oi_no_supportive_external`,
-    };
+    return premiumStamp(
+      "PREMIUM",
+      `${execReason}_conf_a_negative_anomaly_oi_side_aware_external_not_hostile`,
+      "swing flow-persist short + A + negative anomaly OI + external not hostile"
+    );
   }
 
-  if (execReason === "swing_ignition_breakout_long" && supportiveExternal) {
-    return {
-      label: "PREMIUM",
-      emoji: "✅",
-      reason: `${execReason}_supportive_external`,
-    };
+  if (
+    execReason === "swing_ignition_breakout_long" &&
+    anomalyPattern === "long_build" &&
+    macroEquitiesNotOverheated
+  ) {
+    return premiumStamp(
+      "PREMIUM",
+      `${execReason}_long_build_macro_not_overheated`,
+      "swing ignition breakout long + long_build + QQQ/SPX not overheated"
+    );
   }
 
-  // Intentionally no active AVOID rules yet.
-  return { label: "", emoji: "", reason: "no_stamp" };
+  if (execReason === "swing_ignition_breakout_long" && sideAwareExternalSupport) {
+    return premiumStamp(
+      "PREMIUM",
+      `${execReason}_side_aware_external_support`,
+      "swing ignition breakout long + side-aware external support"
+    );
+  }
+
+  return { label: "", emoji: "", reason: "no_stamp", profile: "" };
+}
+
+function buildStoredAlertStateFromEvent(e = {}) {
+  return {
+    ts: Date.now(),
+    symbol: e.symbol || "",
+    instId: e.instId || "",
+    mode: e.mode || "",
+    side: e.side || "",
+    execReason: e.exec_reason || "",
+    entryPrice: asNum(e.entry_price),
+    confidence: e.confidence || "",
+    recipeLabel: e.recipe_stamp_label || "",
+    recipeReason: e.recipe_stamp_reason || "",
+    recipeProfile: e.recipe_stamp_profile || "",
+  };
+}
+
+function isSameAlertSetup(last = {}, t = {}) {
+  return (
+    String(last.symbol || "").toUpperCase() === String(t?.symbol || "").toUpperCase() &&
+    String(last.instId || "") === String(t?.instId || "") &&
+    String(last.mode || "").toLowerCase() === String(t?.mode || "").toLowerCase() &&
+    String(last.side || "").toLowerCase() === String(t?.bias || "").toLowerCase() &&
+    String(last.execReason || "").toLowerCase() === String(t?.execReason || "").toLowerCase()
+  );
+}
+
+function entryDistancePct(a, b) {
+  const x = asNum(a);
+  const y = asNum(b);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || y <= 0) return null;
+  return Math.abs((x - y) / y) * 100;
+}
+
+function isRecentRepeatState({ lastState, now, mode }) {
+  const ts = asNum(lastState?.ts);
+  if (!Number.isFinite(ts)) return false;
+  const ageMin = (Number(now) - ts) / 60000;
+  if (!Number.isFinite(ageMin) || ageMin < CFG.cooldownMinutes) return false;
+  const maxAgeMin = Math.max(CFG.cooldownMinutes * 2, horizonMinForMode(mode));
+  return ageMin <= maxAgeMin;
+}
+
+function evaluateRepeatAlertPolicy({ t, recipeStamp, tradeRead, lastFiredState, now }) {
+  if (!lastFiredState || !isSameAlertSetup(lastFiredState, t)) {
+    return { reject: false, isReminder: false, reason: "new_or_changed_setup" };
+  }
+
+  if (!isRecentRepeatState({ lastState: lastFiredState, now, mode: t?.mode })) {
+    return { reject: false, isReminder: false, reason: "repeat_state_expired" };
+  }
+
+  if (recipeStamp?.label !== "PREMIUM") {
+    return { reject: true, isReminder: false, reason: "repeat_non_premium_suppressed" };
+  }
+
+  const distPct = entryDistancePct(t?.price, lastFiredState?.entryPrice);
+  const tolerancePct = Number(CFG.premiumRealert?.entryTolerancePct || 0.35);
+  if (!Number.isFinite(distPct) || distPct > tolerancePct) {
+    return { reject: true, isReminder: false, reason: "premium_repeat_not_near_entry" };
+  }
+
+  if ((tradeRead?.cautions || []).length > 1) {
+    return { reject: true, isReminder: false, reason: "premium_repeat_caution_heavy" };
+  }
+
+  return {
+    reject: false,
+    isReminder: true,
+    reason: "premium_still_valid_entry_reminder",
+    entryDistancePct: Number(distPct.toFixed(4)),
+  };
 }
 
 function getEntryAtoms(t = {}) {
@@ -4194,6 +4310,29 @@ const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal
 const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
 const analyticsVersionTags = getAnalyticsVersionTags();
 const entryAtoms = getEntryAtoms(t);
+let repeatDecision = { reject: false, isReminder: false, reason: "" };
+
+if (!isRandom && !force) {
+  const lastFiredRaw = await redis.get(CFG.keys.lastFiredAlert(t.instId, mode)).catch(() => null);
+  const lastFiredState = safeJsonParse(lastFiredRaw);
+  repeatDecision = evaluateRepeatAlertPolicy({
+    t,
+    recipeStamp,
+    tradeRead,
+    lastFiredState,
+    now,
+  });
+
+  if (repeatDecision.reject) {
+    if (debug) skipped.push({
+      symbol: t.symbol,
+      mode,
+      reason: repeatDecision.reason,
+      detail: { execReason: t?.execReason || "", recipe: recipeStamp.reason || "" },
+    });
+    continue;
+  }
+}
 
 if (!isRandom) {
   const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
@@ -4201,9 +4340,8 @@ if (!isRandom) {
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
 
   if (recipeStamp.label === "PREMIUM") {
-    lines.push(`PREMIUM ${recipeStamp.emoji}`);
-  } else if (recipeStamp.label === "AVOID") {
-    lines.push(`AVOID ${recipeStamp.emoji}`);
+    lines.push(`PREMIUM ${recipeStamp.emoji}${repeatDecision.isReminder ? " | Reminder: still valid" : ""}`);
+    if (recipeStamp.profile) lines.push(`Profile: ${recipeStamp.profile}`);
   }
 
   lines.push(`Main Edge: ${mainEdge}`);
@@ -4258,7 +4396,13 @@ analyticsEvents.push({
   anomaly_pattern_adj: confidenceMeta.anomalyPatternAdj ?? "",
   ext_context_adj: confidenceMeta.extAdj,
   ext_context_bias: confidenceMeta.externalBias,
-  exec_reason: t?.execReason || "",  
+  exec_reason: t?.execReason || "",
+  recipe_stamp_label: recipeStamp.label || "",
+  recipe_stamp_reason: recipeStamp.reason || "",
+  recipe_stamp_profile: recipeStamp.profile || "",
+  premium_realert: !!repeatDecision.isReminder,
+  premium_realert_reason: repeatDecision.reason || "",
+  premium_realert_entry_distance_pct: repeatDecision.entryDistancePct ?? "",
   ...entryAtoms,
 b1_strong: !!t?.b1?.strong,
 lean_15m: t?.ctx?.lean15m || "",
@@ -4283,6 +4427,16 @@ status: isRandom ? "PENDING" : (finalRejectionReason ? "DONE" : "PENDING"),
 exit_price: "",
 return_pct: "",
 abs_return_pct: "",
+mfe_pct: "",
+mae_pct: "",
+mfe_before_due_pct: "",
+mae_before_due_pct: "",
+hit_1r: "",
+hit_1_5r: "",
+hit_2r: "",
+time_to_mfe_min: "",
+return_at_due_pct: "",
+return_at_2x_due_pct: "",
 result: isRandom ? "" : (finalRejectionReason ? "SKIPPED" : ""),
 gateway_version: deployInfo.sha || "",
 observation_type: observationType,
@@ -4380,6 +4534,7 @@ const telegramRowFields = [
   "ext_context_version",
   "btc_short_tf_version",
   "entry_idea_version",
+  "premium_recipe_version",
   "random_baseline_version",
   "trade_read_label",
   "trade_read_score",
@@ -4394,6 +4549,12 @@ const telegramRowFields = [
   "selector_rejection_reason",
   "anomaly_pattern_adj",
   "exec_reason",
+  "recipe_stamp_label",
+  "recipe_stamp_reason",
+  "recipe_stamp_profile",
+  "premium_realert",
+  "premium_realert_reason",
+  "premium_realert_entry_distance_pct",
   "entry_atom_cont_tf",
   "entry_atom_hi_1h",
   "entry_atom_lo_1h",
@@ -4486,6 +4647,16 @@ const telegramRowFields = [
   "exit_price",
   "return_pct",
   "abs_return_pct",
+  "mfe_pct",
+  "mae_pct",
+  "mfe_before_due_pct",
+  "mae_before_due_pct",
+  "hit_1r",
+  "hit_1_5r",
+  "hit_2r",
+  "time_to_mfe_min",
+  "return_at_due_pct",
+  "return_at_2x_due_pct",
   "result",
   "gateway_version",
   "observation_type",
@@ -4646,6 +4817,23 @@ if (!force && renderedRowCount === 0) {
 
 if (firedStateWrites.length > 0) {
   await Promise.all(firedStateWrites);
+}
+
+const firedAlertStateWrites = analyticsEvents
+  .filter((e) => e.observation_type === "fired" && e.instId && e.mode)
+  .map((e) => {
+    const state = buildStoredAlertStateFromEvent(e);
+    const writes = [
+      redis.set(CFG.keys.lastFiredAlert(e.instId, e.mode), JSON.stringify(state)).catch(() => null),
+    ];
+    if (e.recipe_stamp_label === "PREMIUM") {
+      writes.push(redis.set(CFG.keys.lastPremiumAlert(e.instId, e.mode), JSON.stringify(state)).catch(() => null));
+    }
+    return Promise.all(writes);
+  });
+
+if (firedAlertStateWrites.length > 0) {
+  await Promise.all(firedAlertStateWrites);
 }
 
       if (firedKeys.length > 0) {
