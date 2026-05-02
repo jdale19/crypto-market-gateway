@@ -3,7 +3,7 @@
 //
 // CHANGE (minimal rework):
 // - MULTI MODE SELECTION: support mode=scalp,swing,build and DEFAULT_MODES env var
-// - PRIORITY: faster mode always wins (SCALP > SWING > BUILD)
+// - PRIORITY: Premium is sendable; non-Premium cannot preempt Premium across modes
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
 // - SWING/BUILD: "B1 reversal" entry option (bounce/reject near 1h extremes)
 // - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
@@ -26,8 +26,8 @@ const redis = new Redis({
 
 const EVAL_BUCKET_MS = 5 * 60 * 1000;
 
-// Faster always wins
-const MODE_PRIORITY = ["scalp", "swing", "build"]; // fastest -> slowest
+// Stable evaluation order only; Telegram sendability is Premium-first, not mode-first.
+const MODE_PRIORITY = ["scalp", "swing", "build"];
 
 const ANALYTICS_VERSION_TAGS = Object.freeze({
   selector_version: "selector_v3_2026_05_02",
@@ -3788,6 +3788,7 @@ async function evaluateCandidate({
   }
 
   let winner = null;
+  const winners = [];
   let candidate = null;
   let lastReject = {
     reason: "",
@@ -3836,15 +3837,8 @@ async function evaluateCandidate({
       dps,
     });
 
-    const lastSentRaw = await redis.get(CFG.keys.lastSentAt(instId, mode));
-    const lastSent = lastSentRaw == null ? null : Number(lastSentRaw);
-
-    if (!force && lastSent && now - lastSent < CFG.cooldownMinutes * 60 * 1000) {
-      if (debug) skipped.push({ symbol, mode, reason: "cooldown" });
-      lastReject = { reason: "cooldown", mode, bias, detail: null };
-      candidate = { ...candidate, rejectionReason: "cooldown" };
-      continue;
-    }
+    // Do not apply pre-Premium cooldown here. Premium repeat control happens
+    // after recipe stamping, so non-Premium candidates cannot suppress Premium.
 
     const { minRangePct } = getModeCfg(mode);
     const rPct = rangePct1h({ levels, price: item.price });
@@ -4047,16 +4041,18 @@ async function evaluateCandidate({
       continue;
     }
 
-    break;
+    winners.push(winner);
+    continue;
   }
 
   return {
-    winner,
+    winner: winners[0] || null,
+    winners,
     candidate,
-    rejectionReason: winner ? "" : lastReject.reason,
-    rejectionMode: winner ? "" : lastReject.mode,
-    rejectionBias: winner ? "" : lastReject.bias,
-    rejectionDetail: winner ? null : lastReject.detail,
+    rejectionReason: winners.length ? "" : lastReject.reason,
+    rejectionMode: winners.length ? "" : lastReject.mode,
+    rejectionBias: winners.length ? "" : lastReject.bias,
+    rejectionDetail: winners.length ? null : lastReject.detail,
   };
 }
 
@@ -4095,7 +4091,11 @@ for (const item of j.results || []) {
   }
 
   const evaluated = await evaluateCandidate({ item });
-  if (evaluated.winner) triggered.push(evaluated.winner);
+  if (Array.isArray(evaluated.winners) && evaluated.winners.length) {
+    triggered.push(...evaluated.winners);
+  } else if (evaluated.winner) {
+    triggered.push(evaluated.winner);
+  }
 }
 
 if (randomEval?.winner) {
@@ -4139,6 +4139,17 @@ for (const t of triggered) {
 
   const confidenceMeta = computeConfidence(t);
   const confidence = confidenceMeta.finalConfidence;
+  const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
+  const isPremium = recipeStamp.label === "PREMIUM";
+  if (!isRandom && !force && !isPremium) {
+    if (debug) skipped.push({
+      symbol: t.symbol,
+      mode,
+      reason: "non_premium_not_sendable",
+      detail: { execReason: t?.execReason || "", side: bias },
+    });
+    continue;
+  }
   const profile = getTradeProfile(t);
   const wickMeta = t?.ctx?.wickMeta || {};
   const flowPersists = profile.flowPersists;
@@ -4235,14 +4246,16 @@ const tpPick = chooseDynamicTp({
 });
 
 if (!tpPick) {
-  skipped.push({ symbol: t.symbol, mode, reason: "no_dynamic_tp" });
-  lateRejectionReasons.push("no_dynamic_tp");
-  if (!isRejected) {
-    if (isRandom) {
-      rejectionReason = "no_dynamic_tp";
-      isRejected = true;
-    } else {
-      continue;
+  skipped.push({ symbol: t.symbol, mode, reason: isPremium ? "premium_no_dynamic_tp_advisory" : "no_dynamic_tp" });
+  if (!isPremium) {
+    lateRejectionReasons.push("no_dynamic_tp");
+    if (!isRejected) {
+      if (isRandom) {
+        rejectionReason = "no_dynamic_tp";
+        isRejected = true;
+      } else {
+        continue;
+      }
     }
   }
 }
@@ -4265,13 +4278,15 @@ if (mode === "build" && Number.isFinite(tpPct) && tpPct < CFG.minTpPctByMode.bui
     },
   });
 
-  lateRejectionReasons.push("build_tp_too_small");
-  if (!isRejected) {
-    if (isRandom) {
-      rejectionReason = "build_tp_too_small";
-      isRejected = true;
-    } else {
-      continue;
+  if (!isPremium) {
+    lateRejectionReasons.push("build_tp_too_small");
+    if (!isRejected) {
+      if (isRandom) {
+        rejectionReason = "build_tp_too_small";
+        isRejected = true;
+      } else {
+        continue;
+      }
     }
   }
 }
@@ -4302,13 +4317,15 @@ if (tpPick && (!rrInfo || rrInfo.rr < CFG.minRR)) {
     }
   });
 
-  lateRejectionReasons.push("rr_too_small");
-  if (!isRejected) {
-    if (isRandom) {
-      rejectionReason = "rr_too_small";
-      isRejected = true;
-    } else {
-      continue;
+  if (!isPremium) {
+    lateRejectionReasons.push("rr_too_small");
+    if (!isRejected) {
+      if (isRandom) {
+        rejectionReason = "rr_too_small";
+        isRejected = true;
+      } else {
+        continue;
+      }
     }
   }
 }
@@ -4331,7 +4348,7 @@ if (shouldApplyDeferredRangeFloor) {
     skipped.push({
       symbol: t.symbol,
       mode,
-      reason: "range_floor",
+      reason: isPremium ? "premium_range_floor_advisory" : "range_floor",
       detail: {
         rangePct1h: deferredRangeFloor?.rangePct1h ?? null,
         minRangePct: deferredRangeFloor?.minRangePct ?? null,
@@ -4345,13 +4362,15 @@ if (shouldApplyDeferredRangeFloor) {
       },
     });
 
-    lateRejectionReasons.push("range_floor");
-    if (!isRejected) {
-      if (isRandom) {
-        rejectionReason = "range_floor";
-        isRejected = true;
-      } else {
-        continue;
+    if (!isPremium) {
+      lateRejectionReasons.push("range_floor");
+      if (!isRejected) {
+        if (isRandom) {
+          rejectionReason = "range_floor";
+          isRejected = true;
+        } else {
+          continue;
+        }
       }
     }
   }
@@ -4373,7 +4392,6 @@ if (shouldApplyDeferredRangeFloor) {
 const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
 const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
 const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
-const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
 const analyticsVersionTags = getAnalyticsVersionTags();
 const entryAtoms = getEntryAtoms(t);
 let repeatDecision = { reject: false, isReminder: false, reason: "" };
@@ -4782,7 +4800,7 @@ const firedKeys = [
 
 const { itemErrors, topSkips } = summarizeSkips(skipped);
 
-if (!force && renderedRowCount === 0) {
+if (!force && renderedTradeCount === 0) {
   if (!dry) {
     await postAnalyticsBatch(analyticsEvents, {
       deploy_sha:
