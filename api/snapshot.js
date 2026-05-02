@@ -170,6 +170,23 @@ async function fetchOkxSwap(instId) {
   return { ok: true, price, open, high, low, funding_rate, open_interest_contracts };
 }
 
+
+async function mapWithConcurrency(items, limit, fn) {
+  const out = new Array(items.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < items.length) {
+      const current = idx++;
+      out[current] = await fn(items[current], current);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(Number(limit) || 1, items.length));
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return out;
+}
+
 async function processOne(symbol, reqCache) {
   const base = baseFromSymbolUSDT(symbol);
   if (!base) return { ok: false, symbol, error: "bad symbol format" };
@@ -252,9 +269,8 @@ export default async function handler(req, res) {
     const symbols = normalizeSymbolsQuery(req);
     const reqCache = { swapList: null, instMap: new Map() };
 
-    const results = await Promise.all(
-      symbols.map((s) => processOne(s, reqCache))
-    );
+    const maxConcurrency = Number(process.env.SNAPSHOT_MAX_CONCURRENCY || 5);
+    const results = await mapWithConcurrency(symbols, maxConcurrency, (s) => processOne(s, reqCache));
 
     res.setHeader("Cache-Control", "no-store");
 
