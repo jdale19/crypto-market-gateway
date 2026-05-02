@@ -10,6 +10,7 @@
 // - MESSAGE CONTRACT: header includes MODE; uses Entry Zone format (no Entry: line)
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
+// - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -1010,6 +1011,71 @@ function buildEvaluationTiming(baseTs, horizonMin) {
     evalBucket,
     evalTsEffective: evalBucket * EVAL_BUCKET_MS,
   };
+}
+
+function getEtSessionTelemetry(ts = Date.now()) {
+  const n = Number(ts);
+  const date = Number.isFinite(n) ? new Date(n) : new Date();
+
+  const fallback = {
+    day_of_week_et: "",
+    day_num_et: "",
+    is_weekend_et: "",
+    is_us_equity_rth: "",
+    us_equity_session: "",
+  };
+
+  if (!Number.isFinite(date.getTime())) return fallback;
+
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(date);
+
+    const partMap = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+    const dayShort = String(partMap.weekday || "");
+    const weekdayNum = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[dayShort];
+    const weekdayName = {
+      Sun: "Sunday",
+      Mon: "Monday",
+      Tue: "Tuesday",
+      Wed: "Wednesday",
+      Thu: "Thursday",
+      Fri: "Friday",
+      Sat: "Saturday",
+    }[dayShort] || "";
+
+    const hour = Number(partMap.hour);
+    const minute = Number(partMap.minute);
+
+    if (!Number.isFinite(weekdayNum) || !Number.isFinite(hour) || !Number.isFinite(minute)) {
+      return fallback;
+    }
+
+    const minuteOfDay = hour * 60 + minute;
+    const isWeekend = weekdayNum === 0 || weekdayNum === 6;
+    const isRth = !isWeekend && minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 16 * 60;
+
+    let session = "overnight";
+    if (isWeekend) session = "weekend";
+    else if (isRth) session = "regular";
+    else if (minuteOfDay >= 4 * 60 && minuteOfDay < 9 * 60 + 30) session = "pre_market";
+    else if (minuteOfDay >= 16 * 60 && minuteOfDay < 20 * 60) session = "after_hours";
+
+    return {
+      day_of_week_et: weekdayName,
+      day_num_et: weekdayNum,
+      is_weekend_et: isWeekend,
+      is_us_equity_rth: isRth,
+      us_equity_session: session,
+    };
+  } catch (_) {
+    return fallback;
+  }
 }
 
 function summarizeSkips(skipped) {
@@ -4352,6 +4418,7 @@ if (!isRandom) {
 
 const horizonMin = horizonMinForMode(mode);
 const evalTiming = buildEvaluationTiming(now, horizonMin);
+const sessionTelemetry = getEtSessionTelemetry(now);
 const anomaly = getAnomalyEventFields(t.symbol);
 
 
@@ -4365,6 +4432,7 @@ analyticsEvents.push({
   : `${now}_${t.symbol}_${mode}_${bias}`,
   source: "gateway",
   ts: now,
+  ...sessionTelemetry,
   due_ts: evalTiming.dueTs,
   eval_bucket: evalTiming.evalBucket,
   eval_ts_effective: evalTiming.evalTsEffective,
@@ -4512,6 +4580,11 @@ const telegramRowFields = [
   "alert_id",
   "source",
   "ts",
+  "day_of_week_et",
+  "day_num_et",
+  "is_weekend_et",
+  "is_us_equity_rth",
+  "us_equity_session",
   "due_ts",
   "eval_bucket",
   "eval_ts_effective",
