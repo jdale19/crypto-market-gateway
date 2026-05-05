@@ -38,7 +38,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "premium_v3_2026_05_05",
+  premium_recipe_version: "premium_v3_1_2026_05_05",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -2465,7 +2465,7 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     return premiumStamp(
       "PREMIUM",
       `${execReason}_side_aware_external_support`,
-      "build B1 reversal long + side-aware external support"
+      "Tier 3 | build B1 reversal long + side-aware external support"
     );
   }
 
@@ -2473,7 +2473,7 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     return premiumStamp(
       "PREMIUM",
       `${execReason}_side_aware_non_neutral_external`,
-      "swing liquidity snap reversal long + non-neutral side-aware external"
+      "Tier 2 | swing liquidity snap reversal long + non-neutral side-aware external"
     );
   }
 
@@ -2488,7 +2488,7 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     return premiumStamp(
       "PREMIUM",
       `${execReason}_conf_a_negative_anomaly_oi_side_aware_external_not_hostile`,
-      "swing flow-persist short + A + negative anomaly OI + external not hostile"
+      "Tier 1 | swing flow-persist short + A + negative anomaly OI + external not hostile"
     );
   }
 
@@ -2500,7 +2500,7 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     return premiumStamp(
       "PREMIUM",
       `${execReason}_long_build_macro_not_overheated`,
-      "swing ignition breakout long + long_build + QQQ/SPX not overheated"
+      "Tier 1 | swing ignition breakout long + long_build + QQQ/SPX not overheated"
     );
   }
 
