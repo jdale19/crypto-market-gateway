@@ -11,6 +11,8 @@
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
+// - PREMIUM CLEANUP: demote flow-persist long external-support and ignition external-support-only recipes
+// - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -36,7 +38,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "premium_v2_2026_05_02",
+  premium_recipe_version: "premium_v3_2026_05_05",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -2475,13 +2477,6 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     );
   }
 
-  if (execReason === "swing_flow_persists_long" && sideAwareExternalSupport) {
-    return premiumStamp(
-      "PREMIUM",
-      `${execReason}_side_aware_external_support`,
-      "swing flow-persist long + side-aware external support"
-    );
-  }
 
   if (
     execReason === "swing_flow_persists_short" &&
@@ -2509,13 +2504,6 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     );
   }
 
-  if (execReason === "swing_ignition_breakout_long" && sideAwareExternalSupport) {
-    return premiumStamp(
-      "PREMIUM",
-      `${execReason}_side_aware_external_support`,
-      "swing ignition breakout long + side-aware external support"
-    );
-  }
 
   return { label: "", emoji: "", reason: "no_stamp", profile: "" };
 }
@@ -4005,9 +3993,16 @@ async function evaluateCandidate({
     });
 
     if (candidate?.ctx) {
+      // Preserve execution-specific ctx fields from winner. The earlier candidate
+      // ctx can contain null wickMeta/bottoming values, so it must not overwrite
+      // the execution gate metadata used by entry_atom_wick_* analytics fields.
+      const executionCtx = winner.ctx || {};
       winner.ctx = {
-        ...(winner.ctx || {}),
         ...candidate.ctx,
+        ...executionCtx,
+        wickMeta: executionCtx.wickMeta ?? candidate.ctx?.wickMeta ?? null,
+        bottoming: executionCtx.bottoming ?? candidate.ctx?.bottoming ?? null,
+        dps: executionCtx.dps ?? candidate.ctx?.dps ?? null,
       };
     }
 
