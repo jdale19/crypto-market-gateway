@@ -7,11 +7,11 @@
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
 // - SWING: "B1 reversal" entry option (bounce/reject near 1h extremes); Build is no longer an automation mode
 // - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
-// - MESSAGE CONTRACT: concise Premium-only TG with recipe profile, management hint, edge/watch, and entry only
+// - MESSAGE CONTRACT: concise manual TG with recipe tier, management hint, edge/watch, and entry only
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
-// - PREMIUM CLEANUP: Build removed from automated Premium path; TG hides unvalidated TP/SL/invalidation prices
+// - MANUAL TG RECIPES: Build removed; only strongest Scalp/Swing manual recipes surface as PREMIUM; demoted recipes stay analytics-only; unvalidated TP/SL/invalidation hidden
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
 //
 // Notes:
@@ -38,7 +38,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "premium_v3_2_2026_05_09",
+  premium_recipe_version: "manual_tg_recipes_v2_premium_only_2026_05_09",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -2427,17 +2427,39 @@ function computeTradeRead({ t, confidenceMeta, rrInfo }) {
     cautions: [...new Set(cautions)].slice(0, 3),
   };
 }
+function tradeStamp(label, reason, profile) {
+  const cleanLabel = String(label || "").toUpperCase();
+  const emoji = cleanLabel === "PREMIUM" ? "✅" : "";
+  return { label: cleanLabel, emoji, reason, profile };
+}
+
 function premiumStamp(label, reason, profile) {
-  return { label, emoji: label === "PREMIUM" ? "✅" : "", reason, profile };
+  return tradeStamp(label, reason, profile);
+}
+
+function isSendableTradeStamp(recipeStamp) {
+  const label = String(recipeStamp?.label || "").toUpperCase();
+  return label === "PREMIUM";
 }
 
 function buildManagementHint(t, recipeStamp) {
   const mode = String(t?.mode || "").toLowerCase();
+  const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
   const recipeReason = String(recipeStamp?.reason || "").toLowerCase();
 
   if (mode === "swing" && execReason === "swing_liquidity_snap_reversal_long") {
     return "Trail TP / take partials; no blind due hold.";
+  }
+
+  if (recipeReason.includes("scalp_short_anomaly")) {
+    return "Fast TP; exit if downside stalls.";
+  }
+
+  if (recipeReason.includes("supportive_external_long")) {
+    return mode === "scalp"
+      ? "Fast long; trail only with immediate follow-through."
+      : "Standard hold; trail if momentum expands.";
   }
 
   if (mode === "swing" && execReason === "swing_ignition_breakout_long") {
@@ -2453,7 +2475,9 @@ function buildManagementHint(t, recipeStamp) {
   }
 
   if (mode === "scalp") {
-    return "Fast scalp; take profit quickly if follow-through stalls.";
+    return bias === "short"
+      ? "Fast scalp; cover quickly if downside stalls."
+      : "Fast scalp; take profit quickly if follow-through stalls.";
   }
 
   if (recipeReason) {
@@ -2480,34 +2504,69 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     return { label: "", emoji: "", reason: "selector_rejected", profile: "" };
   }
 
+  const mode = String(t?.mode || "").toLowerCase();
+  const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
   const finalConfidence = String(
     confidenceMeta?.finalConfidence || t?.confidence || ""
   ).toUpperCase();
   const extAdj = Number(confidenceMeta?.extAdj || 0);
   const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
+  const anomalyScore = asNum(t?.ctx?.anomalyScore);
   const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
+  const coinDayPct = asNum(t?.ctx?.coinDayPct);
   const qqqDayPct = asNum(t?.ctx?.qqqDayPct);
   const spxDayPct = asNum(t?.ctx?.spxDayPct);
 
-  // Use the side-aware signed external adjustment for Premium confirmation.
+  // Manual TG stance: Scalp/Swing only. Build is human-managed research and does not stamp TG trade recipes.
+  if (mode === "build") {
+    return { label: "", emoji: "", reason: "build_manual_research_only", profile: "" };
+  }
+
+  // Use the side-aware signed external adjustment for manual confirmation.
   // Positive extAdj supports the trade side; negative extAdj fights the trade side.
   const sideAwareExternalNonNeutral = Math.abs(extAdj) > 0.15;
   const sideAwareExternalNotHostile = extAdj >= -0.15;
+  const strongSwingLongExternal = mode === "swing" && bias === "long" && extAdj >= 1.25;
+  const strongScalpLongExternal = mode === "scalp" && bias === "long" && extAdj >= 0.5;
+  const scalpShortAnomalyPressure =
+    mode === "scalp" &&
+    bias === "short" &&
+    Number.isFinite(anomalyScore) &&
+    anomalyScore >= 1.2 &&
+    (!Number.isFinite(coinDayPct) || coinDayPct <= 1.0);
   const macroEquitiesNotOverheated =
     isFinitePctAtOrBelow(qqqDayPct, 0.75) &&
     isFinitePctAtOrBelow(spxDayPct, 0.75);
 
-  // PREMIUM should stay automation-ready. Build is manual/research-only and does not stamp Premium here.
+  // Scalp long support read: historically useful, but managed as fast scalp.
+  if (strongScalpLongExternal) {
+    return tradeStamp(
+      "PREMIUM",
+      `${mode}_${bias}_supportive_external_long`,
+      "Supportive Scalp Long"
+    );
+  }
+
+  // Scalp short anomaly pressure: large historical sample, fast-management trade.
+  if (scalpShortAnomalyPressure) {
+    return tradeStamp(
+      "PREMIUM",
+      `${mode}_${bias}_scalp_short_anomaly_pressure_coin_not_hot`,
+      "Scalp Short: anomaly pressure"
+    );
+  }
+
+  // Keep Liquidity Snap visible, but it is exit-sensitive; management hint carries the nuance.
   if (execReason === "swing_liquidity_snap_reversal_long" && sideAwareExternalNonNeutral) {
-    return premiumStamp(
+    return tradeStamp(
       "PREMIUM",
       `${execReason}_side_aware_non_neutral_external`,
       "Liquidity Snap Long"
     );
   }
 
-
+  // Demoted from TG surfacing: historical support weakened in current due-window data, so keep analytics-only.
   if (
     execReason === "swing_flow_persists_short" &&
     finalConfidence === "A" &&
@@ -2515,25 +2574,30 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     anomalyOiPct < 0 &&
     sideAwareExternalNotHostile
   ) {
-    return premiumStamp(
-      "PREMIUM",
-      `${execReason}_conf_a_negative_anomaly_oi_side_aware_external_not_hostile`,
-      "Flow Short: A + neg OI"
-    );
+    return { label: "", emoji: "", reason: `${execReason}_conf_a_negative_anomaly_oi_side_aware_external_not_hostile_demoted_analytics_only`, profile: "" };
   }
 
+  // Keep ignition long visible, but do not imply blind hold; management hint handles it.
   if (
     execReason === "swing_ignition_breakout_long" &&
     anomalyPattern === "long_build" &&
     macroEquitiesNotOverheated
   ) {
-    return premiumStamp(
+    return tradeStamp(
       "PREMIUM",
       `${execReason}_long_build_macro_not_overheated`,
       "Ignition Long: long_build"
     );
   }
 
+  // Strongest broad manual long read from historical scan. Placed after specific swing recipes so TG keeps recipe-specific management copy.
+  if (strongSwingLongExternal) {
+    return tradeStamp(
+      "PREMIUM",
+      `${mode}_${bias}_supportive_external_long_strong`,
+      "Supportive Swing Long"
+    );
+  }
 
   return { label: "", emoji: "", reason: "no_stamp", profile: "" };
 }
@@ -2589,8 +2653,8 @@ function evaluateRepeatAlertPolicy({ t, recipeStamp, tradeRead, lastFiredState, 
     return { reject: false, isReminder: false, reason: "repeat_state_expired" };
   }
 
-  if (recipeStamp?.label !== "PREMIUM") {
-    return { reject: true, isReminder: false, reason: "repeat_non_premium_suppressed" };
+  if (!isSendableTradeStamp(recipeStamp)) {
+    return { reject: true, isReminder: false, reason: "repeat_non_manual_recipe_suppressed" };
   }
 
   const distPct = entryDistancePct(t?.price, lastFiredState?.entryPrice);
@@ -3748,6 +3812,8 @@ async function evaluateCandidate({
       rejectionReason,
       ctx: {
         anomalyTf: anomalyCtx.anomaly_tf || "",
+        anomalyScore: asNum(anomalyCtx.anomaly_score),
+        anomalyRank: asNum(anomalyCtx.anomaly_rank),
         anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
         anomalyPattern: anomalyCtx.anomaly_pattern || "",
         oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
@@ -4158,6 +4224,8 @@ for (const t of triggered) {
   t.ctx = {
     ...(t.ctx || {}),
     anomalyTf: anomalyCtx.anomaly_tf || "",
+    anomalyScore: asNum(anomalyCtx.anomaly_score),
+    anomalyRank: asNum(anomalyCtx.anomaly_rank),
     anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
     anomalyPattern: anomalyCtx.anomaly_pattern || "",
   };
@@ -4166,11 +4234,12 @@ for (const t of triggered) {
   const confidence = confidenceMeta.finalConfidence;
   const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
   const isPremium = recipeStamp.label === "PREMIUM";
-  if (!isRandom && !force && !isPremium) {
+  const isSendableManualTrade = isSendableTradeStamp(recipeStamp);
+  if (!isRandom && !force && !isSendableManualTrade) {
     if (debug) skipped.push({
       symbol: t.symbol,
       mode,
-      reason: "non_premium_not_sendable",
+      reason: "non_manual_recipe_not_sendable",
       detail: { execReason: t?.execReason || "", side: bias },
     });
     continue;
@@ -4447,8 +4516,9 @@ if (!isRandom) {
   const profileLabel = recipeStamp.profile || prettifyDecisionToken(t?.execReason || "Premium setup");
   const watch = compactTradeWatch(tradeRead);
 
+  const stampLabel = String(recipeStamp.label || "SETUP").toUpperCase();
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-  lines.push(`PREMIUM ${recipeStamp.emoji}${repeatDecision.isReminder ? " | Reminder" : ""} | ${profileLabel}`);
+  lines.push(`${stampLabel} ${recipeStamp.emoji}${repeatDecision.isReminder ? " | Reminder" : ""} | ${profileLabel}`);
   if (managementHint) lines.push(`Mgmt: ${managementHint}`);
   if (tradeRead.summary) lines.push(`Edge: ${tradeRead.summary}`);
   if (watch) lines.push(`Watch: ${watch}`);
