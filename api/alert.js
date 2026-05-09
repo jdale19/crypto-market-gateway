@@ -2,16 +2,16 @@
 // Crypto Market Gateway — mode-aware alerts (scalp strict, swing realistic)
 //
 // CHANGE (minimal rework):
-// - MULTI MODE SELECTION: support mode=scalp,swing,build and DEFAULT_MODES env var
+// - MULTI MODE SELECTION: support automation modes scalp/swing via mode query or DEFAULT_MODES env var
 // - PRIORITY: Premium is sendable; non-Premium cannot preempt Premium across modes
 // - SCALP: unchanged logic (strict breakout/sweep + strict OI confirmation + B1 required)
-// - SWING/BUILD: "B1 reversal" entry option (bounce/reject near 1h extremes)
+// - SWING: "B1 reversal" entry option (bounce/reject near 1h extremes); Build is no longer an automation mode
 // - DM COPY: explicit numeric zone ranges (ex: 1.594–1.597)
-// - MESSAGE CONTRACT: header includes MODE; uses Entry Zone format (no Entry: line)
+// - MESSAGE CONTRACT: concise Premium-only TG with recipe profile, management hint, edge/watch, and entry only
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
-// - PREMIUM CLEANUP: demote flow-persist long external-support and ignition external-support-only recipes
+// - PREMIUM CLEANUP: Build removed from automated Premium path; TG hides unvalidated TP/SL/invalidation prices
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
 //
 // Notes:
@@ -29,16 +29,16 @@ const redis = new Redis({
 const EVAL_BUCKET_MS = 5 * 60 * 1000;
 
 // Stable evaluation order only; Telegram sendability is Premium-first, not mode-first.
-const MODE_PRIORITY = ["scalp", "swing", "build"];
+const MODE_PRIORITY = ["scalp", "swing"];
 
 const ANALYTICS_VERSION_TAGS = Object.freeze({
-  selector_version: "selector_v3_2026_05_02",
+  selector_version: "selector_v3_1_2026_05_09",
   confidence_version: "confidence_v2_2026_04_14",
   trade_read_version: "trade_read_v1_2026_04_14",
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "premium_v3_1_2026_05_05",
+  premium_recipe_version: "premium_v3_2_2026_05_09",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -120,7 +120,7 @@ const CFG = {
 },
   
   // Defaults
-  // NEW: DEFAULT_MODES="scalp,swing" (comma list)
+  // DEFAULT_MODES="scalp,swing" (comma list). Build is manual/research-only and ignored here.
   // Fallbacks: DEFAULT_MODE then "scalp"
   defaultModesRaw: String(process.env.DEFAULT_MODES || "").toLowerCase(),
   defaultMode: String(process.env.DEFAULT_MODE || "scalp").toLowerCase(), // legacy fallback
@@ -2431,6 +2431,45 @@ function premiumStamp(label, reason, profile) {
   return { label, emoji: label === "PREMIUM" ? "✅" : "", reason, profile };
 }
 
+function buildManagementHint(t, recipeStamp) {
+  const mode = String(t?.mode || "").toLowerCase();
+  const execReason = String(t?.execReason || "").toLowerCase();
+  const recipeReason = String(recipeStamp?.reason || "").toLowerCase();
+
+  if (mode === "swing" && execReason === "swing_liquidity_snap_reversal_long") {
+    return "Trail TP / take partials; no blind due hold.";
+  }
+
+  if (mode === "swing" && execReason === "swing_ignition_breakout_long") {
+    return "Take partials into strength; runner only with follow-through.";
+  }
+
+  if (mode === "swing" && execReason === "swing_flow_persists_short") {
+    return "Fast validation; exit if downside stalls.";
+  }
+
+  if (mode === "swing" && execReason === "swing_flow_persists_long") {
+    return "Standard hold; runner only if MFE expands cleanly.";
+  }
+
+  if (mode === "scalp") {
+    return "Fast scalp; take profit quickly if follow-through stalls.";
+  }
+
+  if (recipeReason) {
+    return "Manual management; do not blindly hold to due window.";
+  }
+
+  return "";
+}
+
+function compactTradeWatch(tradeRead) {
+  const cautions = Array.isArray(tradeRead?.cautions)
+    ? tradeRead.cautions.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  return [...new Set(cautions)].slice(0, 2).join(", ");
+}
+
 function isFinitePctAtOrBelow(value, maxValue) {
   const n = asNum(value);
   return Number.isFinite(n) && n <= maxValue;
@@ -2453,27 +2492,18 @@ function computeRecipeStamp({ t, confidenceMeta }) {
 
   // Use the side-aware signed external adjustment for Premium confirmation.
   // Positive extAdj supports the trade side; negative extAdj fights the trade side.
-  const sideAwareExternalSupport = extAdj > 0.15;
   const sideAwareExternalNonNeutral = Math.abs(extAdj) > 0.15;
   const sideAwareExternalNotHostile = extAdj >= -0.15;
   const macroEquitiesNotOverheated =
     isFinitePctAtOrBelow(qqqDayPct, 0.75) &&
     isFinitePctAtOrBelow(spxDayPct, 0.75);
 
-  // PREMIUM should be blind-usable, so keep it limited to the validated pockets only.
-  if (execReason === "build_b1_reversal_long" && sideAwareExternalSupport) {
-    return premiumStamp(
-      "PREMIUM",
-      `${execReason}_side_aware_external_support`,
-      "Tier 3 | build B1 reversal long + side-aware external support"
-    );
-  }
-
+  // PREMIUM should stay automation-ready. Build is manual/research-only and does not stamp Premium here.
   if (execReason === "swing_liquidity_snap_reversal_long" && sideAwareExternalNonNeutral) {
     return premiumStamp(
       "PREMIUM",
       `${execReason}_side_aware_non_neutral_external`,
-      "Tier 2 | swing liquidity snap reversal long + non-neutral side-aware external"
+      "Liquidity Snap Long"
     );
   }
 
@@ -2488,7 +2518,7 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     return premiumStamp(
       "PREMIUM",
       `${execReason}_conf_a_negative_anomaly_oi_side_aware_external_not_hostile`,
-      "Tier 1 | swing flow-persist short + A + negative anomaly OI + external not hostile"
+      "Flow Short: A + neg OI"
     );
   }
 
@@ -2500,7 +2530,7 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     return premiumStamp(
       "PREMIUM",
       `${execReason}_long_build_macro_not_overheated`,
-      "Tier 1 | swing ignition breakout long + long_build + QQQ/SPX not overheated"
+      "Ignition Long: long_build"
     );
   }
 
@@ -4385,7 +4415,6 @@ if (shouldApplyDeferredRangeFloor) {
     } : null,
   }));
 const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
-const tradeCautions = tradeRead.cautions.length ? tradeRead.cautions.join(", ") : "none";
 const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
 const analyticsVersionTags = getAnalyticsVersionTags();
 const entryAtoms = getEntryAtoms(t);
@@ -4414,18 +4443,16 @@ if (!isRandom && !force) {
 }
 
 if (!isRandom) {
-  const mainEdge = prettifyDecisionToken(t?.execReason || tradeRead.summary || "n/a");
+  const managementHint = buildManagementHint(t, recipeStamp);
+  const profileLabel = recipeStamp.profile || prettifyDecisionToken(t?.execReason || "Premium setup");
+  const watch = compactTradeWatch(tradeRead);
 
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-
-  if (recipeStamp.label === "PREMIUM") {
-    lines.push(`PREMIUM ${recipeStamp.emoji}${repeatDecision.isReminder ? " | Reminder: still valid" : ""}`);
-    if (recipeStamp.profile) lines.push(`Profile: ${recipeStamp.profile}`);
-  }
-
-  lines.push(`Main Edge: ${mainEdge}`);
-  lines.push(`Why: ${tradeRead.summary}`);
-  lines.push(`Cautions: ${tradeCautions}`);
+  lines.push(`PREMIUM ${recipeStamp.emoji}${repeatDecision.isReminder ? " | Reminder" : ""} | ${profileLabel}`);
+  if (managementHint) lines.push(`Mgmt: ${managementHint}`);
+  if (tradeRead.summary) lines.push(`Edge: ${tradeRead.summary}`);
+  if (watch) lines.push(`Watch: ${watch}`);
+  lines.push(`Entry: ${price != null ? fmtPrice(price) : ""}`);
   lines.push("");
 }
 
@@ -4570,23 +4597,9 @@ random_source: isRandom ? randomSourceForEvent : "",
   anomaly_price_deviation: anomaly.anomaly_price_deviation
 });
 
-if (!isRandom) {
-  lines.push(`Entry: ${price != null ? fmtPrice(price) : ""}`);
-  lines.push(`Invalidation: ${invalidationPx != null ? fmtPrice(invalidationPx) : ""}`);
-
-  if (mode === "build" && buildTargets.length) {
-    const targetSummary = buildTargets
-      .map((target) => `${target.label} ${fmtPrice(target.tp)}`)
-      .join(" | ");
-    lines.push(`TP: ${targetSummary}`);
-  } else {
-    lines.push(`TP: ${tp != null ? fmtPrice(tp) : ""}`);
-  }
-
-  lines.push(`Stop: ${stopLossPx != null ? fmtPrice(stopLossPx) : ""}`);
-  lines.push(`Leverage: ${lev ? `${lev.suggestedLow}–${lev.suggestedHigh}x` : ""}`);
-  lines.push("");
-}
+// TG intentionally omits TP/SL/invalidation/leverage price lines.
+// Those values remain captured in analytics and can still gate/reject internally,
+// but they are structure heuristics, not sufficiently validated manual instructions.
 }
 
 const telegramRowFields = [
