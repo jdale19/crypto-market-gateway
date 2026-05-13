@@ -38,7 +38,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v2_premium_only_2026_05_09",
+  premium_recipe_version: "manual_tg_recipes_v3_recipe_predictor_patch_2026_05_12",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
