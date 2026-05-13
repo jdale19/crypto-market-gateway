@@ -2495,10 +2495,10 @@ function compactTradeWatch(tradeRead) {
 }
 
 function isFinitePctAtOrBelow(value, maxValue) {
-  const n = asNum(value);
+  if (value === null || value === undefined || String(value).trim() === "") return false;
+  const n = Number(value);
   return Number.isFinite(n) && n <= maxValue;
 }
-
 function computeRecipeStamp({ t, confidenceMeta }) {
   if (confidenceMeta?.selectorAllowed === false) {
     return { label: "", emoji: "", reason: "selector_rejected", profile: "" };
