@@ -229,6 +229,20 @@ async function fetchSnapshotForInstId(instId, counters) {
     key,
     bucket,
     lag_buckets: 0,
+    market_structure: {
+      spot_inst_id: j?.spot_inst_id || "",
+      spot_return_15m_pct: j?.spot_return_15m_pct ?? null,
+      perp_return_15m_pct: j?.perp_return_15m_pct ?? null,
+      spot_vs_perp_15m_pct: j?.spot_vs_perp_15m_pct ?? null,
+      spot_return_1h_pct: j?.spot_return_1h_pct ?? null,
+      perp_return_1h_pct: j?.perp_return_1h_pct ?? null,
+      spot_vs_perp_1h_pct: j?.spot_vs_perp_1h_pct ?? null,
+      spread_bps: j?.spread_bps ?? null,
+      book_bid_depth_20_usd: j?.book_bid_depth_20_usd ?? null,
+      book_ask_depth_20_usd: j?.book_ask_depth_20_usd ?? null,
+      book_imbalance_20: j?.book_imbalance_20 ?? null,
+      thin_book_flag: j?.thin_book_flag ?? null,
+    },
   };
 }
 
@@ -285,6 +299,7 @@ async function fetchOkxSwap(instId, counters) {
     low,
     funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
     open_interest_contracts,
+    market_structure: {},
   };
 }
 
@@ -577,6 +592,7 @@ if (includeRegime) {
   why,
   deltas,
   build_regime,
+  market_structure: cur?.market_structure || {},
 
   source: dataSource === "snapshot" ? "upstash_snapshot+upstash_series" : "okx_swap_public_api+upstash_series",
 };
@@ -601,6 +617,58 @@ if (includeRegime) {
   }
 
   return out;
+}
+
+function finiteNum(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getDeltaPct(row, tf) {
+  return finiteNum(row?.deltas?.[tf]?.price_change_pct);
+}
+
+function breadthPct(results, tf) {
+  const vals = (results || []).map((r) => getDeltaPct(r, tf)).filter((x) => Number.isFinite(x));
+  if (!vals.length) return null;
+  return (vals.filter((x) => x > 0).length / vals.length) * 100;
+}
+
+function breadthTilt(pct) {
+  if (!Number.isFinite(pct)) return "";
+  if (pct >= 65) return "broad_risk_on";
+  if (pct <= 35) return "broad_risk_off";
+  return "mixed";
+}
+
+function attachMarketContext(results) {
+  const rows = Array.isArray(results) ? results : [];
+  const btc = rows.find((r) => String(r?.symbol || "").toUpperCase() === "BTCUSDT");
+  const eth = rows.find((r) => String(r?.symbol || "").toUpperCase() === "ETHUSDT");
+  const btc15 = getDeltaPct(btc, "15m");
+  const btc1h = getDeltaPct(btc, "1h");
+  const eth15 = getDeltaPct(eth, "15m");
+  const eth1h = getDeltaPct(eth, "1h");
+  const b15 = breadthPct(rows, "15m");
+  const b1h = breadthPct(rows, "1h");
+
+  return rows.map((r) => {
+    const r15 = getDeltaPct(r, "15m");
+    const r1h = getDeltaPct(r, "1h");
+    return {
+      ...r,
+      market_context: {
+        symbol_vs_btc_15m_pct: Number.isFinite(r15) && Number.isFinite(btc15) ? r15 - btc15 : null,
+        symbol_vs_btc_1h_pct: Number.isFinite(r1h) && Number.isFinite(btc1h) ? r1h - btc1h : null,
+        symbol_vs_eth_15m_pct: Number.isFinite(r15) && Number.isFinite(eth15) ? r15 - eth15 : null,
+        symbol_vs_eth_1h_pct: Number.isFinite(r1h) && Number.isFinite(eth1h) ? r1h - eth1h : null,
+        crypto_breadth_15m_pct: b15,
+        crypto_breadth_1h_pct: b1h,
+        crypto_breadth_tilt_15m: breadthTilt(b15),
+        crypto_breadth_tilt_1h: breadthTilt(b1h),
+      },
+    };
+  });
 }
 
 export default async function handler(req, res) {
@@ -635,11 +703,12 @@ export default async function handler(req, res) {
     const now = Date.now();
     const includeRegime = String(req.query.regime || "") === "1";
 
-    const results = await Promise.all(
+    let results = await Promise.all(
      symbols.map((sym) =>
       fetchOne(sym, now, driver_tf, debugMode, dataSource, includeRegime, counters)
   )
 );
+    results = attachMarketContext(results);
     
     res.setHeader("Cache-Control", "no-store");
 
