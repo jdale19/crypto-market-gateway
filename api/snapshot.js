@@ -74,6 +74,81 @@ async function fetchWithTimeout(url) {
   }
 }
 
+function numOrNull(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function safePctChange(now, prev) {
+  if (!Number.isFinite(now) || !Number.isFinite(prev) || prev === 0) return null;
+  return ((now - prev) / prev) * 100;
+}
+
+function spotInstIdFromSymbol(symbol) {
+  const base = baseFromSymbolUSDT(symbol);
+  return base ? `${base}-USDT` : null;
+}
+
+function candleClose(row) {
+  const n = Number(row?.[4]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pctFromCandles(candles, stepsBack) {
+  const rows = Array.isArray(candles) ? candles : [];
+  const now = candleClose(rows[0]);
+  const prev = candleClose(rows[stepsBack]);
+  return safePctChange(now, prev);
+}
+
+function computeSpotPerpDivergence({ swapCandles, spotCandles }) {
+  const swap15 = pctFromCandles(swapCandles, 3);
+  const spot15 = pctFromCandles(spotCandles, 3);
+  const swap1h = pctFromCandles(swapCandles, 12);
+  const spot1h = pctFromCandles(spotCandles, 12);
+  return {
+    spot_return_15m_pct: spot15,
+    perp_return_15m_pct: swap15,
+    spot_vs_perp_15m_pct: Number.isFinite(spot15) && Number.isFinite(swap15) ? spot15 - swap15 : null,
+    spot_return_1h_pct: spot1h,
+    perp_return_1h_pct: swap1h,
+    spot_vs_perp_1h_pct: Number.isFinite(spot1h) && Number.isFinite(swap1h) ? spot1h - swap1h : null,
+  };
+}
+
+function computeBookMetrics(bookJson, price, ctVal = 1, ctValCcy = "") {
+  const data = bookJson?.data?.[0] || {};
+  const bids = Array.isArray(data?.bids) ? data.bids : [];
+  const asks = Array.isArray(data?.asks) ? data.asks : [];
+  const bestBid = numOrNull(bids?.[0]?.[0]);
+  const bestAsk = numOrNull(asks?.[0]?.[0]);
+  const mid = Number.isFinite(bestBid) && Number.isFinite(bestAsk) ? (bestBid + bestAsk) / 2 : price;
+  const spreadBps = Number.isFinite(bestBid) && Number.isFinite(bestAsk) && mid > 0 ? ((bestAsk - bestBid) / mid) * 10000 : null;
+
+  const ctv = Number.isFinite(Number(ctVal)) && Number(ctVal) > 0 ? Number(ctVal) : 1;
+  const ccy = String(ctValCcy || "").toUpperCase();
+  const toUsd = (px, sz) => {
+    const p = numOrNull(px);
+    const q = numOrNull(sz);
+    if (!Number.isFinite(p) || !Number.isFinite(q)) return 0;
+    return ccy === "USDT" || ccy === "USD" ? q * ctv : q * ctv * p;
+  };
+
+  const bidDepth = bids.reduce((sum, row) => sum + toUsd(row?.[0], row?.[1]), 0);
+  const askDepth = asks.reduce((sum, row) => sum + toUsd(row?.[0], row?.[1]), 0);
+  const denom = bidDepth + askDepth;
+  const imbalance = denom > 0 ? (bidDepth - askDepth) / denom : null;
+
+  return {
+    spread_bps: Number.isFinite(spreadBps) ? spreadBps : null,
+    book_bid_depth_20_usd: Number.isFinite(bidDepth) ? bidDepth : null,
+    book_ask_depth_20_usd: Number.isFinite(askDepth) ? askDepth : null,
+    book_imbalance_20: Number.isFinite(imbalance) ? imbalance : null,
+    thin_book_flag: Number.isFinite(spreadBps) ? spreadBps > Number(process.env.SNAPSHOT_THIN_BOOK_SPREAD_BPS || 8) : null,
+  };
+}
+
 async function getOkxSwapInstrumentListCached(reqCache) {
   if (reqCache.swapList) return reqCache.swapList;
 
@@ -140,13 +215,46 @@ async function resolveOkxSwapInstId(symbol, reqCache) {
   return null;
 }
 
-async function fetchOkxSwap(instId) {
-  const [tickerRes, fundingRes, oiRes, candlesRes] = await Promise.all([
+async function resolveOkxSwapMeta(symbol, reqCache) {
+  const base = baseFromSymbolUSDT(symbol);
+  if (!base) return null;
+  if (reqCache.metaMap?.has(base)) return reqCache.metaMap.get(base);
+
+  const list = await getOkxSwapInstrumentListCached(reqCache);
+  const target = `${base}-USDT-SWAP`.toUpperCase();
+  const row = Array.isArray(list) ? list.find((x) => String(x?.instId || "").toUpperCase() === target) : null;
+  const meta = row ? { ctVal: numOrNull(row?.ctVal), ctValCcy: String(row?.ctValCcy || "") } : { ctVal: 1, ctValCcy: "" };
+  if (!reqCache.metaMap) reqCache.metaMap = new Map();
+  reqCache.metaMap.set(base, meta);
+  return meta;
+}
+
+async function fetchOkxSwap(instId, symbol, swapMeta = null) {
+  const spotEnabled = String(process.env.SNAPSHOT_SPOT_DIVERGENCE_ENABLED || "1") !== "0";
+  const bookEnabled = String(process.env.SNAPSHOT_ORDER_BOOK_ENABLED || "1") !== "0";
+  const spotInstId = spotInstIdFromSymbol(symbol);
+  const bookDepth = Math.max(1, Math.min(100, Number(process.env.SNAPSHOT_ORDER_BOOK_DEPTH || 20)));
+
+  const requests = [
     fetchWithTimeout(`https://www.okx.com/api/v5/market/ticker?instId=${instId}`),
     fetchWithTimeout(`https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`),
     fetchWithTimeout(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`),
-    fetchWithTimeout(`https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=5m&limit=1`),
-  ]);
+    fetchWithTimeout(`https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=5m&limit=13`),
+  ];
+
+  if (spotEnabled && spotInstId) {
+    requests.push(fetchWithTimeout(`https://www.okx.com/api/v5/market/candles?instId=${spotInstId}&bar=5m&limit=13`));
+  } else {
+    requests.push(Promise.resolve(null));
+  }
+
+  if (bookEnabled) {
+    requests.push(fetchWithTimeout(`https://www.okx.com/api/v5/market/books?instId=${instId}&sz=${bookDepth}`));
+  } else {
+    requests.push(Promise.resolve(null));
+  }
+
+  const [tickerRes, fundingRes, oiRes, candlesRes, spotCandlesRes, bookRes] = await Promise.all(requests);
 
   if (!tickerRes.ok || !fundingRes.ok || !oiRes.ok || !candlesRes.ok) {
     return { ok: false, error: "okx fetch failed" };
@@ -156,8 +264,11 @@ async function fetchOkxSwap(instId) {
   const funding = await fundingRes.json();
   const oi = await oiRes.json();
   const candles = await candlesRes.json();
+  const spotCandles = spotCandlesRes?.ok ? await spotCandlesRes.json().catch(() => null) : null;
+  const book = bookRes?.ok ? await bookRes.json().catch(() => null) : null;
 
-  const c = candles?.data?.[0] || null;
+  const swapRows = Array.isArray(candles?.data) ? candles.data : [];
+  const c = swapRows?.[0] || null;
 
   const price = Number(ticker?.data?.[0]?.last);
   const funding_rate = Number(funding?.data?.[0]?.fundingRate);
@@ -176,7 +287,24 @@ async function fetchOkxSwap(instId) {
     return { ok: false, error: "instrument missing data" };
   }
 
-  return { ok: true, price, open, high, low, funding_rate, open_interest_contracts };
+  const divergence = computeSpotPerpDivergence({
+    swapCandles: swapRows,
+    spotCandles: Array.isArray(spotCandles?.data) ? spotCandles.data : [],
+  });
+  const bookMetrics = book ? computeBookMetrics(book, price, swapMeta?.ctVal ?? 1, swapMeta?.ctValCcy || "") : {};
+
+  return {
+    ok: true,
+    price,
+    open,
+    high,
+    low,
+    funding_rate,
+    open_interest_contracts,
+    spot_inst_id: spotInstId || "",
+    ...divergence,
+    ...bookMetrics,
+  };
 }
 
 
@@ -203,7 +331,8 @@ async function processOne(symbol, reqCache) {
   const instId = await resolveOkxSwapInstId(symbol, reqCache);
   if (!instId) return { ok: false, symbol, error: "no perp market" };
 
-  const okx = await fetchOkxSwap(instId);
+  const swapMeta = await resolveOkxSwapMeta(symbol, reqCache);
+  const okx = await fetchOkxSwap(instId, symbol, swapMeta);
   if (!okx.ok) return { ok: false, symbol, error: okx.error };
 
   const now = Date.now();
@@ -230,12 +359,24 @@ async function processOne(symbol, reqCache) {
 };
     await redis.set(keyNow, JSON.stringify(snapNow));
     await redis.expire(keyNow, SNAP_TTL_SECONDS);
-  } else if (!Number.isFinite(Number(snapNow?.open))) {
+  } else {
     snapNow = {
       ...snapNow,
-      open: okx.open,
+      open: Number.isFinite(Number(snapNow?.open)) ? snapNow.open : okx.open,
       high: Number.isFinite(Number(snapNow?.high)) ? snapNow.high : okx.high,
       low: Number.isFinite(Number(snapNow?.low)) ? snapNow.low : okx.low,
+      spot_inst_id: okx.spot_inst_id || snapNow?.spot_inst_id || "",
+      spot_return_15m_pct: okx.spot_return_15m_pct,
+      perp_return_15m_pct: okx.perp_return_15m_pct,
+      spot_vs_perp_15m_pct: okx.spot_vs_perp_15m_pct,
+      spot_return_1h_pct: okx.spot_return_1h_pct,
+      perp_return_1h_pct: okx.perp_return_1h_pct,
+      spot_vs_perp_1h_pct: okx.spot_vs_perp_1h_pct,
+      spread_bps: okx.spread_bps,
+      book_bid_depth_20_usd: okx.book_bid_depth_20_usd,
+      book_ask_depth_20_usd: okx.book_ask_depth_20_usd,
+      book_imbalance_20: okx.book_imbalance_20,
+      thin_book_flag: okx.thin_book_flag,
       ts: snapNow?.ts ?? now,
     };
     await redis.set(keyNow, JSON.stringify(snapNow));
@@ -267,6 +408,18 @@ async function processOne(symbol, reqCache) {
     price_change_5m_pct,
     oi_change_5m_pct,
     funding_change_5m,
+    spot_inst_id: snapNow?.spot_inst_id || "",
+    spot_return_15m_pct: snapNow?.spot_return_15m_pct ?? null,
+    perp_return_15m_pct: snapNow?.perp_return_15m_pct ?? null,
+    spot_vs_perp_15m_pct: snapNow?.spot_vs_perp_15m_pct ?? null,
+    spot_return_1h_pct: snapNow?.spot_return_1h_pct ?? null,
+    perp_return_1h_pct: snapNow?.perp_return_1h_pct ?? null,
+    spot_vs_perp_1h_pct: snapNow?.spot_vs_perp_1h_pct ?? null,
+    spread_bps: snapNow?.spread_bps ?? null,
+    book_bid_depth_20_usd: snapNow?.book_bid_depth_20_usd ?? null,
+    book_ask_depth_20_usd: snapNow?.book_ask_depth_20_usd ?? null,
+    book_imbalance_20: snapNow?.book_imbalance_20 ?? null,
+    thin_book_flag: snapNow?.thin_book_flag ?? null,
     state: classifyState(price_change_5m_pct, oi_change_5m_pct),
     warmup_5m: !(snapNow && snapPrev),
     source: "okx_swap_public_api+upstash_state",
@@ -276,7 +429,7 @@ async function processOne(symbol, reqCache) {
 export default async function handler(req, res) {
   try {
     const symbols = normalizeSymbolsQuery(req);
-    const reqCache = { swapList: null, instMap: new Map() };
+    const reqCache = { swapList: null, instMap: new Map(), metaMap: new Map() };
 
     const maxConcurrency = Number(process.env.SNAPSHOT_MAX_CONCURRENCY || 5);
     const results = await mapWithConcurrency(symbols, maxConcurrency, (s) => processOne(s, reqCache));
