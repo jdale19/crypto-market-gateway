@@ -2488,10 +2488,9 @@ function buildManagementHint(t, recipeStamp) {
 }
 
 function compactTradeWatch(tradeRead) {
-  const cautions = Array.isArray(tradeRead?.cautions)
-    ? tradeRead.cautions.map((x) => String(x || "").trim()).filter(Boolean)
-    : [];
-  return [...new Set(cautions)].slice(0, 2).join(", ");
+  // TG is Premium-only and should not surface generic analytical cautions.
+  // Invalidating conditions belong in recipe gates; non-invalidating cautions stay in analytics.
+  return "";
 }
 
 function isFinitePctAtOrBelow(value, maxValue) {
