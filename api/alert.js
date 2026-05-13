@@ -2499,6 +2499,11 @@ function isFinitePctAtOrBelow(value, maxValue) {
   const n = Number(value);
   return Number.isFinite(n) && n <= maxValue;
 }
+
+function isTruthyBoolean(value) {
+  return value === true || String(value).toLowerCase() === "true" || String(value) === "1";
+}
+
 function computeRecipeStamp({ t, confidenceMeta }) {
   if (confidenceMeta?.selectorAllowed === false) {
     return { label: "", emoji: "", reason: "selector_rejected", profile: "" };
@@ -2507,16 +2512,18 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   const mode = String(t?.mode || "").toLowerCase();
   const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
-  const finalConfidence = String(
-    confidenceMeta?.finalConfidence || t?.confidence || ""
-  ).toUpperCase();
   const extAdj = Number(confidenceMeta?.extAdj || 0);
   const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
   const anomalyScore = asNum(t?.ctx?.anomalyScore);
   const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
   const coinDayPct = asNum(t?.ctx?.coinDayPct);
+  const vixDayPct = asNum(t?.ctx?.vixDayPct);
   const qqqDayPct = asNum(t?.ctx?.qqqDayPct);
   const spxDayPct = asNum(t?.ctx?.spxDayPct);
+  const btc15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
+  const btcShortTfState = String(confidenceMeta?.btcShortTfSignal?.state || "neutral").toLowerCase();
+  const etNow = getEtSessionTelemetry(Date.now());
+  const isUsEquityRth = isTruthyBoolean(t?.ctx?.isUsEquityRth) || etNow.is_us_equity_rth === true;
 
   // Manual TG stance: Scalp/Swing only. Build is human-managed research and does not stamp TG trade recipes.
   if (mode === "build") {
@@ -2534,10 +2541,24 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     bias === "short" &&
     Number.isFinite(anomalyScore) &&
     anomalyScore >= 1.2 &&
-    (!Number.isFinite(coinDayPct) || coinDayPct <= 1.0);
+    (!Number.isFinite(coinDayPct) || coinDayPct <= 1.0) &&
+    btcShortTfState !== "hostile";
   const macroEquitiesNotOverheated =
     isFinitePctAtOrBelow(qqqDayPct, 0.75) &&
     isFinitePctAtOrBelow(spxDayPct, 0.75);
+  const vixRthStressGuard =
+    isUsEquityRth && Number.isFinite(vixDayPct) && vixDayPct > 5;
+  const swingLongMildExternalAnomalyBtc15 =
+    mode === "swing" &&
+    bias === "long" &&
+    extAdj > 0.15 &&
+    extAdj <= 0.50 &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct > 0 &&
+    macroEquitiesNotOverheated &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct > 0 &&
+    !vixRthStressGuard;
 
   // Scalp long support read: historically useful, but managed as fast scalp.
   if (strongScalpLongExternal) {
@@ -2552,8 +2573,8 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   if (scalpShortAnomalyPressure) {
     return tradeStamp(
       "PREMIUM",
-      `${mode}_${bias}_scalp_short_anomaly_pressure_coin_not_hot`,
-      "Scalp Short: anomaly pressure"
+      `${mode}_${bias}_scalp_short_anomaly_pressure_coin_not_hot_btc_not_hostile`,
+      "Scalp Short: anomaly pressure + BTC not hostile"
     );
   }
 
@@ -2566,15 +2587,13 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     );
   }
 
-  // Demoted from TG surfacing: historical support weakened in current due-window data, so keep analytics-only.
-  if (
-    execReason === "swing_flow_persists_short" &&
-    finalConfidence === "A" &&
-    Number.isFinite(anomalyOiPct) &&
-    anomalyOiPct < 0 &&
-    sideAwareExternalNotHostile
-  ) {
-    return { label: "", emoji: "", reason: `${execReason}_conf_a_negative_anomaly_oi_side_aware_external_not_hostile_demoted_analytics_only`, profile: "" };
+  // New mild-support swing long recipe: external support is not the edge alone; it must pair with positive anomaly OI, BTC 15m support, and non-overheated equities.
+  if (swingLongMildExternalAnomalyBtc15) {
+    return tradeStamp(
+      "PREMIUM",
+      `${mode}_${bias}_mild_external_positive_anomaly_oi_macro_ok_btc15_positive`,
+      "Swing Long: mild external + anomaly OI + BTC15"
+    );
   }
 
   // Keep ignition long visible, but do not imply blind hold; management hint handles it.
@@ -2748,7 +2767,7 @@ function getEntryAtoms(t = {}) {
   };
 }
 
-function computeDynamicRiskBudget({ mode, t, confidence }) {
+function computeDynamicRiskBudget({ mode, t }) {
   const m = String(mode || "scalp").toLowerCase();
   const baseRiskPct = CFG.leverage?.riskBudgetPctByMode?.[m] ?? 1.0;
 
@@ -2777,9 +2796,6 @@ function computeDynamicRiskBudget({ mode, t, confidence }) {
   const shortIntoBottoming =
     pureContinuationShort &&
     strongBottoming;
-
-  if (confidence === "A") { score += 2; reasons.push("conf_A"); }
-  else if (confidence === "B") { score += 1; reasons.push("conf_B"); }
 
   if (b1Strong) { score += 1; reasons.push("b1_strong"); }
   if (oneHourAligned && !pureContinuationShort) { score += 1; reasons.push("aligned_1h"); }
@@ -3846,6 +3862,22 @@ async function evaluateCandidate({
         btc5mFunding15mAvg: btcTapeContext?.funding15mAvg ?? null,
         btc5mFunding30mAvg: btcTapeContext?.funding30mAvg ?? null,
         btcTapeState: String(btcTapeContext?.tapeState || "neutral"),
+        isUsEquityRth: getEtSessionTelemetry(Date.now()).is_us_equity_rth,
+        symbolVsBtc15mPct: item?.market_context?.symbol_vs_btc_15m_pct ?? null,
+        symbolVsBtc1hPct: item?.market_context?.symbol_vs_btc_1h_pct ?? null,
+        symbolVsEth15mPct: item?.market_context?.symbol_vs_eth_15m_pct ?? null,
+        symbolVsEth1hPct: item?.market_context?.symbol_vs_eth_1h_pct ?? null,
+        cryptoBreadth15mPct: item?.market_context?.crypto_breadth_15m_pct ?? null,
+        cryptoBreadth1hPct: item?.market_context?.crypto_breadth_1h_pct ?? null,
+        cryptoBreadthTilt15m: item?.market_context?.crypto_breadth_tilt_15m ?? "",
+        cryptoBreadthTilt1h: item?.market_context?.crypto_breadth_tilt_1h ?? "",
+        spotVsPerp15mPct: item?.market_structure?.spot_vs_perp_15m_pct ?? null,
+        spotVsPerp1hPct: item?.market_structure?.spot_vs_perp_1h_pct ?? null,
+        spreadBps: item?.market_structure?.spread_bps ?? null,
+        bookBidDepth20Usd: item?.market_structure?.book_bid_depth_20_usd ?? null,
+        bookAskDepth20Usd: item?.market_structure?.book_ask_depth_20_usd ?? null,
+        bookImbalance20: item?.market_structure?.book_imbalance_20 ?? null,
+        thinBookFlag: item?.market_structure?.thin_book_flag ?? null,
       },
     };
   }
@@ -4251,7 +4283,7 @@ for (const t of triggered) {
   const breakoutOnly = profile.pureBreakoutOnly;
   const dynamicRisk =
   mode === "swing"
-    ? computeDynamicRiskBudget({ mode, t, confidence })
+    ? computeDynamicRiskBudget({ mode, t })
     : null;
 
 
@@ -4640,6 +4672,21 @@ btc_5m_funding_5m_avg: t?.ctx?.btc5mFunding5mAvg ?? "",
 btc_5m_funding_15m_avg: t?.ctx?.btc5mFunding15mAvg ?? "",
 btc_5m_funding_30m_avg: t?.ctx?.btc5mFunding30mAvg ?? "",
 btc_tape_state: t?.ctx?.btcTapeState || "",
+symbol_vs_btc_15m_pct: t?.ctx?.symbolVsBtc15mPct ?? "",
+symbol_vs_btc_1h_pct: t?.ctx?.symbolVsBtc1hPct ?? "",
+symbol_vs_eth_15m_pct: t?.ctx?.symbolVsEth15mPct ?? "",
+symbol_vs_eth_1h_pct: t?.ctx?.symbolVsEth1hPct ?? "",
+crypto_breadth_15m_pct: t?.ctx?.cryptoBreadth15mPct ?? "",
+crypto_breadth_1h_pct: t?.ctx?.cryptoBreadth1hPct ?? "",
+crypto_breadth_tilt_15m: t?.ctx?.cryptoBreadthTilt15m ?? "",
+crypto_breadth_tilt_1h: t?.ctx?.cryptoBreadthTilt1h ?? "",
+spot_vs_perp_15m_pct: t?.ctx?.spotVsPerp15mPct ?? "",
+spot_vs_perp_1h_pct: t?.ctx?.spotVsPerp1hPct ?? "",
+spread_bps: t?.ctx?.spreadBps ?? "",
+book_bid_depth_20_usd: t?.ctx?.bookBidDepth20Usd ?? "",
+book_ask_depth_20_usd: t?.ctx?.bookAskDepth20Usd ?? "",
+book_imbalance_20: t?.ctx?.bookImbalance20 ?? "",
+thin_book_flag: t?.ctx?.thinBookFlag ?? "",
 bottoming_triggered: !!t?.ctx?.bottoming?.triggered,
 bottoming_score: t?.ctx?.bottoming?.score ?? "",
 bottoming_reasons: Array.isArray(t?.ctx?.bottoming?.reasons) ? t.ctx.bottoming.reasons.join(",") : "",
@@ -4780,6 +4827,21 @@ const telegramRowFields = [
   "btc_5m_funding_15m_avg",
   "btc_5m_funding_30m_avg",
   "btc_tape_state",
+  "symbol_vs_btc_15m_pct",
+  "symbol_vs_btc_1h_pct",
+  "symbol_vs_eth_15m_pct",
+  "symbol_vs_eth_1h_pct",
+  "crypto_breadth_15m_pct",
+  "crypto_breadth_1h_pct",
+  "crypto_breadth_tilt_15m",
+  "crypto_breadth_tilt_1h",
+  "spot_vs_perp_15m_pct",
+  "spot_vs_perp_1h_pct",
+  "spread_bps",
+  "book_bid_depth_20_usd",
+  "book_ask_depth_20_usd",
+  "book_imbalance_20",
+  "thin_book_flag",
   "bottoming_triggered",
   "bottoming_score",
   "bottoming_reasons",
