@@ -242,6 +242,8 @@ async function fetchSnapshotForInstId(instId, counters) {
       book_ask_depth_20_usd: j?.book_ask_depth_20_usd ?? null,
       book_imbalance_20: j?.book_imbalance_20 ?? null,
       thin_book_flag: j?.thin_book_flag ?? null,
+      market_structure_ok: j?.market_structure_ok ?? false,
+      market_structure_reason: j?.market_structure_reason || "missing_from_snapshot",
     },
   };
 }
@@ -299,7 +301,10 @@ async function fetchOkxSwap(instId, counters) {
     low,
     funding_rate: Number.isFinite(funding_rate) ? funding_rate : null,
     open_interest_contracts,
-    market_structure: {},
+    market_structure: {
+      market_structure_ok: false,
+      market_structure_reason: "multi_okx_mode_no_market_structure",
+    },
   };
 }
 
