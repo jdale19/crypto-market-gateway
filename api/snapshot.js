@@ -149,6 +149,28 @@ function computeBookMetrics(bookJson, price, ctVal = 1, ctValCcy = "") {
   };
 }
 
+function marketStructureStatus({ spotEnabled, bookEnabled, spotInstId, spotCandles, book, divergence, bookMetrics }) {
+  const spotOk = !spotEnabled || !spotInstId || (
+    Number.isFinite(divergence?.spot_vs_perp_15m_pct) || Number.isFinite(divergence?.spot_vs_perp_1h_pct)
+  );
+  const bookOk = !bookEnabled || (
+    Number.isFinite(bookMetrics?.spread_bps) &&
+    Number.isFinite(bookMetrics?.book_bid_depth_20_usd) &&
+    Number.isFinite(bookMetrics?.book_ask_depth_20_usd)
+  );
+
+  const reasons = [];
+  if (spotEnabled && spotInstId && !spotCandles) reasons.push("spot_fetch_failed");
+  if (spotEnabled && spotInstId && spotCandles && !spotOk) reasons.push("spot_candles_insufficient");
+  if (bookEnabled && !book) reasons.push("book_fetch_failed");
+  if (bookEnabled && book && !bookOk) reasons.push("book_invalid_or_empty");
+
+  return {
+    market_structure_ok: spotOk && bookOk,
+    market_structure_reason: reasons.length ? reasons.join(",") : "ok",
+  };
+}
+
 async function getOkxSwapInstrumentListCached(reqCache) {
   if (reqCache.swapList) return reqCache.swapList;
 
@@ -287,11 +309,21 @@ async function fetchOkxSwap(instId, symbol, swapMeta = null) {
     return { ok: false, error: "instrument missing data" };
   }
 
+  const spotRows = Array.isArray(spotCandles?.data) ? spotCandles.data : [];
   const divergence = computeSpotPerpDivergence({
     swapCandles: swapRows,
-    spotCandles: Array.isArray(spotCandles?.data) ? spotCandles.data : [],
+    spotCandles: spotRows,
   });
   const bookMetrics = book ? computeBookMetrics(book, price, swapMeta?.ctVal ?? 1, swapMeta?.ctValCcy || "") : {};
+  const structureStatus = marketStructureStatus({
+    spotEnabled,
+    bookEnabled,
+    spotInstId,
+    spotCandles,
+    book,
+    divergence,
+    bookMetrics,
+  });
 
   return {
     ok: true,
@@ -304,6 +336,7 @@ async function fetchOkxSwap(instId, symbol, swapMeta = null) {
     spot_inst_id: spotInstId || "",
     ...divergence,
     ...bookMetrics,
+    ...structureStatus,
   };
 }
 
@@ -349,14 +382,28 @@ async function processOne(symbol, reqCache) {
 
   if (!snapNow) {
     snapNow = {
-  price: okx.price,
-  open: okx.open,
-  high: okx.high,
-  low: okx.low,
-  funding_rate: okx.funding_rate,
-  open_interest_contracts: okx.open_interest_contracts,
-  ts: now,
-};
+      price: okx.price,
+      open: okx.open,
+      high: okx.high,
+      low: okx.low,
+      funding_rate: okx.funding_rate,
+      open_interest_contracts: okx.open_interest_contracts,
+      spot_inst_id: okx.spot_inst_id || "",
+      spot_return_15m_pct: okx.spot_return_15m_pct,
+      perp_return_15m_pct: okx.perp_return_15m_pct,
+      spot_vs_perp_15m_pct: okx.spot_vs_perp_15m_pct,
+      spot_return_1h_pct: okx.spot_return_1h_pct,
+      perp_return_1h_pct: okx.perp_return_1h_pct,
+      spot_vs_perp_1h_pct: okx.spot_vs_perp_1h_pct,
+      spread_bps: okx.spread_bps,
+      book_bid_depth_20_usd: okx.book_bid_depth_20_usd,
+      book_ask_depth_20_usd: okx.book_ask_depth_20_usd,
+      book_imbalance_20: okx.book_imbalance_20,
+      thin_book_flag: okx.thin_book_flag,
+      market_structure_ok: okx.market_structure_ok,
+      market_structure_reason: okx.market_structure_reason,
+      ts: now,
+    };
     await redis.set(keyNow, JSON.stringify(snapNow));
     await redis.expire(keyNow, SNAP_TTL_SECONDS);
   } else {
@@ -377,6 +424,8 @@ async function processOne(symbol, reqCache) {
       book_ask_depth_20_usd: okx.book_ask_depth_20_usd,
       book_imbalance_20: okx.book_imbalance_20,
       thin_book_flag: okx.thin_book_flag,
+      market_structure_ok: okx.market_structure_ok,
+      market_structure_reason: okx.market_structure_reason,
       ts: snapNow?.ts ?? now,
     };
     await redis.set(keyNow, JSON.stringify(snapNow));
@@ -420,6 +469,8 @@ async function processOne(symbol, reqCache) {
     book_ask_depth_20_usd: snapNow?.book_ask_depth_20_usd ?? null,
     book_imbalance_20: snapNow?.book_imbalance_20 ?? null,
     thin_book_flag: snapNow?.thin_book_flag ?? null,
+    market_structure_ok: snapNow?.market_structure_ok ?? false,
+    market_structure_reason: snapNow?.market_structure_reason || "missing_from_snapshot",
     state: classifyState(price_change_5m_pct, oi_change_5m_pct),
     warmup_5m: !(snapNow && snapPrev),
     source: "okx_swap_public_api+upstash_state",
