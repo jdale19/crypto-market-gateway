@@ -38,7 +38,8 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v3_recipe_predictor_patch_2026_05_12",
+  premium_recipe_version: "manual_tg_recipes_v4_candidate_stamps_2026_05_20",
+  candidate_stamp_version: "candidate_stamps_v1_2026_05_20",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -2532,7 +2533,6 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   // Use the side-aware signed external adjustment for manual confirmation.
   // Positive extAdj supports the trade side; negative extAdj fights the trade side.
   const sideAwareExternalNonNeutral = Math.abs(extAdj) > 0.15;
-  const sideAwareExternalNotHostile = extAdj >= -0.15;
   const strongSwingLongExternal = mode === "swing" && bias === "long" && extAdj >= 1.25;
   const strongScalpLongExternal = mode === "scalp" && bias === "long" && extAdj >= 0.5;
   const scalpShortAnomalyPressure =
@@ -2541,7 +2541,8 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     Number.isFinite(anomalyScore) &&
     anomalyScore >= 1.2 &&
     (!Number.isFinite(coinDayPct) || coinDayPct <= 1.0) &&
-    btcShortTfState !== "hostile";
+    btcShortTfState !== "hostile" &&
+    btcShortTfState !== "minor_hostile";
   const macroEquitiesNotOverheated =
     isFinitePctAtOrBelow(qqqDayPct, 0.75) &&
     isFinitePctAtOrBelow(spxDayPct, 0.75);
@@ -2558,6 +2559,16 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     Number.isFinite(btc15mPct) &&
     btc15mPct > 0 &&
     !vixRthStressGuard;
+  const swingIgnitionLongBuildBtc15External =
+    mode === "swing" &&
+    bias === "long" &&
+    execReason === "swing_ignition_breakout_long" &&
+    anomalyPattern === "long_build" &&
+    macroEquitiesNotOverheated &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct > 0 &&
+    extAdj > 0.15 &&
+    !vixRthStressGuard;
 
   // Scalp long support read: historically useful, but managed as fast scalp.
   if (strongScalpLongExternal) {
@@ -2572,8 +2583,8 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   if (scalpShortAnomalyPressure) {
     return tradeStamp(
       "PREMIUM",
-      `${mode}_${bias}_scalp_short_anomaly_pressure_coin_not_hot_btc_not_hostile`,
-      "Scalp Short: anomaly pressure + BTC not hostile"
+      `${mode}_${bias}_scalp_short_anomaly_pressure_coin_not_hot_btc_no_hostile_no_minor_hostile`,
+      "Scalp Short: anomaly pressure + BTC clean"
     );
   }
 
@@ -2595,16 +2606,12 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     );
   }
 
-  // Keep ignition long visible, but do not imply blind hold; management hint handles it.
-  if (
-    execReason === "swing_ignition_breakout_long" &&
-    anomalyPattern === "long_build" &&
-    macroEquitiesNotOverheated
-  ) {
+  // Targeted ignition upgrade: broad long_build alone was weaker; require BTC 15m support and side-aware external support for TG Premium.
+  if (swingIgnitionLongBuildBtc15External) {
     return tradeStamp(
       "PREMIUM",
-      `${execReason}_long_build_macro_not_overheated`,
-      "Ignition Long: long_build"
+      `${execReason}_long_build_macro_ok_btc15_positive_ext_supportive`,
+      "Ignition Long: long_build + BTC15 + ext"
     );
   }
 
@@ -2620,6 +2627,136 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   return { label: "", emoji: "", reason: "no_stamp", profile: "" };
 }
 
+function addCandidateStamp(stamps, label, reason, profile) {
+  stamps.push({ label, reason, profile });
+}
+
+function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
+  const stamps = [];
+  const mode = String(t?.mode || "").toLowerCase();
+  const bias = String(t?.bias || "").toLowerCase();
+
+  // Candidate stamps are analytics-only. They must not grant TG/Premium eligibility.
+  if (mode === "build") return stamps;
+
+  const extAdj = Number(confidenceMeta?.extAdj || 0);
+  const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
+  const anomalyScore = asNum(t?.ctx?.anomalyScore);
+  const coinDayPct = asNum(t?.ctx?.coinDayPct);
+  const btc15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
+  const btcShortTfState = String(confidenceMeta?.btcShortTfSignal?.state || "neutral").toLowerCase();
+  const symbolVsBtc1hPct = asNum(t?.ctx?.symbolVsBtc1hPct);
+  const bookImbalance20 = asNum(t?.ctx?.bookImbalance20);
+  const spreadBps = asNum(t?.ctx?.spreadBps);
+  const btcOi30mPct = asNum(t?.ctx?.btc5mOi30mPct);
+  const btcOi60mPct = asNum(t?.ctx?.btc5mOi60mPct);
+  const marketStructureOk = isTruthyBoolean(t?.ctx?.marketStructureOk);
+  const inHighBand = isTruthyBoolean(entryAtoms?.entry_atom_in_high_band);
+
+  if (
+    mode === "scalp" &&
+    bias === "short" &&
+    Number.isFinite(anomalyScore) &&
+    anomalyScore >= 1.2 &&
+    (!Number.isFinite(coinDayPct) || coinDayPct <= 1.0) &&
+    btcShortTfState !== "hostile" &&
+    btcShortTfState !== "minor_hostile"
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_short_anomaly_pressure_coin_not_hot_btc_no_hostile_no_minor_hostile",
+      "scalp short anomaly pressure; coin not hot; BTC short-TF clean",
+      "Scalp Short: strict anomaly pressure"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct < 0 &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct < 0 &&
+    extAdj >= -0.15
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_anom_oi_negative_btc15_negative_ext_not_hostile",
+      "swing short; anomaly OI negative; BTC15 negative; external not hostile",
+      "Swing Short: OI unwind + BTC15 down"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    inHighBand &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct < 0 &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct < 0
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_high_band_anom_oi_negative_btc15_negative",
+      "swing short; high-band entry; anomaly OI negative; BTC15 negative",
+      "Swing Short: high-band OI unwind"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(symbolVsBtc1hPct) &&
+    symbolVsBtc1hPct < 0 &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct < 0 &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct < 0
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_rsbtc1h_negative_anom_oi_negative_btc15_negative",
+      "swing short; symbol underperforming BTC 1h; anomaly OI negative; BTC15 negative",
+      "Swing Short: relative weakness + OI unwind"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(bookImbalance20) &&
+    bookImbalance20 <= -0.10 &&
+    Number.isFinite(spreadBps) &&
+    spreadBps <= 5 &&
+    marketStructureOk
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
+      "swing short; ask-side imbalance; spread <= 5 bps; market structure ok",
+      "Swing Short: book pressure"
+    );
+  }
+
+  if (
+    mode === "scalp" &&
+    bias === "short" &&
+    Number.isFinite(btcOi60mPct) &&
+    btcOi60mPct <= -1 &&
+    Number.isFinite(btcOi30mPct) &&
+    btcOi30mPct <= -0.5
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_short_btc_oi_compression_overlay",
+      "scalp short; BTC OI 60m <= -1 and BTC OI 30m <= -0.5",
+      "Scalp Short: BTC OI compression overlay"
+    );
+  }
+
+  return stamps;
+}
 function buildStoredAlertStateFromEvent(e = {}) {
   return {
     ts: Date.now(),
@@ -4234,7 +4371,7 @@ const lines = [];
 for (const t of triggered) {
   const mode = String(t.mode || "swing").toLowerCase();
   const modeUp = mode.toUpperCase();
-  const observationType = t.observationType || "fired";
+  let observationType = t.observationType || "fired";
   const isRandom = observationType === "random";
   let rejectionReason = String(t.rejectionReason || "");
   let isRejected = !!rejectionReason;
@@ -4266,9 +4403,17 @@ for (const t of triggered) {
   const confidenceMeta = computeConfidence(t);
   const confidence = confidenceMeta.finalConfidence;
   const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
+  const entryAtoms = getEntryAtoms(t);
+  const candidateStamps = computeCandidateStamps({ t, confidenceMeta, entryAtoms });
+  const hasAnalyticsCandidateStamp = candidateStamps.length > 0;
   const isPremium = recipeStamp.label === "PREMIUM";
   const isSendableManualTrade = isSendableTradeStamp(recipeStamp);
-  if (!isRandom && !force && !isSendableManualTrade) {
+
+  if (!isRandom && !force && !isSendableManualTrade && hasAnalyticsCandidateStamp) {
+    observationType = "candidate";
+  }
+
+  if (!isRandom && !force && !isSendableManualTrade && !hasAnalyticsCandidateStamp) {
     if (debug) skipped.push({
       symbol: t.symbol,
       mode,
@@ -4329,7 +4474,7 @@ if (!force) {
     skipped.push({
       symbol: t.symbol,
       mode,
-      reason: "leverage_floor",
+      reason: hasAnalyticsCandidateStamp ? "candidate_leverage_floor_advisory" : "leverage_floor",
       bias,
       detail: {
         riskBudgetPct: lev?.riskBudgetPct ?? null,
@@ -4340,13 +4485,15 @@ if (!force) {
         minLev,
       },
     });
-    lateRejectionReasons.push("leverage_floor");
-    if (!isRejected) {
-      if (isRandom) {
-        rejectionReason = "leverage_floor";
-        isRejected = true;
-      } else {
-        continue;
+    if (!hasAnalyticsCandidateStamp) {
+      lateRejectionReasons.push("leverage_floor");
+      if (!isRejected) {
+        if (isRandom) {
+          rejectionReason = "leverage_floor";
+          isRejected = true;
+        } else {
+          continue;
+        }
       }
     }
   }
@@ -4374,7 +4521,7 @@ const tpPick = chooseDynamicTp({
 
 if (!tpPick) {
   skipped.push({ symbol: t.symbol, mode, reason: isPremium ? "premium_no_dynamic_tp_advisory" : "no_dynamic_tp" });
-  if (!isPremium) {
+  if (!isPremium && !hasAnalyticsCandidateStamp) {
     lateRejectionReasons.push("no_dynamic_tp");
     if (!isRejected) {
       if (isRandom) {
@@ -4405,7 +4552,7 @@ if (mode === "build" && Number.isFinite(tpPct) && tpPct < CFG.minTpPctByMode.bui
     },
   });
 
-  if (!isPremium) {
+  if (!isPremium && !hasAnalyticsCandidateStamp) {
     lateRejectionReasons.push("build_tp_too_small");
     if (!isRejected) {
       if (isRandom) {
@@ -4444,7 +4591,7 @@ if (tpPick && (!rrInfo || rrInfo.rr < CFG.minRR)) {
     }
   });
 
-  if (!isPremium) {
+  if (!isPremium && !hasAnalyticsCandidateStamp) {
     lateRejectionReasons.push("rr_too_small");
     if (!isRejected) {
       if (isRandom) {
@@ -4489,7 +4636,7 @@ if (shouldApplyDeferredRangeFloor) {
       },
     });
 
-    if (!isPremium) {
+    if (!isPremium && !hasAnalyticsCandidateStamp) {
       lateRejectionReasons.push("range_floor");
       if (!isRejected) {
         if (isRandom) {
@@ -4519,7 +4666,6 @@ if (shouldApplyDeferredRangeFloor) {
 const tradeRead = computeTradeRead({ t, confidenceMeta, rrInfo });
 const btcShortTfSignal = confidenceMeta?.btcShortTfSignal || getBtcShortTfSignal(profile);
 const analyticsVersionTags = getAnalyticsVersionTags();
-const entryAtoms = getEntryAtoms(t);
 let repeatDecision = { reject: false, isReminder: false, reason: "" };
 
 if (!isRandom && !force) {
@@ -4544,7 +4690,7 @@ if (!isRandom && !force) {
   }
 }
 
-if (!isRandom) {
+if (!isRandom && isSendableManualTrade) {
   const managementHint = buildManagementHint(t, recipeStamp);
   const profileLabel = recipeStamp.profile || prettifyDecisionToken(t?.execReason || "Premium setup");
   const watch = compactTradeWatch(tradeRead);
@@ -4553,7 +4699,6 @@ if (!isRandom) {
   lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
   lines.push(`${stampLabel} ${recipeStamp.emoji}${repeatDecision.isReminder ? " | Reminder" : ""} | ${profileLabel}`);
   if (managementHint) lines.push(`Mgmt: ${managementHint}`);
-  if (tradeRead.summary) lines.push(`Edge: ${tradeRead.summary}`);
   if (watch) lines.push(`Watch: ${watch}`);
   lines.push(`Entry: ${price != null ? fmtPrice(price) : ""}`);
   lines.push("");
@@ -4611,6 +4756,9 @@ analyticsEvents.push({
   recipe_stamp_label: recipeStamp.label || "",
   recipe_stamp_reason: recipeStamp.reason || "",
   recipe_stamp_profile: recipeStamp.profile || "",
+  candidate_stamp_labels: candidateStamps.map((x) => x.label).join(","),
+  candidate_stamp_reasons: candidateStamps.map((x) => x.reason).join(" | "),
+  candidate_stamp_profiles: candidateStamps.map((x) => x.profile).join(" | "),
   premium_realert: !!repeatDecision.isReminder,
   premium_realert_reason: repeatDecision.reason || "",
   premium_realert_entry_distance_pct: repeatDecision.entryDistancePct ?? "",
@@ -4783,6 +4931,10 @@ const telegramRowFields = [
   "recipe_stamp_label",
   "recipe_stamp_reason",
   "recipe_stamp_profile",
+  "candidate_stamp_version",
+  "candidate_stamp_labels",
+  "candidate_stamp_reasons",
+  "candidate_stamp_profiles",
   "premium_realert",
   "premium_realert_reason",
   "premium_realert_entry_distance_pct",
