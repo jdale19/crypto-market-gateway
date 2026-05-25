@@ -13,6 +13,7 @@
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
 // - MANUAL TG RECIPES: Build removed; only strongest Scalp/Swing manual recipes surface as PREMIUM; demoted recipes stay analytics-only; unvalidated TP/SL/invalidation hidden
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
+// - ANALYTICS-ONLY DISCOVERY: added May 25 Scalp/Swing candidate stamps; no TG/Premium behavior change
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -39,7 +40,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
   premium_recipe_version: "manual_tg_recipes_v4_candidate_stamps_2026_05_20",
-  candidate_stamp_version: "candidate_stamps_v1_2026_05_20",
+  candidate_stamp_version: "2026-05-25-discovery-v1",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -2627,8 +2628,19 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   return { label: "", emoji: "", reason: "no_stamp", profile: "" };
 }
 
+const BLOCKED_PROMOTION_CANDIDATE_STAMPS = new Set([
+  "candidate_swing_short_anom_oi_negative_btc15_negative_ext_not_hostile",
+  "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
+]);
+
 function addCandidateStamp(stamps, label, reason, profile) {
-  stamps.push({ label, reason, profile });
+  const promotionBlocked = BLOCKED_PROMOTION_CANDIDATE_STAMPS.has(label);
+  stamps.push({
+    label,
+    reason: promotionBlocked ? `promotion_blocked:${reason}` : reason,
+    profile: promotionBlocked ? `Blocked: ${profile}` : profile,
+    promotionBlocked,
+  });
 }
 
 function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
@@ -2645,28 +2657,106 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   const coinDayPct = asNum(t?.ctx?.coinDayPct);
   const btc15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
   const btcShortTfState = String(confidenceMeta?.btcShortTfSignal?.state || "neutral").toLowerCase();
+  const symbolVsBtc15mPct = asNum(t?.ctx?.symbolVsBtc15mPct);
   const symbolVsBtc1hPct = asNum(t?.ctx?.symbolVsBtc1hPct);
+  const symbolVsEth1hPct = asNum(t?.ctx?.symbolVsEth1hPct);
+  const cryptoBreadth1hPct = asNum(t?.ctx?.cryptoBreadth1hPct);
+  const spotVsPerp1hPct = asNum(t?.ctx?.spotVsPerp1hPct);
   const bookImbalance20 = asNum(t?.ctx?.bookImbalance20);
   const spreadBps = asNum(t?.ctx?.spreadBps);
   const btcOi30mPct = asNum(t?.ctx?.btc5mOi30mPct);
   const btcOi60mPct = asNum(t?.ctx?.btc5mOi60mPct);
+  const anomalyPriceOiGap = asNum(t?.ctx?.anomalyPriceOiGap);
   const marketStructureOk = isTruthyBoolean(t?.ctx?.marketStructureOk);
+  const inLowBand = isTruthyBoolean(entryAtoms?.entry_atom_in_low_band);
   const inHighBand = isTruthyBoolean(entryAtoms?.entry_atom_in_high_band);
 
-  if (
+  const scalpShortAnomalyClean =
     mode === "scalp" &&
     bias === "short" &&
     Number.isFinite(anomalyScore) &&
     anomalyScore >= 1.2 &&
     (!Number.isFinite(coinDayPct) || coinDayPct <= 1.0) &&
     btcShortTfState !== "hostile" &&
-    btcShortTfState !== "minor_hostile"
-  ) {
+    btcShortTfState !== "minor_hostile";
+
+  if (scalpShortAnomalyClean) {
     addCandidateStamp(
       stamps,
       "candidate_scalp_short_anomaly_pressure_coin_not_hot_btc_no_hostile_no_minor_hostile",
       "scalp short anomaly pressure; coin not hot; BTC short-TF clean",
       "Scalp Short: strict anomaly pressure"
+    );
+  }
+
+  if (scalpShortAnomalyClean && Number.isFinite(symbolVsBtc15mPct) && symbolVsBtc15mPct >= 0.20) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_short_anomaly_clean_rsb15_overextended",
+      "scalp short anomaly pressure; BTC short-TF clean; symbol >= 0.20% vs BTC over 15m",
+      "Scalp Short: anomaly + BTC-relative overextension"
+    );
+  }
+
+  if (
+    scalpShortAnomalyClean &&
+    inLowBand &&
+    Number.isFinite(anomalyPriceOiGap) &&
+    anomalyPriceOiGap >= 0.51
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_short_anomaly_clean_low_band_gap",
+      "scalp short anomaly pressure; BTC short-TF clean; low-band entry; anomaly price/OI gap >= 0.51",
+      "Scalp Short: anomaly + low-band gap"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "long" &&
+    Number.isFinite(btcOi60mPct) &&
+    btcOi60mPct <= -1 &&
+    Number.isFinite(btcOi30mPct) &&
+    btcOi30mPct <= -0.5
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_long_btc_oi_compression_long",
+      "swing long; BTC OI 60m <= -1 and BTC OI 30m <= -0.5",
+      "Swing Long: BTC OI compression relief"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(symbolVsEth1hPct) &&
+    symbolVsEth1hPct <= -0.25 &&
+    Number.isFinite(cryptoBreadth1hPct) &&
+    cryptoBreadth1hPct >= 80
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_eth1h_weak_breadth1h_strong",
+      "swing short; symbol <= -0.25% vs ETH over 1h; crypto breadth 1h >= 80%",
+      "Swing Short: ETH-relative weakness in strong breadth"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(symbolVsEth1hPct) &&
+    symbolVsEth1hPct <= -0.25 &&
+    Number.isFinite(spotVsPerp1hPct) &&
+    spotVsPerp1hPct >= 0.0277
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_eth1h_weak_spotperp_high",
+      "swing short; symbol <= -0.25% vs ETH over 1h; spot/perp 1h >= 0.0277",
+      "Swing Short: ETH-relative weakness + spot/perp support"
     );
   }
 
@@ -2707,6 +2797,23 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   if (
     mode === "swing" &&
     bias === "short" &&
+    inHighBand &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct < 0 &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct < 0
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_high_band_oi_unwind_btc15_down",
+      "swing short; high-band entry; anomaly OI negative; BTC15 negative",
+      "Swing Short: high-band OI unwind + BTC15 down"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
     Number.isFinite(symbolVsBtc1hPct) &&
     symbolVsBtc1hPct < 0 &&
     Number.isFinite(anomalyOiPct) &&
@@ -2719,6 +2826,22 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
       "candidate_swing_short_rsbtc1h_negative_anom_oi_negative_btc15_negative",
       "swing short; symbol underperforming BTC 1h; anomaly OI negative; BTC15 negative",
       "Swing Short: relative weakness + OI unwind"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(symbolVsBtc1hPct) &&
+    symbolVsBtc1hPct < 0 &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct < 0
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_rsbtc1h_negative_anom_oi_negative_no_btc15_gate",
+      "swing short; symbol underperforming BTC 1h; anomaly OI negative; no BTC15 gate",
+      "Swing Short: relative weakness + OI unwind, no BTC15 gate"
     );
   }
 
@@ -4398,6 +4521,7 @@ for (const t of triggered) {
     anomalyRank: asNum(anomalyCtx.anomaly_rank),
     anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
     anomalyPattern: anomalyCtx.anomaly_pattern || "",
+    anomalyPriceOiGap: asNum(anomalyCtx.anomaly_price_oi_gap),
   };
 
   const confidenceMeta = computeConfidence(t);
