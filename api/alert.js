@@ -13,7 +13,8 @@
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
 // - MANUAL TG RECIPES: Build removed; only strongest Scalp/Swing manual recipes surface as PREMIUM; demoted recipes stay analytics-only; unvalidated TP/SL/invalidation hidden
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
-// - ANALYTICS-ONLY DISCOVERY: added May 25 Scalp/Swing candidate stamps; no TG/Premium behavior change
+// - ANALYTICS-ONLY DISCOVERY: added June 5 Scalp/Swing all-predictor candidate stamps; no new TG/Premium promotions
+// - PREMIUM SUPPRESSION: demoted weak Swing Long mild external + anomaly OI + BTC15 path to analytics-only tracking
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -39,8 +40,8 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v4_candidate_stamps_2026_05_20",
-  candidate_stamp_version: "2026-05-25-discovery-v1",
+  premium_recipe_version: "manual_tg_recipes_v5_swing_mild_long_suppressed_2026_06_05",
+  candidate_stamp_version: "2026-06-05-discovery-v2",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -2598,14 +2599,8 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     );
   }
 
-  // New mild-support swing long recipe: external support is not the edge alone; it must pair with positive anomaly OI, BTC 15m support, and non-overheated equities.
-  if (swingLongMildExternalAnomalyBtc15) {
-    return tradeStamp(
-      "PREMIUM",
-      `${mode}_${bias}_mild_external_positive_anomaly_oi_macro_ok_btc15_positive`,
-      "Swing Long: mild external + anomaly OI + BTC15"
-    );
-  }
+  // Demoted from TG/Premium on 2026-06-05.
+  // Historical due-window behavior was weak; keep tracking via analytics-only candidate stamps.
 
   // Targeted ignition upgrade: broad long_build alone was weaker; require BTC 15m support and side-aware external support for TG Premium.
   if (swingIgnitionLongBuildBtc15External) {
@@ -2652,14 +2647,25 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   if (mode === "build") return stamps;
 
   const extAdj = Number(confidenceMeta?.extAdj || 0);
+  const externalBias = String(t?.ctx?.externalBias || "neutral").toLowerCase();
   const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
+  const anomalyPricePct = asNum(t?.ctx?.anomalyPricePct);
+  const anomalyBasketOiPct = asNum(t?.ctx?.anomalyBasketOiPct);
+  const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
   const anomalyScore = asNum(t?.ctx?.anomalyScore);
+  const anomalyRank = asNum(t?.ctx?.anomalyRank);
+  const anomalyOiTrendDeviation = asNum(t?.ctx?.anomalyOiTrendDeviation);
   const coinDayPct = asNum(t?.ctx?.coinDayPct);
+  const vixDayPct = asNum(t?.ctx?.vixDayPct);
+  const dxyDayPct = asNum(t?.ctx?.dxyDayPct);
+  const spxDayPct = asNum(t?.ctx?.spxDayPct);
   const btc15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
+  const btcFunding30mAvg = asNum(t?.ctx?.btc5mFunding30mAvg);
   const btcShortTfState = String(confidenceMeta?.btcShortTfSignal?.state || "neutral").toLowerCase();
   const symbolVsBtc15mPct = asNum(t?.ctx?.symbolVsBtc15mPct);
   const symbolVsBtc1hPct = asNum(t?.ctx?.symbolVsBtc1hPct);
   const symbolVsEth1hPct = asNum(t?.ctx?.symbolVsEth1hPct);
+  const cryptoBreadth15mPct = asNum(t?.ctx?.cryptoBreadth15mPct);
   const cryptoBreadth1hPct = asNum(t?.ctx?.cryptoBreadth1hPct);
   const spotVsPerp1hPct = asNum(t?.ctx?.spotVsPerp1hPct);
   const bookImbalance20 = asNum(t?.ctx?.bookImbalance20);
@@ -2670,6 +2676,169 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   const marketStructureOk = isTruthyBoolean(t?.ctx?.marketStructureOk);
   const inLowBand = isTruthyBoolean(entryAtoms?.entry_atom_in_low_band);
   const inHighBand = isTruthyBoolean(entryAtoms?.entry_atom_in_high_band);
+
+  const suppressedSwingLongMildExternalAnomalyBtc15 =
+    mode === "swing" &&
+    bias === "long" &&
+    extAdj > 0.15 &&
+    extAdj <= 0.50 &&
+    Number.isFinite(anomalyOiPct) &&
+    anomalyOiPct > 0 &&
+    isFinitePctAtOrBelow(t?.ctx?.qqqDayPct, 0.75) &&
+    isFinitePctAtOrBelow(spxDayPct, 0.75) &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct > 0;
+
+  if (suppressedSwingLongMildExternalAnomalyBtc15) {
+    addCandidateStamp(
+      stamps,
+      "suppressed_swing_long_mild_external_positive_anomaly_oi_macro_ok_btc15_positive",
+      "suppressed prior Premium; swing long; mild supportive external; anomaly OI positive; equities not overheated; BTC15 positive",
+      "Suppressed: Swing Long mild external + anomaly OI + BTC15"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(coinDayPct) &&
+    coinDayPct <= -4.8 &&
+    Number.isFinite(spxDayPct) &&
+    spxDayPct <= 0
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_macro_riskoff_coin_crash_spx_weak",
+      "swing short; COIN day <= -4.8%; SPX day <= 0",
+      "Swing Short: macro risk-off + coin crash"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(coinDayPct) &&
+    coinDayPct <= -4.8 &&
+    Number.isFinite(spxDayPct) &&
+    spxDayPct <= 0 &&
+    Number.isFinite(dxyDayPct) &&
+    dxyDayPct >= -0.05
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_macro_riskoff_coin_crash_spx_weak_dxy_firm",
+      "swing short; COIN day <= -4.8%; SPX day <= 0; DXY day >= -0.05%",
+      "Swing Short: macro risk-off + firm DXY"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "long" &&
+    Number.isFinite(anomalyBasketOiPct) &&
+    anomalyBasketOiPct >= 0.15
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_long_basket_oi_accumulation",
+      "swing long; anomaly basket OI >= 0.15%",
+      "Swing Long: basket OI accumulation"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "long" &&
+    Number.isFinite(anomalyBasketOiPct) &&
+    anomalyBasketOiPct >= 0.15 &&
+    anomalyPattern === "mixed"
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_long_basket_oi_accumulation_mixed_anomaly",
+      "swing long; anomaly basket OI >= 0.15%; anomaly pattern mixed",
+      "Swing Long: basket OI accumulation + mixed anomaly"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "long" &&
+    Number.isFinite(vixDayPct) &&
+    vixDayPct >= 6.8 &&
+    Number.isFinite(btcFunding30mAvg) &&
+    btcFunding30mAvg <= 0.000005
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_long_vix_stress_low_btc_funding_relief",
+      "swing long; VIX day >= 6.8%; BTC 30m funding avg <= 0.000005",
+      "Swing Long: VIX stress + low BTC funding relief"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "long" &&
+    Number.isFinite(btc15mPct) &&
+    btc15mPct <= -0.25 &&
+    Number.isFinite(cryptoBreadth15mPct) &&
+    cryptoBreadth15mPct <= 0
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_long_btc15_breadth_washout_relief",
+      "swing long; BTC15 <= -0.25%; crypto breadth 15m <= 0%",
+      "Swing Long: BTC15/breadth washout relief"
+    );
+  }
+
+  if (
+    mode === "scalp" &&
+    bias === "short" &&
+    Number.isFinite(anomalyOiTrendDeviation) &&
+    anomalyOiTrendDeviation >= 0.63 &&
+    Number.isFinite(anomalyPricePct) &&
+    anomalyPricePct >= 0.5 &&
+    Number.isFinite(anomalyRank) &&
+    anomalyRank <= 7
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_short_ranked_price_oi_trend_pressure",
+      "scalp short; anomaly OI trend deviation >= 0.63; anomaly price >= 0.5%; anomaly rank <= 7",
+      "Scalp Short: ranked price/OI trend pressure"
+    );
+  }
+
+  if (
+    mode === "scalp" &&
+    bias === "long" &&
+    Number.isFinite(anomalyPriceOiGap) &&
+    anomalyPriceOiGap >= 1.0
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_long_anomaly_price_oi_gap_impulse",
+      "scalp long; anomaly price/OI gap >= 1.0",
+      "Scalp Long: price/OI gap impulse"
+    );
+  }
+
+  if (
+    mode === "scalp" &&
+    bias === "long" &&
+    externalBias === "supportive" &&
+    Number.isFinite(t?.ctx?.oi15) &&
+    t.ctx.oi15 >= 0.14
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_long_supportive_external_oi15_positive",
+      "scalp long; supportive external bias; OI 15m >= 0.14%",
+      "Scalp Long: supportive external + OI15 positive"
+    );
+  }
 
   const scalpShortAnomalyClean =
     mode === "scalp" &&
@@ -4089,8 +4258,13 @@ async function evaluateCandidate({
         anomalyTf: anomalyCtx.anomaly_tf || "",
         anomalyScore: asNum(anomalyCtx.anomaly_score),
         anomalyRank: asNum(anomalyCtx.anomaly_rank),
+        anomalyPricePct: asNum(anomalyCtx.anomaly_price_pct),
         anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
         anomalyPattern: anomalyCtx.anomaly_pattern || "",
+        anomalyBasketPricePct: asNum(anomalyCtx.anomaly_basket_price_pct),
+        anomalyBasketOiPct: asNum(anomalyCtx.anomaly_basket_oi_pct),
+        anomalyPriceOiGap: asNum(anomalyCtx.anomaly_price_oi_gap),
+        anomalyOiTrendDeviation: asNum(anomalyCtx.anomaly_oi_trend_deviation),
         oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
         lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
         lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
