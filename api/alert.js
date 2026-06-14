@@ -41,7 +41,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v6_swing_washout_pilot_scalp_short_suppressed_2026_06_14",
+  premium_recipe_version: "manual_tg_recipes_v7_liq_snap_external_loosened_2026_06_14",
   candidate_stamp_version: "2026-06-14-discovery-v3",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
@@ -2591,11 +2591,11 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   // Demoted from TG/Premium on 2026-06-14.
   // Strong external alone was not enough; Scalp Short anomaly pressure decayed in fired rows.
 
-  // Keep Liquidity Snap visible, but it is exit-sensitive; management hint carries the nuance.
-  if (execReason === "swing_liquidity_snap_reversal_long" && sideAwareExternalNonNeutral) {
+  // Keep all Liquidity Snap Long visible. External confirmation was too restrictive for TG volume; management hint carries the exit-sensitive nuance.
+  if (execReason === "swing_liquidity_snap_reversal_long") {
     return tradeStamp(
       "PREMIUM",
-      `${execReason}_side_aware_non_neutral_external`,
+      `${execReason}_manual_tg_pilot`,
       "Liquidity Snap Long"
     );
   }
