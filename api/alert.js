@@ -13,8 +13,8 @@
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
 // - MANUAL TG RECIPES: Build removed; only strongest Scalp/Swing manual recipes surface as PREMIUM; demoted recipes stay analytics-only; unvalidated TP/SL/invalidation hidden
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
-// - ANALYTICS-ONLY DISCOVERY: added June 14 Scalp/Swing candidate stamps; no new sheet/env fields
-// - PREMIUM SUPPRESSION: demoted weak Swing Long mild external + anomaly OI + BTC15 and Scalp Short anomaly pressure paths to analytics-only tracking
+// - ANALYTICS-ONLY DISCOVERY: added June 14 and June 18 Scalp/Swing candidate stamps; no new sheet/env fields
+// - PREMIUM SUPPRESSION: demoted weak Swing Long continuation/breakout paths and weak anomaly-pressure paths to analytics-only tracking
 // - TG PILOT: promoted stricter Swing Long BTC/breadth washout + basket OI rebound as manual Premium pilot
 //
 // Notes:
@@ -42,7 +42,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
   premium_recipe_version: "manual_tg_recipes_v7_liq_snap_external_loosened_2026_06_14",
-  candidate_stamp_version: "2026-06-14-discovery-v3",
+  candidate_stamp_version: "2026-06-18-discovery-v4",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -2621,6 +2621,9 @@ function computeRecipeStamp({ t, confidenceMeta }) {
 }
 
 const BLOCKED_PROMOTION_CANDIDATE_STAMPS = new Set([
+  "suppressed_swing_long_flow_persists_long",
+  "suppressed_swing_long_ignition_breakout_long",
+  "candidate_swing_short_flow_persists_long_liq",
   "candidate_swing_short_anom_oi_negative_btc15_negative_ext_not_hostile",
   "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
 ]);
@@ -2694,6 +2697,24 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
       "suppressed_swing_long_mild_external_positive_anomaly_oi_macro_ok_btc15_positive",
       "suppressed prior Premium; swing long; mild supportive external; anomaly OI positive; equities not overheated; BTC15 positive",
       "Suppressed: Swing Long mild external + anomaly OI + BTC15"
+    );
+  }
+
+  if (mode === "swing" && bias === "long" && String(t?.execReason || "").toLowerCase() === "swing_flow_persists_long") {
+    addCandidateStamp(
+      stamps,
+      "suppressed_swing_long_flow_persists_long",
+      "suppressed weak swing long continuation; keep analytics only",
+      "Suppressed: Swing Long flow persists long"
+    );
+  }
+
+  if (mode === "swing" && bias === "long" && String(t?.execReason || "").toLowerCase() === "swing_ignition_breakout_long") {
+    addCandidateStamp(
+      stamps,
+      "suppressed_swing_long_ignition_breakout_long",
+      "suppressed weak swing long breakout; keep analytics only",
+      "Suppressed: Swing Long ignition breakout long"
     );
   }
 
@@ -2992,6 +3013,20 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
       "candidate_swing_short_eth1h_weak_spotperp_high",
       "swing short; symbol <= -0.25% vs ETH over 1h; spot/perp 1h >= 0.0277",
       "Swing Short: ETH-relative weakness + spot/perp support"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    String(t?.execReason || "").toLowerCase() === "swing_flow_persists_short" &&
+    anomalyPattern === "long_liq"
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_flow_persists_long_liq",
+      "swing short flow persists; anomaly pattern = long_liq",
+      "Swing Short: flow persists + long liq anomaly"
     );
   }
 
