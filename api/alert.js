@@ -11,11 +11,11 @@
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
-// - MANUAL TG RECIPES: Build removed; only strongest Scalp/Swing manual recipes surface as PREMIUM; demoted recipes stay analytics-only; unvalidated TP/SL/invalidation hidden
+// - MANUAL TG REVALIDATION HOLD: Build remains research-only; no current Scalp/Swing recipe may surface as PREMIUM until a validated manual route is restored
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
-// - ANALYTICS-ONLY DISCOVERY: added June 14 and June 18 Scalp/Swing candidate stamps; no new sheet/env fields
-// - PREMIUM SUPPRESSION: demoted weak Swing Long continuation/breakout paths and weak anomaly-pressure paths to analytics-only tracking
-// - TG PILOT: promoted stricter Swing Long BTC/breadth washout + basket OI rebound as manual Premium pilot
+// - ANALYTICS-ONLY DISCOVERY: retain suppressed families for measurement and add hot-funding Swing Short plus BTC-funding short overlay candidates
+// - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
+// - ANALYTICS POSTING: log non-2xx webhook responses instead of silently marking a failed post as successful
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -41,8 +41,8 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "ext_context_v2_2026_04_11",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v7_liq_snap_external_loosened_2026_06_14",
-  candidate_stamp_version: "2026-06-18-discovery-v4",
+  premium_recipe_version: "manual_tg_recipes_v8_revalidation_hold_2026_06_29",
+  candidate_stamp_version: "2026-06-30-discovery-v6-btc-funding-overlays",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -89,7 +89,7 @@ async function postAnalyticsBatch(events, meta = {}) {
   }
 
   try {
-    await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+    const response = await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -100,10 +100,16 @@ async function postAnalyticsBatch(events, meta = {}) {
       }),
     });
 
+    if (!response.ok) {
+      throw new Error(`analytics_webhook_http_${response.status}`);
+    }
+
     if (Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
       await redis.set(throttleKey, String(Date.now())).catch(() => null);
     }
-  } catch (_) {}
+  } catch (err) {
+    console.error("[analytics] post failed", String(err?.message || err));
+  }
 }
 
 const CFG = {
@@ -2452,13 +2458,8 @@ function buildManagementHint(t, recipeStamp) {
   const execReason = String(t?.execReason || "").toLowerCase();
   const recipeReason = String(recipeStamp?.reason || "").toLowerCase();
 
-  if (mode === "swing" && execReason === "swing_liquidity_snap_reversal_long") {
-    return "Trail TP / take partials; no blind due hold.";
-  }
-
-  if (recipeReason.includes("swing_long_btc_breadth_washout_basket_oi")) {
-    return "Let first 10m settle; trail once rebound confirms.";
-  }
+  // Former TG pilots remain analytics-only during revalidation; do not attach
+  // unvalidated management language to either family.
 
   if (recipeReason.includes("scalp_short_anomaly")) {
     return "Fast TP; exit if downside stalls.";
@@ -2591,38 +2592,23 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   // Demoted from TG/Premium on 2026-06-14.
   // Strong external alone was not enough; Scalp Short anomaly pressure decayed in fired rows.
 
-  // Keep all Liquidity Snap Long visible. External confirmation was too restrictive for TG volume; management hint carries the exit-sensitive nuance.
-  if (execReason === "swing_liquidity_snap_reversal_long") {
-    return tradeStamp(
-      "PREMIUM",
-      `${execReason}_manual_tg_pilot`,
-      "Liquidity Snap Long"
-    );
-  }
-
-  // Manual TG pilot promoted on 2026-06-14.
-  // Uses the stricter washout + breadth stress + basket OI confirmation version, not basket OI alone.
-  if (swingLongBtcBreadthWashoutBasketOi) {
-    return tradeStamp(
-      "PREMIUM",
-      `${mode}_${bias}_swing_long_btc_breadth_washout_basket_oi_rebound`,
-      "Swing Long: BTC/breadth washout rebound"
-    );
-  }
-
-  // Demoted from TG/Premium; keep tracking via analytics-only candidate stamps.
+  // Revalidation hold: no current manual-TG recipe may return PREMIUM.
+  // Former pilots are retained exclusively as analytics candidate stamps below.
   void strongScalpLongExternal;
   void scalpShortAnomalyPressure;
   void swingLongMildExternalAnomalyBtc15;
   void swingIgnitionLongBuildBtc15External;
   void strongSwingLongExternal;
+  void swingLongBtcBreadthWashoutBasketOi;
 
-  return { label: "", emoji: "", reason: "no_stamp", profile: "" };
+  return { label: "", emoji: "", reason: "no_validated_manual_recipe", profile: "" };
 }
 
 const BLOCKED_PROMOTION_CANDIDATE_STAMPS = new Set([
+  "suppressed_swing_long_liquidity_snap_revalidation",
   "suppressed_swing_long_flow_persists_long",
   "suppressed_swing_long_ignition_breakout_long",
+  "suppressed_swing_long_btc_oi_compression_long",
   "candidate_swing_short_flow_persists_long_liq",
   "candidate_swing_short_anom_oi_negative_btc15_negative_ext_not_hostile",
   "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
@@ -2697,6 +2683,19 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
       "suppressed_swing_long_mild_external_positive_anomaly_oi_macro_ok_btc15_positive",
       "suppressed prior Premium; swing long; mild supportive external; anomaly OI positive; equities not overheated; BTC15 positive",
       "Suppressed: Swing Long mild external + anomaly OI + BTC15"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "long" &&
+    String(t?.execReason || "").toLowerCase() === "swing_liquidity_snap_reversal_long"
+  ) {
+    addCandidateStamp(
+      stamps,
+      "suppressed_swing_long_liquidity_snap_revalidation",
+      "former TG Premium; keep analytics only pending entry-quality revalidation",
+      "Swing Long liquidity-snap revalidation"
     );
   }
 
@@ -2945,9 +2944,9 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   ) {
     addCandidateStamp(
       stamps,
-      "candidate_swing_long_btc_oi_compression_long",
-      "swing long; BTC OI 60m <= -1 and BTC OI 30m <= -0.5",
-      "Swing Long: BTC OI compression relief"
+      "suppressed_swing_long_btc_oi_compression_long",
+      "suppressed weak swing long; BTC OI 60m <= -1 and BTC OI 30m <= -0.5",
+      "Swing Long BTC OI compression"
     );
   }
 
@@ -2964,6 +2963,37 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
       "candidate_swing_short_ranked_anomaly_hot_funding",
       "swing short; anomaly rank <= 7; anomaly funding rate >= 0.00008",
       "Swing Short: ranked anomaly + hot funding"
+    );
+  }
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(anomalyFundingRate) &&
+    anomalyFundingRate >= 0.00008 &&
+    Number.isFinite(anomalyPricePct) &&
+    anomalyPricePct <= -0.15
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_hot_funding_price_down",
+      "swing short; anomaly funding rate >= 0.00008; anomaly price <= -0.15%",
+      "Candidate: Swing Short hot funding + anomaly price down"
+    );
+  }
+
+
+  if (
+    mode === "swing" &&
+    bias === "short" &&
+    Number.isFinite(btcFunding30mAvg) &&
+    btcFunding30mAvg >= 0.000024
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_swing_short_btc_funding_high",
+      "swing short; BTC 30m average funding >= 0.000024",
+      "Candidate: Swing Short high BTC funding"
     );
   }
 
@@ -3129,6 +3159,22 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
       "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
       "swing short; ask-side imbalance; spread <= 5 bps; market structure ok",
       "Swing Short: book pressure"
+    );
+  }
+
+  if (
+    mode === "scalp" &&
+    bias === "short" &&
+    Number.isFinite(btcFunding30mAvg) &&
+    btcFunding30mAvg >= 0.00003 &&
+    Number.isFinite(btcOi30mPct) &&
+    btcOi30mPct >= -0.01
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_short_btc_funding_high_flat_oi",
+      "scalp short; BTC 30m average funding >= 0.00003; BTC 30m OI >= -0.01%",
+      "Candidate: Scalp Short high BTC funding + flat-to-rising BTC OI"
     );
   }
 
