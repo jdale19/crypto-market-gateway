@@ -11,7 +11,7 @@
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
-// - MANUAL TG REVALIDATION HOLD: Build remains research-only; no current Scalp/Swing recipe may surface as PREMIUM until a validated manual route is restored
+// - MANUAL TG V9: one bounded Swing Short Premium route is restored; all other former Scalp/Swing pilots remain analytics-only
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
 // - ANALYTICS-ONLY DISCOVERY: retain suppressed families for measurement and add hot-funding Swing Short plus BTC-funding short overlay candidates
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
@@ -38,10 +38,10 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   selector_version: "selector_v3_1_2026_05_09",
   confidence_version: "confidence_v2_2026_04_14",
   trade_read_version: "trade_read_v1_2026_04_14",
-  ext_context_version: "ext_context_v2_2026_04_11",
+  ext_context_version: "ext_context_v3_require_ok_2026_07_01",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v8_revalidation_hold_2026_06_29",
+  premium_recipe_version: "manual_tg_recipes_v9_swing_short_crowded_basket_compact_2026_07_01",
   candidate_stamp_version: "2026-06-30-discovery-v6-btc-funding-overlays",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
@@ -883,6 +883,7 @@ function getExternalContextComponents({ side, ctx = {} }) {
 
 function getExternalContextAdj({ mode, side, ctx = {} }) {
   if (!CFG.extContext?.enabled || !CFG.extContext?.useRawFieldsLive) return 0;
+  if (!ctx?.ok) return 0;
 
   const modeWeight = getExternalWeightForMode(mode);
   if (!Number.isFinite(modeWeight) || modeWeight <= 0) return 0;
@@ -2512,7 +2513,7 @@ function isTruthyBoolean(value) {
   return value === true || String(value).toLowerCase() === "true" || String(value) === "1";
 }
 
-function computeRecipeStamp({ t, confidenceMeta }) {
+function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
   if (confidenceMeta?.selectorAllowed === false) {
     return { label: "", emoji: "", reason: "selector_rejected", profile: "" };
   }
@@ -2523,6 +2524,18 @@ function computeRecipeStamp({ t, confidenceMeta }) {
   const extAdj = Number(confidenceMeta?.extAdj || 0);
   const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
   const anomalyBasketOiPct = asNum(t?.ctx?.anomalyBasketOiPct);
+  const anomalyBasketFundingRate = asNum(t?.ctx?.anomalyBasketFundingRate);
+  const entryPrice = asNum(t?.price);
+  const contHi = asNum(entryAtoms?.entry_atom_cont_hi);
+  const contLo = asNum(entryAtoms?.entry_atom_cont_lo);
+  const contRangePct =
+    Number.isFinite(entryPrice) &&
+    Number.isFinite(contHi) &&
+    Number.isFinite(contLo) &&
+    contHi > contLo &&
+    entryPrice > 0
+      ? ((contHi - contLo) / entryPrice) * 100
+      : null;
   const anomalyScore = asNum(t?.ctx?.anomalyScore);
   const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
   const coinDayPct = asNum(t?.ctx?.coinDayPct);
@@ -2588,12 +2601,29 @@ function computeRecipeStamp({ t, confidenceMeta }) {
     cryptoBreadth15mPct <= 0 &&
     Number.isFinite(anomalyBasketOiPct) &&
     anomalyBasketOiPct >= 0.15;
+  const swingShortCrowdedBasketCompactContinuation =
+    t?.analyticsOnly !== true &&
+    mode === "swing" &&
+    bias === "short" &&
+    execReason === "swing_flow_persists_short" &&
+    Number.isFinite(anomalyBasketFundingRate) &&
+    anomalyBasketFundingRate >= 0.000004 &&
+    Number.isFinite(contRangePct) &&
+    contRangePct <= 0.8;
 
   // Demoted from TG/Premium on 2026-06-14.
   // Strong external alone was not enough; Scalp Short anomaly pressure decayed in fired rows.
 
-  // Revalidation hold: no current manual-TG recipe may return PREMIUM.
-  // Former pilots are retained exclusively as analytics candidate stamps below.
+  if (swingShortCrowdedBasketCompactContinuation) {
+    return premiumStamp(
+      "PREMIUM",
+      "swing_short_crowded_basket_compact_continuation",
+      "Swing Short: elevated basket funding + compact continuation"
+    );
+  }
+
+  // V9 reactivates only the bounded Swing Short route above.
+  // Former pilots remain exclusively as analytics candidate stamps below.
   void strongScalpLongExternal;
   void scalpShortAnomalyPressure;
   void swingLongMildExternalAnomalyBtc15;
@@ -4411,6 +4441,7 @@ async function evaluateCandidate({
         anomalyPattern: anomalyCtx.anomaly_pattern || "",
         anomalyBasketPricePct: asNum(anomalyCtx.anomaly_basket_price_pct),
         anomalyBasketOiPct: asNum(anomalyCtx.anomaly_basket_oi_pct),
+        anomalyBasketFundingRate: asNum(anomalyCtx.anomaly_basket_funding_rate),
         anomalyPriceOiGap: asNum(anomalyCtx.anomaly_price_oi_gap),
         anomalyOiTrendDeviation: asNum(anomalyCtx.anomaly_oi_trend_deviation),
         oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
@@ -4843,13 +4874,14 @@ for (const t of triggered) {
     anomalyRank: asNum(anomalyCtx.anomaly_rank),
     anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
     anomalyPattern: anomalyCtx.anomaly_pattern || "",
+    anomalyBasketFundingRate: asNum(anomalyCtx.anomaly_basket_funding_rate),
     anomalyPriceOiGap: asNum(anomalyCtx.anomaly_price_oi_gap),
   };
 
   const confidenceMeta = computeConfidence(t);
   const confidence = confidenceMeta.finalConfidence;
-  const recipeStamp = computeRecipeStamp({ t, confidenceMeta });
   const entryAtoms = getEntryAtoms(t);
+  const recipeStamp = computeRecipeStamp({ t, confidenceMeta, entryAtoms });
   const candidateStamps = computeCandidateStamps({ t, confidenceMeta, entryAtoms });
   const hasAnalyticsCandidateStamp = candidateStamps.length > 0;
   const isPremium = recipeStamp.label === "PREMIUM";
