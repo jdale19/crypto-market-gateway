@@ -382,6 +382,7 @@ async function processOne(symbol, reqCache) {
 
   if (!snapNow) {
     snapNow = {
+      inst_id: instId,
       price: okx.price,
       open: okx.open,
       high: okx.high,
@@ -409,6 +410,7 @@ async function processOne(symbol, reqCache) {
   } else {
     snapNow = {
       ...snapNow,
+      inst_id: instId,
       open: Number.isFinite(Number(snapNow?.open)) ? snapNow.open : okx.open,
       high: Number.isFinite(Number(snapNow?.high)) ? snapNow.high : okx.high,
       low: Number.isFinite(Number(snapNow?.low)) ? snapNow.low : okx.low,
