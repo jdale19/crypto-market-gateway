@@ -4610,6 +4610,24 @@ async function evaluateCandidate({
 
     const macroMode = computeBtcMacro(j.results || [], mode);
 
+    // Preserve the exact mode-specific BTC macro state used by the live gate.
+    // This is analytics-only telemetry; it does not alter routing.
+    candidate = {
+      ...candidate,
+      ctx: {
+        ...(candidate?.ctx || {}),
+        btcMacro: {
+          ok: !!macroMode?.ok,
+          reason: String(macroMode?.reason || ""),
+          tf: String(macroMode?.tf || ""),
+          lean: String(macroMode?.btc?.lean || ""),
+          pricePct: macroMode?.btc?.pricePct ?? null,
+          oiPct: macroMode?.btc?.oiPct ?? null,
+          bullExpansion: !!macroMode?.btcBullExpansion,
+        },
+      },
+    };
+
     if (
       !force &&
       CFG.macro.enabled &&
@@ -5311,6 +5329,16 @@ btc_5m_funding_5m_avg: t?.ctx?.btc5mFunding5mAvg ?? "",
 btc_5m_funding_15m_avg: t?.ctx?.btc5mFunding15mAvg ?? "",
 btc_5m_funding_30m_avg: t?.ctx?.btc5mFunding30mAvg ?? "",
 btc_tape_state: t?.ctx?.btcTapeState || "",
+btc_macro_ok: !!t?.ctx?.btcMacro?.ok,
+btc_macro_reason: t?.ctx?.btcMacro?.reason || "",
+btc_macro_tf: t?.ctx?.btcMacro?.tf || "",
+btc_macro_lean: t?.ctx?.btcMacro?.lean || "",
+btc_macro_price_pct: t?.ctx?.btcMacro?.pricePct ?? "",
+btc_macro_oi_pct: t?.ctx?.btcMacro?.oiPct ?? "",
+btc_macro_bull_expansion: !!t?.ctx?.btcMacro?.bullExpansion,
+btc_macro_price_threshold_pct: CFG.macro.btcPricePctMin,
+btc_macro_oi_threshold_pct: CFG.macro.btcOiPctMin,
+btc_macro_block_shorts_enabled: CFG.macro.blockShortsOnAltsWhenBtcBull,
 symbol_vs_btc_15m_pct: t?.ctx?.symbolVsBtc15mPct ?? "",
 symbol_vs_btc_1h_pct: t?.ctx?.symbolVsBtc1hPct ?? "",
 symbol_vs_eth_15m_pct: t?.ctx?.symbolVsEth15mPct ?? "",
@@ -5472,6 +5500,16 @@ const telegramRowFields = [
   "btc_5m_funding_15m_avg",
   "btc_5m_funding_30m_avg",
   "btc_tape_state",
+  "btc_macro_ok",
+  "btc_macro_reason",
+  "btc_macro_tf",
+  "btc_macro_lean",
+  "btc_macro_price_pct",
+  "btc_macro_oi_pct",
+  "btc_macro_bull_expansion",
+  "btc_macro_price_threshold_pct",
+  "btc_macro_oi_threshold_pct",
+  "btc_macro_block_shorts_enabled",
   "symbol_vs_btc_15m_pct",
   "symbol_vs_btc_1h_pct",
   "symbol_vs_eth_15m_pct",
