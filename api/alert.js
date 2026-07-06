@@ -810,6 +810,148 @@ async function loadExternalTelemetry() {
   return out;
 }
 
+function average(nums = []) {
+  const vals = (nums || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
+  if (!vals.length) return null;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
+
+function classifyAnomalyPattern({ pricePct, oiPct }) {
+  if (!Number.isFinite(pricePct) || !Number.isFinite(oiPct)) return "unknown";
+  if (pricePct > 0 && oiPct > 0) return "long_build";
+  if (pricePct < 0 && oiPct < 0) return "long_liq";
+  if (pricePct > 0 && oiPct < 0) return "short_squeeze";
+  if (pricePct < 0 && oiPct > 0) return "short_build";
+  return "mixed";
+}
+
+function buildCrossAssetAnomaly({
+  items = [],
+  tf = CFG.anomaly?.tf || "15m",
+  preferredBasket = CFG.anomaly?.basketSymbols || ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NEARUSDT", "SUIUSDT"],
+  minBasketSize = CFG.anomaly?.minBasketSize || 3,
+  fallbackBasketSize = CFG.anomaly?.fallbackBasketSize || 5,
+}) {
+  if (!CFG.anomaly?.enabled) {
+    return {
+      ok: false,
+      reason: "disabled",
+      tf,
+      basket_symbols: [],
+      ranking: [],
+    };
+  }
+
+  const rows = (items || [])
+    .filter((it) => it?.ok && it?.symbol)
+    .map((it) => {
+      const pricePct = asNum(it?.deltas?.[tf]?.price_change_pct);
+      const oiPct = asNum(it?.deltas?.[tf]?.oi_change_pct);
+      const fundingRate = asNum(it?.funding_rate);
+
+      if (!Number.isFinite(pricePct) || !Number.isFinite(oiPct) || !Number.isFinite(fundingRate)) {
+        return null;
+      }
+
+      return {
+        symbol: String(it.symbol).toUpperCase(),
+        pricePct,
+        oiPct,
+        fundingRate,
+      };
+    })
+    .filter(Boolean);
+
+  const preferredSet = new Set(
+    (preferredBasket || []).map((s) => String(s || "").toUpperCase()).filter(Boolean)
+  );
+
+  let basketRows = rows.filter((r) => preferredSet.has(r.symbol));
+
+  if (basketRows.length < minBasketSize) {
+    basketRows = rows
+      .slice()
+      .sort((a, b) => {
+        const aPri = preferredSet.has(a.symbol) ? 0 : 1;
+        const bPri = preferredSet.has(b.symbol) ? 0 : 1;
+        if (aPri !== bPri) return aPri - bPri;
+        return a.symbol.localeCompare(b.symbol);
+      })
+      .slice(0, Math.min(fallbackBasketSize, rows.length));
+  }
+
+  if (basketRows.length < minBasketSize) {
+    return {
+      ok: false,
+      reason: "basket_too_small",
+      tf,
+      basket_symbols: basketRows.map((r) => r.symbol),
+      ranking: [],
+    };
+  }
+
+  const basketPricePct = average(basketRows.map((r) => r.pricePct));
+  const basketOiPct = average(basketRows.map((r) => r.oiPct));
+  const basketFundingRate = average(basketRows.map((r) => r.fundingRate));
+
+  if (
+    !Number.isFinite(basketPricePct) ||
+    !Number.isFinite(basketOiPct) ||
+    !Number.isFinite(basketFundingRate)
+  ) {
+    return {
+      ok: false,
+      reason: "basket_invalid",
+      tf,
+      basket_symbols: basketRows.map((r) => r.symbol),
+      ranking: [],
+    };
+  }
+
+  const ranking = rows
+    .map((r) => {
+      const priceOiGap = Math.abs(r.oiPct - r.pricePct);
+      const fundingDeviationBps = Math.abs((r.fundingRate - basketFundingRate) * 10000);
+      const oiTrendDeviation = Math.abs(r.oiPct - basketOiPct);
+      const priceDeviation = Math.abs(r.pricePct - basketPricePct);
+
+      const score = Number(
+        (priceOiGap + fundingDeviationBps + oiTrendDeviation + priceDeviation).toFixed(2)
+      );
+
+      return {
+        symbol: r.symbol,
+        score,
+        pattern: classifyAnomalyPattern({ pricePct: r.pricePct, oiPct: r.oiPct }),
+        price_pct: Number(r.pricePct.toFixed(4)),
+        oi_pct: Number(r.oiPct.toFixed(4)),
+        funding_rate: r.fundingRate,
+        basket_price_pct: Number(basketPricePct.toFixed(4)),
+        basket_oi_pct: Number(basketOiPct.toFixed(4)),
+        basket_funding_rate: basketFundingRate,
+        components: {
+          price_oi_gap: Number(priceOiGap.toFixed(2)),
+          funding_deviation_bps: Number(fundingDeviationBps.toFixed(2)),
+          oi_trend_deviation: Number(oiTrendDeviation.toFixed(2)),
+          price_deviation: Number(priceDeviation.toFixed(2)),
+        },
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return {
+    ok: true,
+    tf,
+    basket_symbols: basketRows.map((r) => r.symbol),
+    basket: {
+      price_pct: Number(basketPricePct.toFixed(4)),
+      oi_pct: Number(basketOiPct.toFixed(4)),
+      funding_rate: basketFundingRate,
+    },
+    ranking,
+  };
+}
+
 function computeRiskReward({ entryPrice, stopLossPx, tp }) {
   const entry = asNum(entryPrice);
   const sl = asNum(stopLossPx);
