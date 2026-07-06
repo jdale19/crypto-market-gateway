@@ -16,6 +16,7 @@
 // - ANALYTICS-ONLY DISCOVERY: retain suppressed families for measurement and add hot-funding Swing Short plus BTC-funding short overlay candidates
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
 // - ANALYTICS POSTING: log non-2xx webhook responses instead of silently marking a failed post as successful
+// - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y telemetry is capture-only
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -35,14 +36,14 @@ const EVAL_BUCKET_MS = 5 * 60 * 1000;
 const MODE_PRIORITY = ["scalp", "swing"];
 
 const ANALYTICS_VERSION_TAGS = Object.freeze({
-  selector_version: "selector_v3_1_2026_05_09",
-  confidence_version: "confidence_v2_2026_04_14",
-  trade_read_version: "trade_read_v1_2026_04_14",
-  ext_context_version: "ext_context_v3_require_ok_2026_07_01",
+  selector_version: "selector_v3_2_external_aggregate_deprecated_2026_07_06",
+  confidence_version: "confidence_v2_1_external_aggregate_deprecated_2026_07_06",
+  trade_read_version: "trade_read_v1_1_external_aggregate_deprecated_2026_07_06",
+  ext_context_version: "external_telemetry_v1_aggregate_deprecated_2026_07_06",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
   premium_recipe_version: "manual_tg_recipes_v9_swing_short_crowded_basket_compact_2026_07_01",
-  candidate_stamp_version: "2026-06-30-discovery-v6-btc-funding-overlays",
+  candidate_stamp_version: "2026-07-06-external-aggregate-deprecated",
   random_baseline_version: "random_upstream_v2_2026_04_18",
 });
 
@@ -190,29 +191,38 @@ minRangePctByMode: {
   
   telegramMaxChars: 3900,
 
-  extContext: {
-    enabled: String(process.env.ALERT_EXT_CONTEXT_ENABLED || "0") === "1",
-    useRawFieldsLive: String(process.env.ALERT_EXT_CONTEXT_USE_RAW_FIELDS_LIVE || "1") === "1",
-    swingWeight: Number(process.env.ALERT_EXT_CONTEXT_SWING_WEIGHT || 1),
-    scalpWeight: Number(process.env.ALERT_EXT_CONTEXT_SCALP_WEIGHT || 0.5),
-    buildWeight: Number(process.env.ALERT_EXT_CONTEXT_BUILD_WEIGHT || 0.25),
-    timeoutMs: Number(process.env.ALERT_EXT_CONTEXT_TIMEOUT_MS || 4000),
-    coinUrl: String(process.env.ALERT_EXT_CONTEXT_COIN_URL || "https://stooq.com/q/l/?s=coin.us&i=d"),
-    vixUrl: String(process.env.ALERT_EXT_CONTEXT_VIX_URL || "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"),
-    dxyUrl: String(process.env.ALERT_EXT_CONTEXT_DXY_URL || ""),
-    qqqUrl: String(process.env.ALERT_EXT_CONTEXT_QQQ_URL || ""),
-    spxUrl: String(process.env.ALERT_EXT_CONTEXT_SPX_URL || ""),
-    us2yUrl: String(process.env.ALERT_EXT_CONTEXT_US2Y_URL || ""),
-    metricWeights: {
-      coin: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_COIN || 1.0),
-      vix: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_VIX || 1.0),
-      dxy: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_DXY || 0.7),
-      qqq: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_QQQ || 0.8),
-      spx: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_SPX || 0.6),
-      us2y: Number(process.env.ALERT_EXT_CONTEXT_METRIC_WEIGHT_US2Y || 0.6),
+  // External-market telemetry only. These fields are persisted for research but
+  // intentionally do not affect selector eligibility, confidence, or TG copy.
+  // Legacy ALERT_EXT_CONTEXT_* score/weight/source settings are intentionally ignored.
+  externalTelemetry: {
+    enabled: String(
+      process.env.ALERT_EXTERNAL_TELEMETRY_ENABLED ||
+      process.env.ALERT_EXT_CONTEXT_ENABLED ||
+      "1"
+    ) === "1",
+    timeoutMs: Number(process.env.ALERT_EXTERNAL_TELEMETRY_TIMEOUT_MS || 2500),
+    cacheTtlSeconds: Number(process.env.ALERT_EXTERNAL_TELEMETRY_CACHE_TTL_SECONDS || 300),
+    cacheKey: String(process.env.ALERT_EXTERNAL_TELEMETRY_CACHE_KEY || "alert:externalTelemetry:v1"),
+    yahooChartBaseUrl: String(
+      process.env.ALERT_EXTERNAL_TELEMETRY_YAHOO_CHART_BASE_URL ||
+      "https://query1.finance.yahoo.com/v8/finance/chart"
+    ).replace(/\/$/, ""),
+    yahooSymbols: {
+      coin: String(process.env.ALERT_EXTERNAL_TELEMETRY_COIN_SYMBOL || "COIN"),
+      dxy: String(process.env.ALERT_EXTERNAL_TELEMETRY_DXY_SYMBOL || "DX-Y.NYB"),
+      qqq: String(process.env.ALERT_EXTERNAL_TELEMETRY_QQQ_SYMBOL || "QQQ"),
+      spx: String(process.env.ALERT_EXTERNAL_TELEMETRY_SPX_SYMBOL || "^GSPC"),
     },
+    vixUrl: String(
+      process.env.ALERT_EXTERNAL_TELEMETRY_VIX_URL ||
+      "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+    ),
+    us2yUrlTemplate: String(
+      process.env.ALERT_EXTERNAL_TELEMETRY_US2Y_URL_TEMPLATE ||
+      "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}"
+    ),
   },
-  
+
   anomaly: {
   enabled: String(process.env.ALERT_ANOMALY_ENABLED || "1") === "1",
   tf: String(process.env.ALERT_ANOMALY_TF || "15m").toLowerCase(),
@@ -373,6 +383,7 @@ macro: {
     lastFiredAlert: (id, mode) => `alert:lastFiredAlert:${id}:${String(mode || "unknown")}`,
     lastPremiumAlert: (id, mode) => `alert:lastPremiumAlert:${id}:${String(mode || "unknown")}`,
     series5m: (id) => `series5m:${id}`,
+    externalTelemetry: () => CFG.externalTelemetry.cacheKey,
   },
 };
 
@@ -543,19 +554,32 @@ const fmtPct = (x, digits = 2) => {
   return `${n.toFixed(digits)}%`;
 };
 
-async function fetchTextWithTimeout(url, timeoutMs = 4000) {
+async function fetchWithTimeout(url, timeoutMs = 2500) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const r = await fetch(url, {
-      headers: { "Cache-Control": "no-store" },
+    const response = await fetch(url, {
+      headers: {
+        "Cache-Control": "no-store",
+        Accept: "application/json,text/csv,text/xml,application/xml,text/plain;q=0.9,*/*;q=0.8",
+      },
       signal: controller.signal,
     });
-    if (!r.ok) throw new Error(`http_${r.status}`);
-    return await r.text();
+    if (!response.ok) throw new Error(`http_${response.status}`);
+    return response;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchTextWithTimeout(url, timeoutMs = 2500) {
+  const response = await fetchWithTimeout(url, timeoutMs);
+  return response.text();
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs = 2500) {
+  const response = await fetchWithTimeout(url, timeoutMs);
+  return response.json();
 }
 
 function computePctChange(current, previous) {
@@ -563,63 +587,96 @@ function computePctChange(current, previous) {
   return ((current - previous) / previous) * 100;
 }
 
-function parseStooqDayPct(text) {
-  const lines = String(text || "").trim().split(/\r?\n/).filter(Boolean);
-  if (lines.length < 2) throw new Error("stooq_rows_missing");
+function parseYahooChartDayPct(payload) {
+  const result = payload?.chart?.result?.[0];
+  const quote = result?.indicators?.quote?.[0] || {};
+  const opens = Array.isArray(quote?.open) ? quote.open : [];
+  const closes = Array.isArray(quote?.close) ? quote.close : [];
 
-  const last = lines[lines.length - 1].split(",");
-  if (last.length < 6) throw new Error("stooq_cols_missing");
-
-  const openPx = Number(last[last.length - 5]);
-  const close = Number(last[last.length - 2]);
-
-  if (Number.isFinite(close) && Number.isFinite(openPx) && openPx !== 0) {
-    return computePctChange(close, openPx);
+  for (let i = Math.min(opens.length, closes.length) - 1; i >= 0; i -= 1) {
+    const openPx = Number(opens[i]);
+    const closePx = Number(closes[i]);
+    if (Number.isFinite(openPx) && openPx > 0 && Number.isFinite(closePx) && closePx > 0) {
+      return computePctChange(closePx, openPx);
+    }
   }
 
-  throw new Error("stooq_prices_missing");
+  const validCloses = closes.map(Number).filter((value) => Number.isFinite(value) && value > 0);
+  if (validCloses.length >= 2) {
+    return computePctChange(validCloses[validCloses.length - 1], validCloses[validCloses.length - 2]);
+  }
+
+  throw new Error("yahoo_chart_prices_missing");
 }
 
-function parseFredDailyPct(text) {
-  const lines = String(text || "").trim().split(/\r?\n/).filter(Boolean);
-  if (lines.length < 3) throw new Error("fred_rows_missing");
-
-  const vals = [];
-  for (const line of lines.slice(1)) {
-    const parts = line.split(",");
-    const raw = parts[1];
-    if (raw == null || raw === ".") continue;
-    const n = Number(raw);
-    if (Number.isFinite(n)) vals.push(n);
-  }
-
-  if (vals.length < 2) throw new Error("fred_values_missing");
-  return computePctChange(vals[vals.length - 1], vals[vals.length - 2]);
+function parseCsvRow(line) {
+  return String(line || "")
+    .split(",")
+    .map((cell) => cell.trim().replace(/^"|"$/g, ""));
 }
 
-function parseFredLatestDelta(text) {
-  const lines = String(text || "").trim().split(/\r?\n/).filter(Boolean);
-  if (lines.length < 3) throw new Error("fred_rows_missing");
+function parseCboeVixDayPct(text) {
+  const lines = String(text || "")
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 
-  const vals = [];
-  for (const line of lines.slice(1)) {
-    const parts = line.split(",");
-    const raw = parts[1];
-    if (raw == null || raw === ".") continue;
-    const n = Number(raw);
-    if (Number.isFinite(n)) vals.push(n);
+  const headerIndex = lines.findIndex((line) => /\bdate\b/i.test(line) && /\bopen\b/i.test(line) && /\bclose\b/i.test(line));
+  if (headerIndex < 0) throw new Error("cboe_vix_header_missing");
+
+  const header = parseCsvRow(lines[headerIndex]).map((name) => name.toUpperCase());
+  const dateIndex = header.indexOf("DATE");
+  const openIndex = header.indexOf("OPEN");
+  const closeIndex = header.indexOf("CLOSE");
+  if (dateIndex < 0 || openIndex < 0 || closeIndex < 0) throw new Error("cboe_vix_columns_missing");
+
+  const rows = lines
+    .slice(headerIndex + 1)
+    .map(parseCsvRow)
+    .map((cells) => ({
+      dateMs: Date.parse(String(cells[dateIndex] || "")),
+      open: Number(cells[openIndex]),
+      close: Number(cells[closeIndex]),
+    }))
+    .filter((row) => Number.isFinite(row.close) && row.close > 0);
+
+  if (!rows.length) throw new Error("cboe_vix_prices_missing");
+  const datedRows = rows.filter((row) => Number.isFinite(row.dateMs));
+  const orderedRows = datedRows.length ? datedRows.sort((a, b) => a.dateMs - b.dateMs) : rows;
+  const latest = orderedRows[orderedRows.length - 1];
+  if (Number.isFinite(latest.open) && latest.open > 0) {
+    return computePctChange(latest.close, latest.open);
   }
-
-  if (vals.length < 2) throw new Error("fred_values_missing");
-  return vals[vals.length - 1] - vals[vals.length - 2];
+  if (rows.length >= 2) {
+    return computePctChange(latest.close, rows[rows.length - 2].close);
+  }
+  throw new Error("cboe_vix_change_missing");
 }
 
-function computeDerivedExternalBias({ coinDayPct, vixDayPct }) {
-  if (Number.isFinite(coinDayPct) && Number.isFinite(vixDayPct)) {
-    if (coinDayPct > 0 && vixDayPct < 0) return "supportive";
-    if (coinDayPct < 0 && vixDayPct > 0) return "defensive";
-  }
-  return "neutral";
+function extractXmlTag(text, tagName) {
+  const escaped = String(tagName).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(text || "").match(
+    new RegExp(`<\\/?(?:[A-Za-z0-9_-]+:)?${escaped}\\b[^>]*>([^<]*)<\\/(?:[A-Za-z0-9_-]+:)?${escaped}>`, "i")
+  );
+  return match ? String(match[1] || "").trim() : null;
+}
+
+function parseTreasuryUs2yDelta(text) {
+  const entries = String(text || "").match(/<entry\b[\s\S]*?<\/entry>/gi) || [];
+  const rows = entries
+    .map((entry) => {
+      const dateRaw = extractXmlTag(entry, "NEW_DATE");
+      const valueRaw = extractXmlTag(entry, "BC_2YEAR");
+      const dateMs = Date.parse(String(dateRaw || ""));
+      const value = Number(valueRaw);
+      return { dateMs, value };
+    })
+    .filter((row) => Number.isFinite(row.dateMs) && Number.isFinite(row.value));
+
+  if (rows.length < 2) throw new Error("treasury_us2y_values_missing");
+  rows.sort((a, b) => a.dateMs - b.dateMs);
+  return rows[rows.length - 1].value - rows[rows.length - 2].value;
 }
 
 function metricFailureReason(label, res) {
@@ -632,7 +689,48 @@ function metricFailureReason(label, res) {
   return `${label}_non_finite`;
 }
 
-async function loadExternalContext() {
+function buildYahooChartUrl(symbol) {
+  const baseUrl = CFG.externalTelemetry.yahooChartBaseUrl;
+  const encodedSymbol = encodeURIComponent(String(symbol || ""));
+  return `${baseUrl}/${encodedSymbol}?range=5d&interval=1d&includePrePost=false&events=history`;
+}
+
+function buildTreasuryUs2yUrl() {
+  const template = String(CFG.externalTelemetry.us2yUrlTemplate || "");
+  return template.replaceAll("{year}", String(new Date().getUTCFullYear()));
+}
+
+function buildExternalTelemetrySummary(ctx = {}) {
+  const source = ctx?.source || {};
+  const labels = [
+    `coin:${source.coin || "missing"}`,
+    `vix:${source.vix || "missing"}`,
+    `dxy:${source.dxy || "missing"}`,
+    `qqq:${source.qqq || "missing"}`,
+    `spx:${source.spx || "missing"}`,
+    `us2y:${source.us2y || "missing"}`,
+  ];
+  return `telemetry_only|${labels.join(",")}`;
+}
+
+async function readExternalTelemetryCache() {
+  const raw = await redis.get(CFG.keys.externalTelemetry()).catch(() => null);
+  const cached = typeof raw === "string" ? safeJsonParse(raw) : raw;
+  if (!cached || typeof cached !== "object") return null;
+
+  const fetchedAt = Number(cached?.fetchedAt);
+  const ttlMs = Math.max(0, Number(CFG.externalTelemetry.cacheTtlSeconds || 0)) * 1000;
+  if (!Number.isFinite(fetchedAt) || !ttlMs || Date.now() - fetchedAt > ttlMs) return null;
+  return { ...cached, cache: "hit" };
+}
+
+async function writeExternalTelemetryCache(snapshot) {
+  await redis
+    .set(CFG.keys.externalTelemetry(), JSON.stringify(snapshot))
+    .catch(() => null);
+}
+
+async function loadExternalTelemetry() {
   const out = {
     ok: false,
     bias: "neutral",
@@ -643,265 +741,73 @@ async function loadExternalContext() {
     spxDayPct: null,
     us2yDelta: null,
     reason: null,
+    source: {
+      coin: "yahoo_chart",
+      vix: "cboe_csv",
+      dxy: "yahoo_chart",
+      qqq: "yahoo_chart",
+      spx: "yahoo_chart",
+      us2y: "treasury_xml",
+    },
+    fetchedAt: Date.now(),
+    cache: "miss",
   };
 
-  if (!CFG.extContext?.enabled) {
-    out.reason = "disabled";
+  if (!CFG.externalTelemetry?.enabled) {
+    out.reason = "telemetry_only|disabled";
     return out;
   }
 
+  const cached = await readExternalTelemetryCache();
+  if (cached) return cached;
+
+  const timeoutMs = CFG.externalTelemetry.timeoutMs;
+  const symbols = CFG.externalTelemetry.yahooSymbols || {};
   const tasks = [
-    ["coin", CFG.extContext.coinUrl, parseStooqDayPct],
-    ["vix", CFG.extContext.vixUrl, parseFredDailyPct],
-    ["dxy", CFG.extContext.dxyUrl, parseStooqDayPct],
-    ["qqq", CFG.extContext.qqqUrl, parseStooqDayPct],
-    ["spx", CFG.extContext.spxUrl, parseStooqDayPct],
-    ["us2y", CFG.extContext.us2yUrl, parseFredLatestDelta],
+    ["coin", () => fetchJsonWithTimeout(buildYahooChartUrl(symbols.coin), timeoutMs).then(parseYahooChartDayPct)],
+    ["vix", () => fetchTextWithTimeout(CFG.externalTelemetry.vixUrl, timeoutMs).then(parseCboeVixDayPct)],
+    ["dxy", () => fetchJsonWithTimeout(buildYahooChartUrl(symbols.dxy), timeoutMs).then(parseYahooChartDayPct)],
+    ["qqq", () => fetchJsonWithTimeout(buildYahooChartUrl(symbols.qqq), timeoutMs).then(parseYahooChartDayPct)],
+    ["spx", () => fetchJsonWithTimeout(buildYahooChartUrl(symbols.spx), timeoutMs).then(parseYahooChartDayPct)],
+    ["us2y", () => fetchTextWithTimeout(buildTreasuryUs2yUrl(), timeoutMs).then(parseTreasuryUs2yDelta)],
   ];
 
-  const settled = await Promise.allSettled(
-    tasks.map(([_, url, parser]) => {
-      if (!String(url || "").trim()) return Promise.resolve(null);
-      return fetchTextWithTimeout(url, CFG.extContext.timeoutMs).then(parser);
-    })
-  );
+  const settled = await Promise.allSettled(tasks.map(([_, run]) => run()));
+  const metricMap = Object.fromEntries(tasks.map(([label], index) => [label, settled[index]]));
 
-  const metricMap = Object.fromEntries(tasks.map(([label], idx) => [label, settled[idx]]));
-
-  const coinRes = metricMap.coin;
-  const vixRes = metricMap.vix;
-  const dxyRes = metricMap.dxy;
-  const qqqRes = metricMap.qqq;
-  const spxRes = metricMap.spx;
-  const us2yRes = metricMap.us2y;
-
-  if (coinRes?.status === "fulfilled" && Number.isFinite(coinRes.value)) out.coinDayPct = coinRes.value;
-  if (vixRes?.status === "fulfilled" && Number.isFinite(vixRes.value)) out.vixDayPct = vixRes.value;
-  if (dxyRes?.status === "fulfilled" && Number.isFinite(dxyRes.value)) out.dxyDayPct = dxyRes.value;
-  if (qqqRes?.status === "fulfilled" && Number.isFinite(qqqRes.value)) out.qqqDayPct = qqqRes.value;
-  if (spxRes?.status === "fulfilled" && Number.isFinite(spxRes.value)) out.spxDayPct = spxRes.value;
-  if (us2yRes?.status === "fulfilled" && Number.isFinite(us2yRes.value)) out.us2yDelta = us2yRes.value;
-
-  const reasons = [];
-  if (!Number.isFinite(out.coinDayPct)) reasons.push(metricFailureReason("coin", coinRes));
-  if (!Number.isFinite(out.vixDayPct)) reasons.push(metricFailureReason("vix", vixRes));
-  if (String(CFG.extContext.dxyUrl || "").trim() && !Number.isFinite(out.dxyDayPct)) reasons.push(metricFailureReason("dxy", dxyRes));
-  if (String(CFG.extContext.qqqUrl || "").trim() && !Number.isFinite(out.qqqDayPct)) reasons.push(metricFailureReason("qqq", qqqRes));
-  if (String(CFG.extContext.spxUrl || "").trim() && !Number.isFinite(out.spxDayPct)) reasons.push(metricFailureReason("spx", spxRes));
-  if (String(CFG.extContext.us2yUrl || "").trim() && !Number.isFinite(out.us2yDelta)) reasons.push(metricFailureReason("us2y", us2yRes));
-
-  out.bias = computeDerivedExternalBias(out);
-
-  if (Number.isFinite(out.coinDayPct) && Number.isFinite(out.vixDayPct)) {
-    out.ok = true;
-    out.reason = reasons.length ? `ok|${reasons.join("|")}` : "ok";
-    return out;
-  }
-
-  out.reason = reasons.join("|") || "missing";
-  return out;
-}
-function average(nums = []) {
-  const vals = (nums || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
-  if (!vals.length) return null;
-  return vals.reduce((a, b) => a + b, 0) / vals.length;
-}
-
-function classifyAnomalyPattern({ pricePct, oiPct }) {
-  if (!Number.isFinite(pricePct) || !Number.isFinite(oiPct)) return "unknown";
-  if (pricePct > 0 && oiPct > 0) return "long_build";
-  if (pricePct < 0 && oiPct < 0) return "long_liq";
-  if (pricePct > 0 && oiPct < 0) return "short_squeeze";
-  if (pricePct < 0 && oiPct > 0) return "short_build";
-  return "mixed";
-}
-
-function buildCrossAssetAnomaly({
-  items = [],
-  tf = CFG.anomaly?.tf || "15m",
-  preferredBasket = CFG.anomaly?.basketSymbols || ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NEARUSDT", "SUIUSDT"],
-  minBasketSize = CFG.anomaly?.minBasketSize || 3,
-  fallbackBasketSize = CFG.anomaly?.fallbackBasketSize || 5,
-}) {
-  if (!CFG.anomaly?.enabled) {
-    return {
-      ok: false,
-      reason: "disabled",
-      tf,
-      basket_symbols: [],
-      ranking: [],
-    };
-  }
-
-  const rows = (items || [])
-    .filter((it) => it?.ok && it?.symbol)
-    .map((it) => {
-      const pricePct = asNum(it?.deltas?.[tf]?.price_change_pct);
-      const oiPct = asNum(it?.deltas?.[tf]?.oi_change_pct);
-      const fundingRate = asNum(it?.funding_rate);
-
-      if (!Number.isFinite(pricePct) || !Number.isFinite(oiPct) || !Number.isFinite(fundingRate)) {
-        return null;
-      }
-
-      return {
-        symbol: String(it.symbol).toUpperCase(),
-        pricePct,
-        oiPct,
-        fundingRate,
-      };
-    })
-    .filter(Boolean);
-
-  const preferredSet = new Set(
-    (preferredBasket || []).map((s) => String(s || "").toUpperCase()).filter(Boolean)
-  );
-
-  let basketRows = rows.filter((r) => preferredSet.has(r.symbol));
-
-  if (basketRows.length < minBasketSize) {
-    basketRows = rows
-      .slice()
-      .sort((a, b) => {
-        const aPri = preferredSet.has(a.symbol) ? 0 : 1;
-        const bPri = preferredSet.has(b.symbol) ? 0 : 1;
-        if (aPri !== bPri) return aPri - bPri;
-        return a.symbol.localeCompare(b.symbol);
-      })
-      .slice(0, Math.min(fallbackBasketSize, rows.length));
-  }
-
-  if (basketRows.length < minBasketSize) {
-    return {
-      ok: false,
-      reason: "basket_too_small",
-      tf,
-      basket_symbols: basketRows.map((r) => r.symbol),
-      ranking: [],
-    };
-  }
-
-  const basketPricePct = average(basketRows.map((r) => r.pricePct));
-  const basketOiPct = average(basketRows.map((r) => r.oiPct));
-  const basketFundingRate = average(basketRows.map((r) => r.fundingRate));
-
-  if (
-    !Number.isFinite(basketPricePct) ||
-    !Number.isFinite(basketOiPct) ||
-    !Number.isFinite(basketFundingRate)
-  ) {
-    return {
-      ok: false,
-      reason: "basket_invalid",
-      tf,
-      basket_symbols: basketRows.map((r) => r.symbol),
-      ranking: [],
-    };
-  }
-
-  const ranking = rows
-    .map((r) => {
-      const priceOiGap = Math.abs(r.oiPct - r.pricePct);
-      const fundingDeviationBps = Math.abs((r.fundingRate - basketFundingRate) * 10000);
-      const oiTrendDeviation = Math.abs(r.oiPct - basketOiPct);
-      const priceDeviation = Math.abs(r.pricePct - basketPricePct);
-
-      const score = Number(
-        (priceOiGap + fundingDeviationBps + oiTrendDeviation + priceDeviation).toFixed(2)
-      );
-
-      return {
-        symbol: r.symbol,
-        score,
-        pattern: classifyAnomalyPattern({ pricePct: r.pricePct, oiPct: r.oiPct }),
-        price_pct: Number(r.pricePct.toFixed(4)),
-        oi_pct: Number(r.oiPct.toFixed(4)),
-        funding_rate: r.fundingRate,
-        basket_price_pct: Number(basketPricePct.toFixed(4)),
-        basket_oi_pct: Number(basketOiPct.toFixed(4)),
-        basket_funding_rate: basketFundingRate,
-        components: {
-          price_oi_gap: Number(priceOiGap.toFixed(2)),
-          funding_deviation_bps: Number(fundingDeviationBps.toFixed(2)),
-          oi_trend_deviation: Number(oiTrendDeviation.toFixed(2)),
-          price_deviation: Number(priceDeviation.toFixed(2)),
-        },
-      };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  return {
-    ok: true,
-    tf,
-    basket_symbols: basketRows.map((r) => r.symbol),
-    basket: {
-      price_pct: Number(basketPricePct.toFixed(4)),
-      oi_pct: Number(basketOiPct.toFixed(4)),
-      funding_rate: basketFundingRate,
-    },
-    ranking,
+  const assign = (label, outputKey) => {
+    const result = metricMap[label];
+    if (result?.status === "fulfilled" && Number.isFinite(result.value)) out[outputKey] = result.value;
   };
-}
-function getExternalWeightForMode(mode) {
-  const m = String(mode || "").toLowerCase();
-  return (
-    m === "swing" ? CFG.extContext.swingWeight :
-    m === "scalp" ? CFG.extContext.scalpWeight :
-    m === "build" ? CFG.extContext.buildWeight :
-    0
-  );
-}
+  assign("coin", "coinDayPct");
+  assign("vix", "vixDayPct");
+  assign("dxy", "dxyDayPct");
+  assign("qqq", "qqqDayPct");
+  assign("spx", "spxDayPct");
+  assign("us2y", "us2yDelta");
 
-function metricAlignmentFromValue(value, side, polarity = "risk_on") {
-  if (!Number.isFinite(value)) return null;
-  if (value === 0) return 0;
+  const required = ["coinDayPct", "vixDayPct", "dxyDayPct", "qqqDayPct", "spxDayPct", "us2yDelta"];
+  const failures = tasks
+    .filter(([label], index) => {
+      const outputKey = {
+        coin: "coinDayPct",
+        vix: "vixDayPct",
+        dxy: "dxyDayPct",
+        qqq: "qqqDayPct",
+        spx: "spxDayPct",
+        us2y: "us2yDelta",
+      }[label];
+      return !Number.isFinite(out[outputKey]);
+    })
+    .map(([label]) => metricFailureReason(label, metricMap[label]));
 
-  const sign = value > 0 ? 1 : -1;
-  const longAligned = polarity === "risk_on" ? sign : -sign;
-  return String(side || "").toLowerCase() === "long" ? longAligned : -longAligned;
-}
+  out.ok = required.every((key) => Number.isFinite(out[key]));
+  out.reason = out.ok
+    ? "telemetry_only|ok"
+    : `telemetry_only|partial|${failures.join("|") || "missing"}`;
 
-function getExternalContextComponents({ side, ctx = {} }) {
-  const weights = CFG.extContext.metricWeights || {};
-  const out = [];
-
-  const pushMetric = (key, value, weight, polarity) => {
-    const align = metricAlignmentFromValue(value, side, polarity);
-    if (align == null || !Number.isFinite(weight) || weight <= 0) return;
-    out.push({ key, value, weight, align });
-  };
-
-  pushMetric("coin", asNum(ctx?.coinDayPct), weights.coin, "risk_on");
-  pushMetric("vix", asNum(ctx?.vixDayPct), weights.vix, "risk_off");
-  pushMetric("dxy", asNum(ctx?.dxyDayPct), weights.dxy, "risk_off");
-  pushMetric("qqq", asNum(ctx?.qqqDayPct), weights.qqq, "risk_on");
-  pushMetric("spx", asNum(ctx?.spxDayPct), weights.spx, "risk_on");
-  pushMetric("us2y", asNum(ctx?.us2yDelta), weights.us2y, "risk_off");
-
+  await writeExternalTelemetryCache(out);
   return out;
-}
-
-function getExternalContextAdj({ mode, side, ctx = {} }) {
-  if (!CFG.extContext?.enabled || !CFG.extContext?.useRawFieldsLive) return 0;
-  if (!ctx?.ok) return 0;
-
-  const modeWeight = getExternalWeightForMode(mode);
-  if (!Number.isFinite(modeWeight) || modeWeight <= 0) return 0;
-
-  const components = getExternalContextComponents({ side, ctx });
-  if (!components.length) return 0;
-
-  const totalWeight = components.reduce((sum, item) => sum + item.weight, 0);
-  if (!(totalWeight > 0)) return 0;
-
-  const weighted = components.reduce((sum, item) => sum + item.align * item.weight, 0) / totalWeight;
-  return Number((Math.max(-1, Math.min(1, weighted)) * modeWeight).toFixed(2));
-}
-
-function getExternalContextComponentSummary({ side, ctx = {} }) {
-  return getExternalContextComponents({ side, ctx })
-    .map((item) => `${item.key}:${item.align > 0 ? "+" : item.align < 0 ? "-" : "0"}`)
-    .join(",");
 }
 
 function computeRiskReward({ entryPrice, stopLossPx, tp }) {
@@ -1908,7 +1814,7 @@ function computeLeverageFromStop({ mode, entryPrice, stopLossPx, item, dynamicRi
  * Architecture:
  * - selectors decide whether an archetype is allowed to fire
  * - modifiers shape score only after a selector is valid
- * - raw external fields are live; derived external bias is explainability-only
+ * - external-market fields are telemetry-only; they do not shape selectors, confidence, or TG copy
  */
 function getTradeProfile(t) {
   const mode = String(t?.mode || "").toLowerCase();
@@ -1963,7 +1869,6 @@ function getTradeProfile(t) {
     Number.isFinite(bottomingScore) &&
     bottomingScore >= CFG.bottoming.scoreMin;
 
-  const externalRawScore = Number(t?.ctx?.externalContextAdj || 0) || 0;
   const btcTapeState = String(t?.ctx?.btcTapeState || "neutral").toLowerCase();
   const btcPrice5mPct = asNum(t?.ctx?.btc5mPrice5mPct);
   const btcPrice15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
@@ -1994,7 +1899,6 @@ function getTradeProfile(t) {
     wickStrong,
     wickExtreme,
     strongBottoming,
-    externalRawScore,
     btcTapeState,
     btcPrice5mPct,
     btcPrice15mPct,
@@ -2040,7 +1944,9 @@ function evaluateSelectorPolicy(t) {
   }
 
   if (profile.mode === "swing" && profile.bias === "long" && profile.flowPersists && !profile.reversalConfirmed) {
-    if (!(profile.externalRawScore > 0)) reasons.push("flow_persists_long_needs_supportive_external");
+    // This family remains analytics-only while it is revalidated. Do not let the
+    // retired external aggregate accidentally become a path back to TG eligibility.
+    reasons.push("swing_long_flow_persists_demoted");
     if (profile.btcTapeState === "long_hostile") reasons.push("flow_persists_long_btc_hostile");
   }
 
@@ -2130,12 +2036,13 @@ function computeConfidence(t) {
   const selectorPolicy = evaluateSelectorPolicy(t);
   const baseConfidence = computeConfidenceBase(t);
   const baseScore = confidenceScoreFromLabel(baseConfidence);
-  const extAdjRaw = Number(t?.ctx?.externalContextAdj || 0);
-  const extAdj = Number.isFinite(extAdjRaw) ? extAdjRaw : 0;
+  // Legacy external aggregate intentionally retired. Keep the published field at
+  // zero for schema compatibility, while raw metrics remain in telemetry columns.
+  const extAdj = 0;
   const anomalyPatternAdj = getAnomalyPatternAdj(profile);
   const btcShortTfSignal = getBtcShortTfSignal(profile);
 
-  let adjustedScore = Number((baseScore + extAdj + anomalyPatternAdj + btcShortTfSignal.confidenceAdj).toFixed(2));
+  let adjustedScore = Number((baseScore + anomalyPatternAdj + btcShortTfSignal.confidenceAdj).toFixed(2));
 
   if (profile.mode === "swing" && profile.bias === "long" && profile.liquiditySnap) {
     adjustedScore += 0.5;
@@ -2149,11 +2056,6 @@ function computeConfidence(t) {
 
   if (profile.mode === "swing" && profile.bias === "short" && profile.flowPersists && profile.oiAligned && profile.oneHourAligned) {
     adjustedScore += 0.25;
-  }
-
-  if (profile.mode === "swing" && profile.bias === "long" && profile.flowPersists && !profile.reversalConfirmed) {
-    if (profile.externalRawScore > 0) adjustedScore += 0.25;
-    else adjustedScore -= 0.35;
   }
 
   if (profile.pureBreakoutOnly) adjustedScore -= 0.5;
@@ -2197,7 +2099,7 @@ function computeConfidence(t) {
     btcShortTfSignal,
     finalScore,
     finalConfidence,
-    externalBias: String(t?.ctx?.externalBias || "neutral").toLowerCase(),
+    externalBias: "neutral",
     selectorFamily: selectorPolicy.family,
     selectorAllowed: selectorPolicy.allowed,
     selectorReason: selectorPolicy.reason,
@@ -2241,11 +2143,6 @@ function buildModelDecisionReason(t, confidenceMeta) {
 
   const parts = [];
   parts.push(describeSelectorFamily(confidenceMeta?.selectorFamily, profile));
-
-  const extAdj = Number(confidenceMeta?.extAdj || 0);
-  const externalBias = String(confidenceMeta?.externalBias || "neutral").toLowerCase();
-  if (extAdj > 0.15) parts.push(`${externalBias} external`);
-  else if (extAdj < -0.15) parts.push(`${externalBias} external cap`);
 
   const anomalyAdj = Number(confidenceMeta?.anomalyPatternAdj || 0);
   if (anomalyAdj > 0.1) parts.push("anomaly support");
@@ -2360,14 +2257,6 @@ function computeTradeRead({ t, confidenceMeta, rrInfo }) {
       cautions.push("generic continuation");
     }
 
-    if (profile.externalRawScore > 0.15) {
-      score += 1.5;
-      positives.push("supportive external");
-    } else if (profile.externalRawScore < -0.15) {
-      score -= 1.5;
-      cautions.push("external drag");
-    }
-
     if (profile.oneHourAligned) {
       score += 1;
       positives.push("1h aligned");
@@ -2397,13 +2286,6 @@ function computeTradeRead({ t, confidenceMeta, rrInfo }) {
       cautions.push("counter 1h lean");
     }
 
-    if (profile.externalRawScore > 0.15) {
-      score += 1;
-      positives.push("external supports side");
-    } else if (profile.externalRawScore < -0.15) {
-      score -= 1;
-      cautions.push("external fights side");
-    }
   }
 
   if (btcShortTf.state === "strong_support") {
@@ -2466,12 +2348,6 @@ function buildManagementHint(t, recipeStamp) {
     return "Fast TP; exit if downside stalls.";
   }
 
-  if (recipeReason.includes("supportive_external_long")) {
-    return mode === "scalp"
-      ? "Fast long; trail only with immediate follow-through."
-      : "Standard hold; trail if momentum expands.";
-  }
-
   if (mode === "swing" && execReason === "swing_ignition_breakout_long") {
     return "Take partials into strength; runner only with follow-through.";
   }
@@ -2503,12 +2379,6 @@ function compactTradeWatch(tradeRead) {
   return "";
 }
 
-function isFinitePctAtOrBelow(value, maxValue) {
-  if (value === null || value === undefined || String(value).trim() === "") return false;
-  const n = Number(value);
-  return Number.isFinite(n) && n <= maxValue;
-}
-
 function isTruthyBoolean(value) {
   return value === true || String(value).toLowerCase() === "true" || String(value) === "1";
 }
@@ -2521,9 +2391,6 @@ function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
   const mode = String(t?.mode || "").toLowerCase();
   const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
-  const extAdj = Number(confidenceMeta?.extAdj || 0);
-  const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
-  const anomalyBasketOiPct = asNum(t?.ctx?.anomalyBasketOiPct);
   const anomalyBasketFundingRate = asNum(t?.ctx?.anomalyBasketFundingRate);
   const entryPrice = asNum(t?.price);
   const contHi = asNum(entryAtoms?.entry_atom_cont_hi);
@@ -2536,71 +2403,12 @@ function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
     entryPrice > 0
       ? ((contHi - contLo) / entryPrice) * 100
       : null;
-  const anomalyScore = asNum(t?.ctx?.anomalyScore);
-  const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
-  const coinDayPct = asNum(t?.ctx?.coinDayPct);
-  const vixDayPct = asNum(t?.ctx?.vixDayPct);
-  const qqqDayPct = asNum(t?.ctx?.qqqDayPct);
-  const spxDayPct = asNum(t?.ctx?.spxDayPct);
-  const btc15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
-  const cryptoBreadth15mPct = asNum(t?.ctx?.cryptoBreadth15mPct);
-  const btcShortTfState = String(confidenceMeta?.btcShortTfSignal?.state || "neutral").toLowerCase();
-  const etNow = getEtSessionTelemetry(Date.now());
-  const isUsEquityRth = isTruthyBoolean(t?.ctx?.isUsEquityRth) || etNow.is_us_equity_rth === true;
 
-  // Manual TG stance: Scalp/Swing only. Build is human-managed research and does not stamp TG trade recipes.
+  // Manual TG stance: Scalp/Swing only. Build is research-only.
   if (mode === "build") {
     return { label: "", emoji: "", reason: "build_manual_research_only", profile: "" };
   }
 
-  // Use the side-aware signed external adjustment for manual confirmation.
-  // Positive extAdj supports the trade side; negative extAdj fights the trade side.
-  const sideAwareExternalNonNeutral = Math.abs(extAdj) > 0.15;
-  const strongSwingLongExternal = mode === "swing" && bias === "long" && extAdj >= 1.25;
-  const strongScalpLongExternal = mode === "scalp" && bias === "long" && extAdj >= 0.5;
-  const scalpShortAnomalyPressure =
-    mode === "scalp" &&
-    bias === "short" &&
-    Number.isFinite(anomalyScore) &&
-    anomalyScore >= 1.2 &&
-    (!Number.isFinite(coinDayPct) || coinDayPct <= 1.0) &&
-    btcShortTfState !== "hostile" &&
-    btcShortTfState !== "minor_hostile";
-  const macroEquitiesNotOverheated =
-    isFinitePctAtOrBelow(qqqDayPct, 0.75) &&
-    isFinitePctAtOrBelow(spxDayPct, 0.75);
-  const vixRthStressGuard =
-    isUsEquityRth && Number.isFinite(vixDayPct) && vixDayPct > 5;
-  const swingLongMildExternalAnomalyBtc15 =
-    mode === "swing" &&
-    bias === "long" &&
-    extAdj > 0.15 &&
-    extAdj <= 0.50 &&
-    Number.isFinite(anomalyOiPct) &&
-    anomalyOiPct > 0 &&
-    macroEquitiesNotOverheated &&
-    Number.isFinite(btc15mPct) &&
-    btc15mPct > 0 &&
-    !vixRthStressGuard;
-  const swingIgnitionLongBuildBtc15External =
-    mode === "swing" &&
-    bias === "long" &&
-    execReason === "swing_ignition_breakout_long" &&
-    anomalyPattern === "long_build" &&
-    macroEquitiesNotOverheated &&
-    Number.isFinite(btc15mPct) &&
-    btc15mPct > 0 &&
-    extAdj > 0.15 &&
-    !vixRthStressGuard;
-  const swingLongBtcBreadthWashoutBasketOi =
-    mode === "swing" &&
-    bias === "long" &&
-    Number.isFinite(btc15mPct) &&
-    btc15mPct <= -0.25 &&
-    Number.isFinite(cryptoBreadth15mPct) &&
-    cryptoBreadth15mPct <= 0 &&
-    Number.isFinite(anomalyBasketOiPct) &&
-    anomalyBasketOiPct >= 0.15;
   const swingShortCrowdedBasketCompactContinuation =
     t?.analyticsOnly !== true &&
     mode === "swing" &&
@@ -2611,9 +2419,8 @@ function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
     Number.isFinite(contRangePct) &&
     contRangePct <= 0.8;
 
-  // Demoted from TG/Premium on 2026-06-14.
-  // Strong external alone was not enough; Scalp Short anomaly pressure decayed in fired rows.
-
+  // V9 retains one bounded Swing Short Premium route. External-market telemetry
+  // remains available in analytics but is never a recipe input.
   if (swingShortCrowdedBasketCompactContinuation) {
     return premiumStamp(
       "PREMIUM",
@@ -2621,15 +2428,6 @@ function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
       "Swing Short: elevated basket funding + compact continuation"
     );
   }
-
-  // V9 reactivates only the bounded Swing Short route above.
-  // Former pilots remain exclusively as analytics candidate stamps below.
-  void strongScalpLongExternal;
-  void scalpShortAnomalyPressure;
-  void swingLongMildExternalAnomalyBtc15;
-  void swingIgnitionLongBuildBtc15External;
-  void strongSwingLongExternal;
-  void swingLongBtcBreadthWashoutBasketOi;
 
   return { label: "", emoji: "", reason: "no_validated_manual_recipe", profile: "" };
 }
@@ -2640,7 +2438,7 @@ const BLOCKED_PROMOTION_CANDIDATE_STAMPS = new Set([
   "suppressed_swing_long_ignition_breakout_long",
   "suppressed_swing_long_btc_oi_compression_long",
   "candidate_swing_short_flow_persists_long_liq",
-  "candidate_swing_short_anom_oi_negative_btc15_negative_ext_not_hostile",
+  "candidate_swing_short_anom_oi_negative_btc15_negative",
   "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
 ]);
 
@@ -2662,8 +2460,6 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   // Candidate stamps are analytics-only. They must not grant TG/Premium eligibility.
   if (mode === "build") return stamps;
 
-  const extAdj = Number(confidenceMeta?.extAdj || 0);
-  const externalBias = String(t?.ctx?.externalBias || "neutral").toLowerCase();
   const anomalyOiPct = asNum(t?.ctx?.anomalyOiPct);
   const anomalyPricePct = asNum(t?.ctx?.anomalyPricePct);
   const anomalyBasketOiPct = asNum(t?.ctx?.anomalyBasketOiPct);
@@ -2694,27 +2490,6 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   const marketStructureOk = isTruthyBoolean(t?.ctx?.marketStructureOk);
   const inLowBand = isTruthyBoolean(entryAtoms?.entry_atom_in_low_band);
   const inHighBand = isTruthyBoolean(entryAtoms?.entry_atom_in_high_band);
-
-  const suppressedSwingLongMildExternalAnomalyBtc15 =
-    mode === "swing" &&
-    bias === "long" &&
-    extAdj > 0.15 &&
-    extAdj <= 0.50 &&
-    Number.isFinite(anomalyOiPct) &&
-    anomalyOiPct > 0 &&
-    isFinitePctAtOrBelow(t?.ctx?.qqqDayPct, 0.75) &&
-    isFinitePctAtOrBelow(spxDayPct, 0.75) &&
-    Number.isFinite(btc15mPct) &&
-    btc15mPct > 0;
-
-  if (suppressedSwingLongMildExternalAnomalyBtc15) {
-    addCandidateStamp(
-      stamps,
-      "suppressed_swing_long_mild_external_positive_anomaly_oi_macro_ok_btc15_positive",
-      "suppressed prior Premium; swing long; mild supportive external; anomaly OI positive; equities not overheated; BTC15 positive",
-      "Suppressed: Swing Long mild external + anomaly OI + BTC15"
-    );
-  }
 
   if (
     mode === "swing" &&
@@ -2908,21 +2683,6 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
     );
   }
 
-  if (
-    mode === "scalp" &&
-    bias === "long" &&
-    externalBias === "supportive" &&
-    Number.isFinite(asNum(t?.ctx?.oi15)) &&
-    asNum(t?.ctx?.oi15) >= 0.14
-  ) {
-    addCandidateStamp(
-      stamps,
-      "candidate_scalp_long_supportive_external_oi15_positive",
-      "scalp long; supportive external bias; OI 15m >= 0.14%",
-      "Scalp Long: supportive external + OI15 positive"
-    );
-  }
-
   const scalpShortAnomalyClean =
     mode === "scalp" &&
     bias === "short" &&
@@ -3096,13 +2856,12 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
     Number.isFinite(anomalyOiPct) &&
     anomalyOiPct < 0 &&
     Number.isFinite(btc15mPct) &&
-    btc15mPct < 0 &&
-    extAdj >= -0.15
+    btc15mPct < 0
   ) {
     addCandidateStamp(
       stamps,
-      "candidate_swing_short_anom_oi_negative_btc15_negative_ext_not_hostile",
-      "swing short; anomaly OI negative; BTC15 negative; external not hostile",
+      "candidate_swing_short_anom_oi_negative_btc15_negative",
+      "swing short; anomaly OI negative; BTC15 negative",
       "Swing Short: OI unwind + BTC15 down"
     );
   }
@@ -4324,12 +4083,16 @@ module.exports = async function handler(req, res) {
     const now = Date.now();
 const deployInfo = getDeployInfo();
 const cooldownMs = CFG.cooldownMinutes * 60000;
-const externalContext = await loadExternalContext();
+const externalTelemetryPromise = loadExternalTelemetry();
 const btcTapeInstId =
   (j.results || []).find(
     (it) => String(it?.symbol || "").toUpperCase() === String(CFG.macro.btcSymbol || "BTCUSDT").toUpperCase()
   )?.instId || btcInstIdFromSymbol(CFG.macro.btcSymbol);
-const btcTapeContext = await loadBtcTapeContext(btcTapeInstId);
+const btcTapePromise = loadBtcTapeContext(btcTapeInstId);
+const [externalTelemetry, btcTapeContext] = await Promise.all([
+  externalTelemetryPromise,
+  btcTapePromise,
+]);
 const anomalyRanking = buildCrossAssetAnomaly({
   items: j.results || [],
 });
@@ -4403,11 +4166,8 @@ async function evaluateCandidate({
     bottoming = null,
     rejectionReason = "",
   }) {
-    const externalContextAdj = getExternalContextAdj({
-      mode,
-      side: bias,
-      ctx: externalContext,
-    });
+    // Legacy aggregate is retired. Raw external-market values below are capture-only.
+    const externalContextAdj = 0;
 
         const anomalyCtx = getAnomalyEventFields(symbol);
 
@@ -4450,17 +4210,17 @@ async function evaluateCandidate({
         wickMeta: wickMeta || null,
         dps: dps || null,
         bottoming: bottoming || null,
-        externalBias: String(externalContext?.bias || "neutral").toLowerCase(),
+        externalBias: "neutral",
         externalContextAdj,
-        externalContextOk: !!externalContext?.ok,
-        externalContextReason: String(externalContext?.reason || ""),
-        externalContextComponentSummary: getExternalContextComponentSummary({ side: bias, ctx: externalContext }),
-        coinDayPct: externalContext?.coinDayPct ?? null,
-        vixDayPct: externalContext?.vixDayPct ?? null,
-        dxyDayPct: externalContext?.dxyDayPct ?? null,
-        qqqDayPct: externalContext?.qqqDayPct ?? null,
-        spxDayPct: externalContext?.spxDayPct ?? null,
-        us2yDelta: externalContext?.us2yDelta ?? null,
+        externalContextOk: !!externalTelemetry?.ok,
+        externalContextReason: String(externalTelemetry?.reason || "telemetry_only|missing"),
+        externalContextComponentSummary: buildExternalTelemetrySummary(externalTelemetry),
+        coinDayPct: externalTelemetry?.coinDayPct ?? null,
+        vixDayPct: externalTelemetry?.vixDayPct ?? null,
+        dxyDayPct: externalTelemetry?.dxyDayPct ?? null,
+        qqqDayPct: externalTelemetry?.qqqDayPct ?? null,
+        spxDayPct: externalTelemetry?.spxDayPct ?? null,
+        us2yDelta: externalTelemetry?.us2yDelta ?? null,
         btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
         btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
         btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
@@ -5688,7 +5448,7 @@ if (!force && renderedTradeCount === 0) {
           deploy: getDeployInfo(),
           multiUrl,
           macro: macroByMode,
-          externalContext,
+          externalTelemetry,
           anomalyRanking,
           skipped,
           triggered,
@@ -5823,7 +5583,7 @@ const summary = debug
             deploy: getDeployInfo(),
             multiUrl,
             macro: macroByMode,
-            externalContext,
+            externalTelemetry,
             anomalyRanking,
                       skipped,
           triggered,
