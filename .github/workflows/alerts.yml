@@ -1,10 +1,7 @@
 name: Crypto Market Gateway Alerts
 
 on:
-  schedule:
-    # Runs every 5 minutes (UTC)
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+ workflow_dispatch:
 
 jobs:
   ping-alert:
