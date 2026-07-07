@@ -17,6 +17,7 @@
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
 // - ANALYTICS POSTING: log non-2xx webhook responses instead of silently marking a failed post as successful
 // - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y telemetry is capture-only
+// - TWO-COHORT ANALYTICS: Random is sampled before any candidate/selector gate; Fired is persisted only for Premium alerts successfully sent to Telegram. Candidate/Premium metadata remain fields, never cohorts.
 //
 // Notes:
 // - Behavior: same per-mode rules; we just evaluate multiple modes in order and choose first that triggers.
@@ -44,7 +45,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   entry_idea_version: "entry_ideas_v1_2026_04_20",
   premium_recipe_version: "manual_tg_recipes_v9_swing_short_crowded_basket_compact_2026_07_01",
   candidate_stamp_version: "2026-07-06-external-aggregate-deprecated",
-  random_baseline_version: "random_upstream_v2_2026_04_18",
+  random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
 
 function getAnalyticsVersionTags() {
@@ -4288,6 +4289,7 @@ async function evaluateCandidate({
   randomGroupId = "",
   randomSource = "",
   analyticsOnly = false,
+  rawObservation = false,
 }) {
   const instId = String(item?.instId || "");
   const symbol = String(item?.symbol || "?");
@@ -4401,6 +4403,50 @@ async function evaluateCandidate({
   const defaultMode = String(modeList?.[0] || "scalp").toLowerCase();
   const defaultBaseBias = biasFromItem(item, defaultMode);
   const defaultBias = forcedBias || defaultBaseBias;
+
+  // Random is intentionally sampled before every live candidate, selector, and
+  // manual-trade gate. We may calculate the same pre-entry features for analysis,
+  // but no gate can reject or redefine the sampled observation.
+  if (rawObservation) {
+    const { triggers, curState } = evaluateCriteria(item, null, defaultMode);
+    const b1 = strongRecoB1({ bias: defaultBias, levels, price: item.price });
+    const candidate = buildCandidate({
+      mode: defaultMode,
+      bias: defaultBias,
+      baseBias: defaultBaseBias,
+      triggers,
+      b1,
+      curState,
+    });
+
+    const macroMode = computeBtcMacro(j.results || [], defaultMode);
+    const selectorPolicy = evaluateSelectorPolicy(candidate);
+    candidate.ctx = {
+      ...(candidate.ctx || {}),
+      btcMacro: {
+        ok: !!macroMode?.ok,
+        reason: String(macroMode?.reason || ""),
+        tf: String(macroMode?.tf || ""),
+        lean: String(macroMode?.btc?.lean || ""),
+        pricePct: macroMode?.btc?.pricePct ?? null,
+        oiPct: macroMode?.btc?.oiPct ?? null,
+        bullExpansion: !!macroMode?.btcBullExpansion,
+      },
+      selectorFamily: selectorPolicy.family,
+      selectorAllowed: selectorPolicy.allowed,
+      selectorRejectionReason: selectorPolicy.reason,
+    };
+
+    return {
+      winner: candidate,
+      winners: [candidate],
+      candidate,
+      rejectionReason: "",
+      rejectionMode: "",
+      rejectionBias: "",
+      rejectionDetail: null,
+    };
+  }
 
   if (!force && levels?.["1h"]?.warmup) {
     if (debug) skipped.push({ symbol, reason: "warmup_gate_1h" });
@@ -4720,9 +4766,16 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
   const roll = Math.floor(Math.random() * 100) + 1;
 
   if (roll <= CFG.randomBaselinePct) {
-    const eligible = j.results.filter((x) => x?.ok && x?.price);
+    // Full /alert input universe: a valid multi row × active mode × side.
+    // Do not call candidate, selector, execution, target, RR, cooldown, or
+    // recipe logic before admitting this sample to the Random cohort.
+    const eligible = j.results.filter((x) =>
+      x?.ok &&
+      Number.isFinite(asNum(x?.price)) &&
+      String(x?.instId || "").trim()
+    );
 
-    if (eligible.length > 0) {
+    if (eligible.length > 0 && modes.length > 0) {
       const pick = eligible[Math.floor(Math.random() * eligible.length)];
       const side = Math.random() < 0.5 ? "long" : "short";
       const modePick = modes[Math.floor(Math.random() * modes.length)];
@@ -4733,8 +4786,9 @@ if (CFG.randomBaselineEnabled && Array.isArray(j.results) && j.results.length > 
         forcedBias: side,
         observationType: "random",
         randomGroupId,
-        randomSource: "upstream_pre_fired_loop",
+        randomSource: "pre_gate_full_multi_universe_v1",
         analyticsOnly: true,
+        rawObservation: true,
       });
     }
   }
@@ -4807,11 +4861,12 @@ for (const t of triggered) {
   const isPremium = recipeStamp.label === "PREMIUM";
   const isSendableManualTrade = isSendableTradeStamp(recipeStamp);
 
-  if (!isRandom && !force && !isSendableManualTrade && hasAnalyticsCandidateStamp) {
-    observationType = "candidate";
-  }
-
-  if (!isRandom && !force && !isSendableManualTrade && !hasAnalyticsCandidateStamp) {
+  // Exactly two persisted analytics cohorts:
+  // - Random: one pre-gate baseline observation per eligible run.
+  // - Fired: only a Premium alert that is rendered and successfully delivered to Telegram.
+  // Analytics-only candidate stamps remain metadata on Random rows. Non-Premium
+  // candidates are deliberately not appended as a third cohort or relabeled Fired.
+  if (!isRandom && !isSendableManualTrade) {
     if (debug) skipped.push({
       symbol: t.symbol,
       mode,
@@ -4869,7 +4924,7 @@ if (!force) {
   const effectiveLev = Number(lev?.suggestedHigh || 0);
 
  if (effectiveLev < minLev) {
-    skipped.push({
+    if (!isRandom) skipped.push({
       symbol: t.symbol,
       mode,
       reason: hasAnalyticsCandidateStamp ? "candidate_leverage_floor_advisory" : "leverage_floor",
@@ -4886,10 +4941,7 @@ if (!force) {
     if (!hasAnalyticsCandidateStamp) {
       lateRejectionReasons.push("leverage_floor");
       if (!isRejected) {
-        if (isRandom) {
-          rejectionReason = "leverage_floor";
-          isRejected = true;
-        } else {
+        if (!isRandom) {
           continue;
         }
       }
@@ -4918,14 +4970,11 @@ const tpPick = chooseDynamicTp({
 });
 
 if (!tpPick) {
-  skipped.push({ symbol: t.symbol, mode, reason: isPremium ? "premium_no_dynamic_tp_advisory" : "no_dynamic_tp" });
+  if (!isRandom) skipped.push({ symbol: t.symbol, mode, reason: isPremium ? "premium_no_dynamic_tp_advisory" : "no_dynamic_tp" });
   if (!isPremium && !hasAnalyticsCandidateStamp) {
     lateRejectionReasons.push("no_dynamic_tp");
     if (!isRejected) {
-      if (isRandom) {
-        rejectionReason = "no_dynamic_tp";
-        isRejected = true;
-      } else {
+      if (!isRandom) {
         continue;
       }
     }
@@ -4953,10 +5002,7 @@ if (mode === "build" && Number.isFinite(tpPct) && tpPct < CFG.minTpPctByMode.bui
   if (!isPremium && !hasAnalyticsCandidateStamp) {
     lateRejectionReasons.push("build_tp_too_small");
     if (!isRejected) {
-      if (isRandom) {
-        rejectionReason = "build_tp_too_small";
-        isRejected = true;
-      } else {
+      if (!isRandom) {
         continue;
       }
     }
@@ -4992,10 +5038,7 @@ if (tpPick && (!rrInfo || rrInfo.rr < CFG.minRR)) {
   if (!isPremium && !hasAnalyticsCandidateStamp) {
     lateRejectionReasons.push("rr_too_small");
     if (!isRejected) {
-      if (isRandom) {
-        rejectionReason = "rr_too_small";
-        isRejected = true;
-      } else {
+      if (!isRandom) {
         continue;
       }
     }
@@ -5037,10 +5080,7 @@ if (shouldApplyDeferredRangeFloor) {
     if (!isPremium && !hasAnalyticsCandidateStamp) {
       lateRejectionReasons.push("range_floor");
       if (!isRejected) {
-        if (isRandom) {
-          rejectionReason = "range_floor";
-          isRejected = true;
-        } else {
+        if (!isRandom) {
           continue;
         }
       }
@@ -5108,10 +5148,12 @@ const sessionTelemetry = getEtSessionTelemetry(now);
 const anomaly = getAnomalyEventFields(t.symbol);
 
 
-const finalRejectionReason = [
-  rejectionReason,
-  ...lateRejectionReasons.filter((x) => x && x !== rejectionReason),
-].filter(Boolean).join("|");
+const finalRejectionReason = isRandom
+  ? ""
+  : [
+      rejectionReason,
+      ...lateRejectionReasons.filter((x) => x && x !== rejectionReason),
+    ].filter(Boolean).join("|");
 analyticsEvents.push({
   alert_id: isRandom
   ? `${now}_random_${t.symbol}_${mode}_${bias}`
@@ -5509,12 +5551,15 @@ const telegramRows = analyticsEvents
   );
 
 
-const renderedTradeCount = analyticsEvents.filter(
+const telegramEvents = analyticsEvents.filter(
+  (e) => e.observation_type === "fired" && e.recipe_stamp_label === "PREMIUM"
+);
+
+const renderedTradeCount = telegramEvents.length;
+const firedRowCount = analyticsEvents.filter(
   (e) => e.observation_type === "fired"
 ).length;
-
 const renderedRowCount = telegramRows.length;
-
 const randomRowCount = analyticsEvents.filter(
   (e) => e.observation_type === "random"
 ).length;
@@ -5529,10 +5574,12 @@ const message = renderedTradeCount > 0
       .join("\n\n")
   : "";
 
+// Fired rows are Premium Telegram events. Because analytics posts only after a
+// successful Telegram response, persisted Fired rows represent sent alerts.
 const firedKeys = [
   ...new Set(
-    analyticsEvents
-      .filter((e) => e.observation_type === "fired" && e.instId && e.mode)
+    telegramEvents
+      .filter((e) => e.instId && e.mode)
       .map((e) => `${String(e.instId)}__${String(e.mode)}`)
   )
 ];
@@ -5563,6 +5610,7 @@ if (!force && renderedTradeCount === 0) {
       triggered_count: renderedTradeCount,
       rendered_trade_count: renderedTradeCount,
       rendered_row_count: renderedRowCount,
+      fired_row_count: firedRowCount,
       random_row_count: randomRowCount,
       itemErrors,
       topSkips,
@@ -5596,6 +5644,7 @@ if (!force && renderedTradeCount === 0) {
           triggered,
           rendered_trade_count: renderedTradeCount,
           rendered_row_count: renderedRowCount,
+          fired_row_count: firedRowCount,
           random_row_count: randomRowCount,
           modes,
           debug_build_regimes,
@@ -5624,6 +5673,7 @@ if (!force && renderedTradeCount === 0) {
       triggered_count: renderedTradeCount,
       rendered_trade_count: renderedTradeCount,
       rendered_row_count: renderedRowCount,
+      fired_row_count: firedRowCount,
       random_row_count: randomRowCount,
       itemErrors,
       topSkips,
@@ -5634,8 +5684,8 @@ if (!force && renderedTradeCount === 0) {
   return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
         
 }
-      const firedStateWrites = analyticsEvents
-  .filter((e) => e.observation_type === "fired" && e.instId && e.mode)
+      const firedStateWrites = telegramEvents
+  .filter((e) => e.instId && e.mode)
   .map((e) => {
     const match = triggered.find(
       (t) => String(t.instId) === String(e.instId) && String(t.mode) === String(e.mode)
@@ -5649,8 +5699,8 @@ if (firedStateWrites.length > 0) {
   await Promise.all(firedStateWrites);
 }
 
-const firedAlertStateWrites = analyticsEvents
-  .filter((e) => e.observation_type === "fired" && e.instId && e.mode)
+const firedAlertStateWrites = telegramEvents
+  .filter((e) => e.instId && e.mode)
   .map((e) => {
     const state = buildStoredAlertStateFromEvent(e);
     const writes = [
@@ -5731,6 +5781,7 @@ const summary = debug
           triggered,
           rendered_trade_count: renderedTradeCount,
           rendered_row_count: renderedRowCount,
+          fired_row_count: firedRowCount,
           random_row_count: randomRowCount,
           modes,
           debug_build_regimes,
