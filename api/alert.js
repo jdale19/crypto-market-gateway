@@ -71,6 +71,14 @@ function getDeployInfo() {
 async function postAnalyticsBatch(events, meta = {}) {
   if (!process.env.ANALYTICS_WEBHOOK_URL || !Array.isArray(events) || events.length === 0) return;
 
+  // Bound each n8n webhook execution. The workflow expands event objects into
+  // Google Sheets items, so a small sequential batch prevents a large alert
+  // payload from causing a memory spike in one n8n execution.
+  const maxEventsPerPostRaw = Number(process.env.ANALYTICS_MAX_EVENTS_PER_POST || 3);
+  const maxEventsPerPost = Number.isInteger(maxEventsPerPostRaw) && maxEventsPerPostRaw > 0
+    ? Math.min(maxEventsPerPostRaw, 10)
+    : 3;
+
   const minPostMinutes = Number(process.env.ANALYTICS_MIN_POST_INTERVAL_MINUTES || 0);
   const throttleKey = String(
     process.env.ANALYTICS_POST_THROTTLE_KEY || "alert:analytics:lastPostAt"
@@ -91,19 +99,22 @@ async function postAnalyticsBatch(events, meta = {}) {
   }
 
   try {
-    const response = await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        source: "gateway",
-        ts: Date.now(),
-        ...meta,
-        events,
-      }),
-    });
+    for (let start = 0; start < events.length; start += maxEventsPerPost) {
+      const batch = events.slice(start, start + maxEventsPerPost);
+      const response = await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "gateway",
+          ts: Date.now(),
+          ...meta,
+          events: batch,
+        }),
+      });
 
-    if (!response.ok) {
-      throw new Error(`analytics_webhook_http_${response.status}`);
+      if (!response.ok) {
+        throw new Error(`analytics_webhook_http_${response.status}`);
+      }
     }
 
     if (Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
@@ -2580,9 +2591,7 @@ const BLOCKED_PROMOTION_CANDIDATE_STAMPS = new Set([
   "suppressed_swing_long_flow_persists_long",
   "suppressed_swing_long_ignition_breakout_long",
   "suppressed_swing_long_btc_oi_compression_long",
-  "candidate_swing_short_flow_persists_long_liq",
   "candidate_swing_short_anom_oi_negative_btc15_negative",
-  "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
 ]);
 
 function addCandidateStamp(stamps, label, reason, profile) {
@@ -2979,19 +2988,6 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
     );
   }
 
-  if (
-    mode === "swing" &&
-    bias === "short" &&
-    String(t?.execReason || "").toLowerCase() === "swing_flow_persists_short" &&
-    anomalyPattern === "long_liq"
-  ) {
-    addCandidateStamp(
-      stamps,
-      "candidate_swing_short_flow_persists_long_liq",
-      "swing short flow persists; anomaly pattern = long_liq",
-      "Swing Short: flow persists + long liq anomaly"
-    );
-  }
 
   if (
     mode === "swing" &&
@@ -3043,56 +3039,6 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
     );
   }
 
-  if (
-    mode === "swing" &&
-    bias === "short" &&
-    Number.isFinite(symbolVsBtc1hPct) &&
-    symbolVsBtc1hPct < 0 &&
-    Number.isFinite(anomalyOiPct) &&
-    anomalyOiPct < 0 &&
-    Number.isFinite(btc15mPct) &&
-    btc15mPct < 0
-  ) {
-    addCandidateStamp(
-      stamps,
-      "candidate_swing_short_rsbtc1h_negative_anom_oi_negative_btc15_negative",
-      "swing short; symbol underperforming BTC 1h; anomaly OI negative; BTC15 negative",
-      "Swing Short: relative weakness + OI unwind"
-    );
-  }
-
-  if (
-    mode === "swing" &&
-    bias === "short" &&
-    Number.isFinite(symbolVsBtc1hPct) &&
-    symbolVsBtc1hPct < 0 &&
-    Number.isFinite(anomalyOiPct) &&
-    anomalyOiPct < 0
-  ) {
-    addCandidateStamp(
-      stamps,
-      "candidate_swing_short_rsbtc1h_negative_anom_oi_negative_no_btc15_gate",
-      "swing short; symbol underperforming BTC 1h; anomaly OI negative; no BTC15 gate",
-      "Swing Short: relative weakness + OI unwind, no BTC15 gate"
-    );
-  }
-
-  if (
-    mode === "swing" &&
-    bias === "short" &&
-    Number.isFinite(bookImbalance20) &&
-    bookImbalance20 <= -0.10 &&
-    Number.isFinite(spreadBps) &&
-    spreadBps <= 5 &&
-    marketStructureOk
-  ) {
-    addCandidateStamp(
-      stamps,
-      "candidate_swing_short_book_ask_imbalance_tight_spread_market_structure_ok",
-      "swing short; ask-side imbalance; spread <= 5 bps; market structure ok",
-      "Swing Short: book pressure"
-    );
-  }
 
   if (
     mode === "scalp" &&
@@ -5661,6 +5607,23 @@ if (!force && renderedTradeCount === 0) {
       const tg = await sendTelegram(message);
       
       if (!tg.ok) {
+  // Random is the pre-gate analytical baseline. Preserve it even when
+  // Telegram delivery fails; do not persist the unsent Fired event.
+  const randomOnlyEvents = analyticsEvents.filter(
+    (e) => e.observation_type === "random"
+  );
+  if (randomOnlyEvents.length > 0) {
+    await postAnalyticsBatch(randomOnlyEvents, {
+      deploy_sha:
+        process.env.VERCEL_GIT_COMMIT_SHA ||
+        process.env.VERCEL_GITHUB_COMMIT_SHA ||
+        process.env.GITHUB_SHA ||
+        null,
+      modes,
+      risk_profile,
+      telegram_delivery: "failed",
+    });
+  }
   await writeHeartbeat(
     {
       ts: now,
