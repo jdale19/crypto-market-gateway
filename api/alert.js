@@ -138,9 +138,9 @@ async function postAnalyticsBatch(events, meta = {}) {
     return makeAnalyticsPostResult({ status: "disabled", eventCount });
   }
 
-  // Bound each n8n webhook execution. The workflow expands event objects into
-  // Google Sheets items, so a small sequential batch prevents a large alert
-  // payload from causing a memory spike in one n8n execution.
+  // Keep outbound analytics writes small. The direct Apps Script ingest accepts
+  // the existing batch payload contract and writes one rectangular range per
+  // request, without routing the payload through an n8n Google Sheets node.
   const maxEventsPerPostRaw = Number(process.env.ANALYTICS_MAX_EVENTS_PER_POST || 3);
   const maxEventsPerPost = Number.isInteger(maxEventsPerPostRaw) && maxEventsPerPostRaw > 0
     ? Math.min(maxEventsPerPostRaw, 10)
@@ -168,22 +168,46 @@ async function postAnalyticsBatch(events, meta = {}) {
     }
   }
 
+  const analyticsIngestKey = String(
+    process.env.ANALYTICS_INGEST_SHARED_SECRET || ""
+  ).trim();
+
   let postedBatchCount = 0;
   for (let start = 0; start < eventCount; start += maxEventsPerPost) {
     const batch = events.slice(start, start + maxEventsPerPost);
+    const payload = {
+      source: "gateway",
+      ts: Date.now(),
+      ...meta,
+      events: batch,
+    };
+
+    // The existing n8n ingest ignores this field. The direct Apps Script endpoint
+    // requires it, so it can reject unauthenticated writes without exposing the
+    // secret in the endpoint URL or repository.
+    if (analyticsIngestKey) payload.ingest_key = analyticsIngestKey;
+
     let response;
+    let responseBody = null;
 
     try {
       response = await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source: "gateway",
-          ts: Date.now(),
-          ...meta,
-          events: batch,
-        }),
+        body: JSON.stringify(payload),
       });
+
+      // Apps Script web apps usually return HTTP 200 even for application-level
+      // rejections. Treat an explicit { ok: false } response as a failed post so
+      // heartbeat telemetry remains truthful.
+      const responseText = await response.text();
+      if (responseText) {
+        try {
+          responseBody = JSON.parse(responseText);
+        } catch (_) {
+          responseBody = null;
+        }
+      }
     } catch (_) {
       const result = makeAnalyticsPostResult({
         status: "failed",
@@ -196,13 +220,16 @@ async function postAnalyticsBatch(events, meta = {}) {
       return result;
     }
 
-    if (!response.ok) {
+    const applicationRejected = responseBody && responseBody.ok === false;
+    if (!response.ok || applicationRejected) {
       const result = makeAnalyticsPostResult({
         status: "failed",
         eventCount,
         batchCount: postedBatchCount,
         failedBatchCount: 1,
-        errorCode: `analytics_webhook_http_${response.status}`,
+        errorCode: applicationRejected
+          ? String(responseBody.error || "analytics_webhook_rejected")
+          : `analytics_webhook_http_${response.status}`,
       });
       console.error("[analytics] post failed", result.errorCode);
       return result;
