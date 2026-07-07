@@ -15,7 +15,7 @@
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
 // - ANALYTICS-ONLY DISCOVERY: retain suppressed families for measurement and add hot-funding Swing Short plus BTC-funding short overlay candidates
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
-// - ANALYTICS POSTING: log non-2xx webhook responses instead of silently marking a failed post as successful
+// - ANALYTICS POSTING: report posted/throttled/failed webhook health in heartbeat and debug output
 // - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y telemetry is capture-only
 // - TWO-COHORT ANALYTICS: Random is sampled before any candidate/selector gate; Fired is persisted only for Premium alerts successfully sent to Telegram. Candidate/Premium metadata remain fields, never cohorts.
 //
@@ -68,8 +68,75 @@ function getDeployInfo() {
       null,
   };
 }
+function makeAnalyticsPostResult({
+  status = "not_attempted",
+  eventCount = 0,
+  batchCount = 0,
+  failedBatchCount = 0,
+  errorCode = null,
+} = {}) {
+  const normalStatus = String(status || "not_attempted");
+  const safeCount = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  };
+
+  return {
+    status: normalStatus,
+    // A scheduled event that is throttled or intentionally disabled was not
+    // durably persisted, so it is not analytics-healthy even though the main
+    // alert handler itself may have completed successfully.
+    ok: normalStatus === "posted" || normalStatus === "no_events",
+    eventCount: safeCount(eventCount),
+    batchCount: safeCount(batchCount),
+    failedBatchCount: safeCount(failedBatchCount),
+    errorCode: errorCode ? String(errorCode) : null,
+  };
+}
+
+function analyticsHeartbeatFields(result) {
+  const safe = result && typeof result === "object"
+    ? result
+    : makeAnalyticsPostResult();
+
+  return {
+    analytics_status: String(safe.status || "not_attempted"),
+    analytics_ok: typeof safe.ok === "boolean" ? safe.ok : null,
+    analytics_event_count: Number.isFinite(Number(safe.eventCount))
+      ? Math.max(0, Math.floor(Number(safe.eventCount)))
+      : 0,
+    analytics_batch_count: Number.isFinite(Number(safe.batchCount))
+      ? Math.max(0, Math.floor(Number(safe.batchCount)))
+      : 0,
+    analytics_failed_batch_count: Number.isFinite(Number(safe.failedBatchCount))
+      ? Math.max(0, Math.floor(Number(safe.failedBatchCount)))
+      : 0,
+    analytics_error_code: safe.errorCode ? String(safe.errorCode) : null,
+  };
+}
+
+function analyticsResponseSummary(result) {
+  const fields = analyticsHeartbeatFields(result);
+  return {
+    status: fields.analytics_status,
+    ok: fields.analytics_ok,
+    event_count: fields.analytics_event_count,
+    batch_count: fields.analytics_batch_count,
+    failed_batch_count: fields.analytics_failed_batch_count,
+    error_code: fields.analytics_error_code,
+  };
+}
+
 async function postAnalyticsBatch(events, meta = {}) {
-  if (!process.env.ANALYTICS_WEBHOOK_URL || !Array.isArray(events) || events.length === 0) return;
+  const eventCount = Array.isArray(events) ? events.length : 0;
+
+  if (!Array.isArray(events) || eventCount === 0) {
+    return makeAnalyticsPostResult({ status: "no_events", eventCount: 0 });
+  }
+
+  if (!process.env.ANALYTICS_WEBHOOK_URL) {
+    return makeAnalyticsPostResult({ status: "disabled", eventCount });
+  }
 
   // Bound each n8n webhook execution. The workflow expands event objects into
   // Google Sheets items, so a small sequential batch prevents a large alert
@@ -93,15 +160,21 @@ async function postAnalyticsBatch(events, meta = {}) {
         Number.isFinite(lastPostAt) &&
         Date.now() - lastPostAt < minPostMinutes * 60 * 1000
       ) {
-        return;
+        return makeAnalyticsPostResult({ status: "throttled", eventCount });
       }
-    } catch (_) {}
+    } catch (_) {
+      // Preserve existing behavior: a throttle-read problem must not prevent
+      // a normal analytics attempt. The POST result below remains authoritative.
+    }
   }
 
-  try {
-    for (let start = 0; start < events.length; start += maxEventsPerPost) {
-      const batch = events.slice(start, start + maxEventsPerPost);
-      const response = await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
+  let postedBatchCount = 0;
+  for (let start = 0; start < eventCount; start += maxEventsPerPost) {
+    const batch = events.slice(start, start + maxEventsPerPost);
+    let response;
+
+    try {
+      response = await fetch(process.env.ANALYTICS_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -111,18 +184,42 @@ async function postAnalyticsBatch(events, meta = {}) {
           events: batch,
         }),
       });
-
-      if (!response.ok) {
-        throw new Error(`analytics_webhook_http_${response.status}`);
-      }
+    } catch (_) {
+      const result = makeAnalyticsPostResult({
+        status: "failed",
+        eventCount,
+        batchCount: postedBatchCount,
+        failedBatchCount: 1,
+        errorCode: "analytics_webhook_request_failed",
+      });
+      console.error("[analytics] post failed", result.errorCode);
+      return result;
     }
 
-    if (Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
-      await redis.set(throttleKey, String(Date.now())).catch(() => null);
+    if (!response.ok) {
+      const result = makeAnalyticsPostResult({
+        status: "failed",
+        eventCount,
+        batchCount: postedBatchCount,
+        failedBatchCount: 1,
+        errorCode: `analytics_webhook_http_${response.status}`,
+      });
+      console.error("[analytics] post failed", result.errorCode);
+      return result;
     }
-  } catch (err) {
-    console.error("[analytics] post failed", String(err?.message || err));
+
+    postedBatchCount += 1;
   }
+
+  if (Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
+    await redis.set(throttleKey, String(Date.now())).catch(() => null);
+  }
+
+  return makeAnalyticsPostResult({
+    status: "posted",
+    eventCount,
+    batchCount: postedBatchCount,
+  });
 }
 
 const CFG = {
@@ -4084,6 +4181,7 @@ module.exports = async function handler(req, res) {
 
   // evaluate potentially multiple modes in priority order
   let modes = ["scalp"];
+  let analyticsPost = makeAnalyticsPostResult({ status: "not_attempted" });
 
   try {
     const secret = process.env.ALERT_SECRET || "";
@@ -4154,6 +4252,7 @@ module.exports = async function handler(req, res) {
           risk_profile,
           sent: false,
           triggered_count: 0,
+          ...analyticsHeartbeatFields(analyticsPost),
           error: "multi fetch failed",
         },
         { dry }
@@ -5534,7 +5633,7 @@ const { itemErrors, topSkips } = summarizeSkips(skipped);
 
 if (!force && renderedTradeCount === 0) {
   if (!dry) {
-    await postAnalyticsBatch(analyticsEvents, {
+    analyticsPost = await postAnalyticsBatch(analyticsEvents, {
       deploy_sha:
         process.env.VERCEL_GIT_COMMIT_SHA ||
         process.env.VERCEL_GITHUB_COMMIT_SHA ||
@@ -5558,6 +5657,7 @@ if (!force && renderedTradeCount === 0) {
       rendered_row_count: renderedRowCount,
       fired_row_count: firedRowCount,
       random_row_count: randomRowCount,
+      ...analyticsHeartbeatFields(analyticsPost),
       itemErrors,
       topSkips,
     },
@@ -5597,6 +5697,7 @@ if (!force && renderedTradeCount === 0) {
           risk_profile,
           summary,
           renderedMessage: message,
+          analytics: analyticsResponseSummary(analyticsPost),
           heartbeat_last_run,
         }
       : {}),
@@ -5612,18 +5713,16 @@ if (!force && renderedTradeCount === 0) {
   const randomOnlyEvents = analyticsEvents.filter(
     (e) => e.observation_type === "random"
   );
-  if (randomOnlyEvents.length > 0) {
-    await postAnalyticsBatch(randomOnlyEvents, {
-      deploy_sha:
-        process.env.VERCEL_GIT_COMMIT_SHA ||
-        process.env.VERCEL_GITHUB_COMMIT_SHA ||
-        process.env.GITHUB_SHA ||
-        null,
-      modes,
-      risk_profile,
-      telegram_delivery: "failed",
-    });
-  }
+  analyticsPost = await postAnalyticsBatch(randomOnlyEvents, {
+    deploy_sha:
+      process.env.VERCEL_GIT_COMMIT_SHA ||
+      process.env.VERCEL_GITHUB_COMMIT_SHA ||
+      process.env.GITHUB_SHA ||
+      null,
+    modes,
+    risk_profile,
+    telegram_delivery: "failed",
+  });
   await writeHeartbeat(
     {
       ts: now,
@@ -5638,13 +5737,19 @@ if (!force && renderedTradeCount === 0) {
       rendered_row_count: renderedRowCount,
       fired_row_count: firedRowCount,
       random_row_count: randomRowCount,
+      ...analyticsHeartbeatFields(analyticsPost),
       itemErrors,
       topSkips,
       telegram_error: tg.detail || null,
     },
     { dry }
   );
-  return res.status(500).json({ ok: false, error: "telegram_failed", detail: tg.detail || null });
+  return res.status(500).json({
+    ok: false,
+    error: "telegram_failed",
+    detail: tg.detail || null,
+    ...(debug ? { analytics: analyticsResponseSummary(analyticsPost) } : {}),
+  });
         
 }
       const firedStateWrites = telegramEvents
@@ -5688,7 +5793,7 @@ if (firedAlertStateWrites.length > 0) {
   );
 }
 
-    await postAnalyticsBatch(analyticsEvents, {
+    analyticsPost = await postAnalyticsBatch(analyticsEvents, {
       deploy_sha:
         process.env.VERCEL_GIT_COMMIT_SHA ||
         process.env.VERCEL_GITHUB_COMMIT_SHA ||
@@ -5711,6 +5816,7 @@ if (firedAlertStateWrites.length > 0) {
         rendered_trade_count: renderedTradeCount,
         rendered_row_count: renderedRowCount,
         random_row_count: randomRowCount,
+        ...analyticsHeartbeatFields(analyticsPost),
         itemErrors,
         topSkips,
       },
@@ -5751,6 +5857,7 @@ const summary = debug
           risk_profile,
           summary,
           renderedMessage: message,
+          analytics: analyticsResponseSummary(analyticsPost),
           heartbeat_last_run,
           }
         : {}),
@@ -5767,6 +5874,7 @@ const summary = debug
         risk_profile,
         sent: false,
         triggered_count: 0,
+        ...analyticsHeartbeatFields(analyticsPost),
         error: String(e?.message || e),
       },
       { dry }
