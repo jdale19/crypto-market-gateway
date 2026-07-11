@@ -11,7 +11,8 @@
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
-// - MANUAL TG V9: one bounded Swing Short Premium route is restored; all other former Scalp/Swing pilots remain analytics-only
+// - MANUAL TG V10: four pooled-history Scalp/Swing recipes are live as dedicated paths; the former Swing Short route is analytics-only
+// - RANKED TELEGRAM: one message per qualifying recipe, with up to three ranked symbol alternatives
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
 // - ANALYTICS-ONLY DISCOVERY: retain suppressed families for measurement and add hot-funding Swing Short plus BTC-funding short overlay candidates
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
@@ -43,7 +44,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v1_aggregate_deprecated_2026_07_06",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v9_swing_short_crowded_basket_compact_2026_07_01",
+  premium_recipe_version: "manual_tg_recipes_v10_four_recipe_ranked_shortlists_2026_07_11",
   candidate_stamp_version: "2026-07-06-external-aggregate-deprecated",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
@@ -150,8 +151,14 @@ async function postAnalyticsBatch(events, meta = {}) {
   const throttleKey = String(
     process.env.ANALYTICS_POST_THROTTLE_KEY || "alert:analytics:lastPostAt"
   );
+  const containsFired = events.some(
+    (event) => String(event?.observation_type || "").toLowerCase() === "fired"
+  );
 
-  if (Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
+  // Random sampling may be rate-limited to control ingest volume. Fired rows
+  // must never be suppressed by that throttle because Fired is the persisted
+  // record of a Telegram alert that was actually delivered.
+  if (!containsFired && Number.isFinite(minPostMinutes) && minPostMinutes > 0) {
     try {
       const lastPostRaw = await redis.get(throttleKey);
       const lastPostAt = lastPostRaw == null ? null : Number(lastPostRaw);
@@ -257,6 +264,13 @@ const CFG = {
   premiumRealert: {
     // Optional, safe default. Controls whether a repeat Premium reminder is still near the original entry.
     entryTolerancePct: Number(process.env.ALERT_PREMIUM_REALERT_ENTRY_TOLERANCE_PCT || 0.35),
+  },
+  recipeRouting: {
+    shortlistSize: Number(process.env.ALERT_RECIPE_SHORTLIST_SIZE || 3),
+    cooldownMinutesByMode: {
+      scalp: Number(process.env.ALERT_RECIPE_COOLDOWN_MINUTES_SCALP || 60),
+      swing: Number(process.env.ALERT_RECIPE_COOLDOWN_MINUTES_SWING || 240),
+    },
   },
   stop: {
   // candle flip method for reversals
@@ -518,6 +532,7 @@ macro: {
     lastSentAt: (id, mode) => `alert:lastSentAt:${id}:${String(mode || "unknown")}`,
     lastFiredAlert: (id, mode) => `alert:lastFiredAlert:${id}:${String(mode || "unknown")}`,
     lastPremiumAlert: (id, mode) => `alert:lastPremiumAlert:${id}:${String(mode || "unknown")}`,
+    lastRecipeSentAt: (recipeId) => `alert:lastRecipeSentAt:${String(recipeId || "unknown")}`,
     series5m: (id) => `series5m:${id}`,
     externalTelemetry: () => CFG.externalTelemetry.cacheKey,
   },
@@ -2613,11 +2628,160 @@ function isSendableTradeStamp(recipeStamp) {
   return label === "PREMIUM";
 }
 
+
+const LIVE_MANUAL_RECIPES = Object.freeze([
+  Object.freeze({
+    id: "scalp_breadth_spotperp_washout_long",
+    mode: "scalp",
+    side: "long",
+    profile: "Scalp Long: breadth washout + spot/perp divergence",
+    managementHint: "Fast scalp; take profit quickly if follow-through stalls.",
+    matches: (t) => {
+      const breadth = asNum(t?.ctx?.cryptoBreadth1hPct);
+      const spotPerp = asNum(t?.ctx?.spotVsPerp1hPct);
+      return Number.isFinite(breadth) && breadth <= 10 && Number.isFinite(spotPerp) && spotPerp <= -0.02;
+    },
+    rankValue: (t) => asNum(t?.ctx?.spotVsPerp1hPct),
+    rankMetric: (t) => `Spot/perp 1h ${fmtPct(t?.ctx?.spotVsPerp1hPct, 3)}`,
+    marketContext: (t) => [`Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`],
+  }),
+  Object.freeze({
+    id: "scalp_btc_oi_relative_lag_short",
+    mode: "scalp",
+    side: "short",
+    profile: "Scalp Short: moderate BTC OI rise + BTC-relative lag",
+    managementHint: "Fast TP; cover quickly if downside stalls.",
+    matches: (t) => {
+      const btcOi15 = asNum(t?.ctx?.btc5mOi15mPct);
+      const vsBtc15 = asNum(t?.ctx?.symbolVsBtc15mPct);
+      return (
+        Number.isFinite(btcOi15) &&
+        btcOi15 >= 0.02 &&
+        btcOi15 <= 0.13 &&
+        Number.isFinite(vsBtc15) &&
+        vsBtc15 >= -0.11 &&
+        vsBtc15 <= -0.02
+      );
+    },
+    rankValue: (t) => asNum(t?.ctx?.symbolVsBtc15mPct),
+    rankMetric: (t) => `vs BTC 15m ${fmtPct(t?.ctx?.symbolVsBtc15mPct, 3)}`,
+    marketContext: (t) => [`BTC OI 15m ${fmtPct(t?.ctx?.btc5mOi15mPct, 3)}`],
+  }),
+  Object.freeze({
+    id: "swing_eth_relative_weakness_btc_funding_long",
+    mode: "swing",
+    side: "long",
+    profile: "Swing Long: ETH-relative washout + elevated BTC funding",
+    managementHint: "Harvest at the due-window move; runner only with clean follow-through.",
+    matches: (t) => {
+      const vsEth1h = asNum(t?.ctx?.symbolVsEth1hPct);
+      const btcFunding15 = asNum(t?.ctx?.btc5mFunding15mAvg);
+      return (
+        Number.isFinite(vsEth1h) &&
+        vsEth1h <= -0.35 &&
+        Number.isFinite(btcFunding15) &&
+        btcFunding15 >= 0.00008
+      );
+    },
+    rankValue: (t) => asNum(t?.ctx?.symbolVsEth1hPct),
+    rankMetric: (t) => `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)}`,
+    marketContext: (t) => [`BTC funding 15m avg ${formatFundingRate(t?.ctx?.btc5mFunding15mAvg)}`],
+  }),
+  Object.freeze({
+    id: "swing_breadth_btc_oi_unwind_eth_lag_short",
+    mode: "swing",
+    side: "short",
+    profile: "Swing Short: extreme breadth + BTC OI unwind + ETH-relative lag",
+    managementHint: "Validate quickly; take partials by the due window and extend only with downside follow-through.",
+    matches: (t) => {
+      const breadth = asNum(t?.ctx?.cryptoBreadth1hPct);
+      const btcOi60 = asNum(t?.ctx?.btc5mOi60mPct);
+      const vsEth1h = asNum(t?.ctx?.symbolVsEth1hPct);
+      return (
+        Number.isFinite(breadth) &&
+        breadth >= 80 &&
+        Number.isFinite(btcOi60) &&
+        btcOi60 <= -0.35 &&
+        Number.isFinite(vsEth1h) &&
+        vsEth1h <= 0
+      );
+    },
+    rankValue: (t) => asNum(t?.ctx?.symbolVsEth1hPct),
+    rankMetric: (t) => `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)}`,
+    marketContext: (t) => [
+      `Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`,
+      `BTC OI 60m ${fmtPct(t?.ctx?.btc5mOi60mPct, 3)}`,
+    ],
+  }),
+]);
+
+const LIVE_MANUAL_RECIPE_BY_ID = new Map(LIVE_MANUAL_RECIPES.map((recipe) => [recipe.id, recipe]));
+
+function getLiveManualRecipe(recipeId) {
+  return LIVE_MANUAL_RECIPE_BY_ID.get(String(recipeId || "")) || null;
+}
+
+function getRecipeShortlistSize() {
+  const configured = Number(CFG.recipeRouting?.shortlistSize);
+  if (!Number.isFinite(configured)) return 3;
+  return Math.max(1, Math.min(5, Math.floor(configured)));
+}
+
+function getRecipeCooldownMinutes(recipe) {
+  const configured = Number(CFG.recipeRouting?.cooldownMinutesByMode?.[recipe?.mode]);
+  const fallback = recipe?.mode === "swing" ? 240 : 60;
+  return Number.isFinite(configured) && configured >= 0 ? configured : fallback;
+}
+
+function formatFundingRate(value) {
+  const n = asNum(value);
+  if (!Number.isFinite(n)) return "n/a";
+  return n.toFixed(6);
+}
+
+function sortManualRecipeCandidates(recipe, candidates) {
+  return [...(candidates || [])].sort((a, b) => {
+    const av = asNum(recipe?.rankValue?.(a));
+    const bv = asNum(recipe?.rankValue?.(b));
+    if (Number.isFinite(av) && Number.isFinite(bv) && av !== bv) return av - bv;
+    if (Number.isFinite(av) && !Number.isFinite(bv)) return -1;
+    if (!Number.isFinite(av) && Number.isFinite(bv)) return 1;
+    return String(a?.symbol || "").localeCompare(String(b?.symbol || ""));
+  });
+}
+
+function buildRankedRecipeTelegramMessage(recipe, selections) {
+  const ranked = selections || [];
+  if (!recipe || ranked.length === 0) return "";
+
+  const header = `⚡️ ${String(recipe.mode || "").toUpperCase()} ${String(recipe.side || "").toUpperCase()}`;
+  const lines = [header, `PREMIUM ✅ | ${recipe.profile}`, ""];
+
+  ranked.forEach((selection, index) => {
+    const t = selection?.t || {};
+    const reminder = selection?.repeatDecision?.isReminder ? " | Reminder" : "";
+    const metric = recipe.rankMetric?.(t) || "";
+    lines.push(`${index + 1}. ${t.symbol} — Entry ${fmtPrice(t.price)}${reminder}`);
+    if (metric) lines.push(`   ${metric}`);
+  });
+
+  const contextLines = recipe.marketContext?.(ranked[0]?.t) || [];
+  if (contextLines.length) {
+    lines.push("");
+    lines.push(`Market: ${contextLines.join(" | ")}`);
+  }
+  if (recipe.managementHint) lines.push(`Mgmt: ${recipe.managementHint}`);
+
+  return lines.join("\n");
+}
+
 function buildManagementHint(t, recipeStamp) {
   const mode = String(t?.mode || "").toLowerCase();
   const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
   const recipeReason = String(recipeStamp?.reason || "").toLowerCase();
+  const liveRecipe = getLiveManualRecipe(execReason);
+  if (liveRecipe?.managementHint) return liveRecipe.managementHint;
 
   // Former TG pilots remain analytics-only during revalidation; do not attach
   // unvalidated management language to either family.
@@ -2662,51 +2826,35 @@ function isTruthyBoolean(value) {
 }
 
 function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
-  if (confidenceMeta?.selectorAllowed === false) {
-    return { label: "", emoji: "", reason: "selector_rejected", profile: "" };
-  }
-
   const mode = String(t?.mode || "").toLowerCase();
   const bias = String(t?.bias || "").toLowerCase();
   const execReason = String(t?.execReason || "").toLowerCase();
-  const anomalyBasketFundingRate = asNum(t?.ctx?.anomalyBasketFundingRate);
-  const entryPrice = asNum(t?.price);
-  const contHi = asNum(entryAtoms?.entry_atom_cont_hi);
-  const contLo = asNum(entryAtoms?.entry_atom_cont_lo);
-  const contRangePct =
-    Number.isFinite(entryPrice) &&
-    Number.isFinite(contHi) &&
-    Number.isFinite(contLo) &&
-    contHi > contLo &&
-    entryPrice > 0
-      ? ((contHi - contLo) / entryPrice) * 100
-      : null;
+  const liveRecipe = getLiveManualRecipe(execReason);
+
+  // Dedicated pooled-history recipes are complete routes. They intentionally do
+  // not depend on the legacy selector or execution families, but the exact
+  // approved predicate is rechecked here before granting Premium status.
+  if (
+    t?.analyticsOnly !== true &&
+    liveRecipe &&
+    liveRecipe.mode === mode &&
+    liveRecipe.side === bias &&
+    liveRecipe.matches(t)
+  ) {
+    return premiumStamp("PREMIUM", liveRecipe.id, liveRecipe.profile);
+  }
+
+  if (confidenceMeta?.selectorAllowed === false) {
+    return { label: "", emoji: "", reason: "selector_rejected", profile: "" };
+  }
 
   // Manual TG stance: Scalp/Swing only. Build is research-only.
   if (mode === "build") {
     return { label: "", emoji: "", reason: "build_manual_research_only", profile: "" };
   }
 
-  const swingShortCrowdedBasketCompactContinuation =
-    t?.analyticsOnly !== true &&
-    mode === "swing" &&
-    bias === "short" &&
-    execReason === "swing_flow_persists_short" &&
-    Number.isFinite(anomalyBasketFundingRate) &&
-    anomalyBasketFundingRate >= 0.000004 &&
-    Number.isFinite(contRangePct) &&
-    contRangePct <= 0.8;
-
-  // V9 retains one bounded Swing Short Premium route. External-market telemetry
-  // remains available in analytics but is never a recipe input.
-  if (swingShortCrowdedBasketCompactContinuation) {
-    return premiumStamp(
-      "PREMIUM",
-      "swing_short_crowded_basket_compact_continuation",
-      "Swing Short: elevated basket funding + compact continuation"
-    );
-  }
-
+  // The former V9 Swing Short continuation route is intentionally demoted to
+  // analytics-only. No legacy route can grant Premium status in V10.
   return { label: "", emoji: "", reason: "no_validated_manual_recipe", profile: "" };
 }
 
@@ -3231,13 +3379,11 @@ function entryDistancePct(a, b) {
   return Math.abs((x - y) / y) * 100;
 }
 
-function isRecentRepeatState({ lastState, now, mode }) {
+function getRepeatStateAgeMinutes(lastState, now) {
   const ts = asNum(lastState?.ts);
-  if (!Number.isFinite(ts)) return false;
+  if (!Number.isFinite(ts)) return null;
   const ageMin = (Number(now) - ts) / 60000;
-  if (!Number.isFinite(ageMin) || ageMin < CFG.cooldownMinutes) return false;
-  const maxAgeMin = Math.max(CFG.cooldownMinutes * 2, horizonMinForMode(mode));
-  return ageMin <= maxAgeMin;
+  return Number.isFinite(ageMin) && ageMin >= 0 ? ageMin : null;
 }
 
 function evaluateRepeatAlertPolicy({ t, recipeStamp, tradeRead, lastFiredState, now }) {
@@ -3245,7 +3391,22 @@ function evaluateRepeatAlertPolicy({ t, recipeStamp, tradeRead, lastFiredState, 
     return { reject: false, isReminder: false, reason: "new_or_changed_setup" };
   }
 
-  if (!isRecentRepeatState({ lastState: lastFiredState, now, mode: t?.mode })) {
+  const ageMin = getRepeatStateAgeMinutes(lastFiredState, now);
+  if (!Number.isFinite(ageMin)) {
+    return { reject: false, isReminder: false, reason: "repeat_state_missing_timestamp" };
+  }
+
+  if (ageMin < CFG.cooldownMinutes) {
+    return {
+      reject: true,
+      isReminder: false,
+      reason: "cooldown",
+      ageMinutes: Number(ageMin.toFixed(2)),
+    };
+  }
+
+  const maxAgeMin = Math.max(CFG.cooldownMinutes * 2, horizonMinForMode(t?.mode));
+  if (ageMin > maxAgeMin) {
     return { reject: false, isReminder: false, reason: "repeat_state_expired" };
   }
 
@@ -4338,6 +4499,163 @@ const triggered = [];
     anomaly_price_deviation: row?.components?.price_deviation ?? "",
   };
 }
+
+async function buildDirectManualRecipeCandidates(item) {
+  const instId = String(item?.instId || "").trim();
+  const symbol = String(item?.symbol || "?").trim();
+  const price = asNum(item?.price);
+
+  if (!instId || !Number.isFinite(price)) return [];
+
+  const probeCtx = {
+    btc5mOi15mPct: btcTapeContext?.oi15mPct ?? null,
+    btc5mOi60mPct: btcTapeContext?.oi60mPct ?? null,
+    btc5mFunding15mAvg: btcTapeContext?.funding15mAvg ?? null,
+    symbolVsBtc15mPct: item?.market_context?.symbol_vs_btc_15m_pct ?? null,
+    symbolVsEth1hPct: item?.market_context?.symbol_vs_eth_1h_pct ?? null,
+    cryptoBreadth1hPct: item?.market_context?.crypto_breadth_1h_pct ?? null,
+    spotVsPerp1hPct: item?.market_structure?.spot_vs_perp_1h_pct ?? null,
+  };
+
+  const matchingRecipes = LIVE_MANUAL_RECIPES.filter((recipe) => {
+    if (!modes.includes(recipe.mode)) return false;
+    return recipe.matches({ mode: recipe.mode, bias: recipe.side, execReason: recipe.id, ctx: probeCtx });
+  });
+
+  if (matchingRecipes.length === 0) return [];
+
+  const levels = await computeLevelsFromSeries(instId);
+  if (!force && levels?.["1h"]?.warmup) {
+    if (debug) {
+      for (const recipe of matchingRecipes) {
+        skipped.push({ symbol, mode: recipe.mode, reason: "direct_recipe_warmup_gate_1h", detail: { recipe: recipe.id } });
+      }
+    }
+    return [];
+  }
+
+  const anomalyCtx = getAnomalyEventFields(symbol);
+  const stateByMode = new Map();
+  const candidates = [];
+
+  for (const recipe of matchingRecipes) {
+    let stateInfo = stateByMode.get(recipe.mode);
+    if (!stateInfo) {
+      const lastStateRaw = await redis.get(CFG.keys.lastState(recipe.mode, instId)).catch(() => null);
+      const lastState = lastStateRaw ? String(lastStateRaw) : null;
+      stateInfo = evaluateCriteria(item, lastState, recipe.mode);
+      stateByMode.set(recipe.mode, stateInfo);
+    }
+
+    const baseBias = biasFromItem(item, recipe.mode);
+    const b1 = strongRecoB1({ bias: recipe.side, levels, price });
+    const macroMode = computeBtcMacro(j.results || [], recipe.mode);
+
+    const t = {
+      mode: recipe.mode,
+      instId,
+      _rawItem: item,
+      symbol,
+      price,
+      bias: recipe.side,
+      baseBias,
+      triggers: stateInfo?.triggers || [],
+      levels,
+      b1,
+      entryLine: null,
+      execReason: recipe.id,
+      execDetail: {
+        directRecipe: recipe.id,
+        rankValue: recipe.rankValue({ ctx: probeCtx }),
+      },
+      curState: stateInfo?.curState || null,
+      observationType: "fired",
+      randomGroupId: "",
+      randomSource: "",
+      analyticsOnly: false,
+      rejectionReason: "",
+      manualRecipeId: recipe.id,
+      ctx: {
+        anomalyTf: anomalyCtx.anomaly_tf || "",
+        anomalyScore: asNum(anomalyCtx.anomaly_score),
+        anomalyRank: asNum(anomalyCtx.anomaly_rank),
+        anomalyPricePct: asNum(anomalyCtx.anomaly_price_pct),
+        anomalyOiPct: asNum(anomalyCtx.anomaly_oi_pct),
+        anomalyFundingRate: asNum(anomalyCtx.anomaly_funding_rate),
+        anomalyPattern: anomalyCtx.anomaly_pattern || "",
+        anomalyBasketPricePct: asNum(anomalyCtx.anomaly_basket_price_pct),
+        anomalyBasketOiPct: asNum(anomalyCtx.anomaly_basket_oi_pct),
+        anomalyBasketFundingRate: asNum(anomalyCtx.anomaly_basket_funding_rate),
+        anomalyPriceOiGap: asNum(anomalyCtx.anomaly_price_oi_gap),
+        anomalyOiTrendDeviation: asNum(anomalyCtx.anomaly_oi_trend_deviation),
+        oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
+        lean15m: String(item?.deltas?.["15m"]?.lean || "").toLowerCase(),
+        lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
+        wickMeta: null,
+        dps: null,
+        bottoming: null,
+        externalBias: "neutral",
+        externalContextAdj: 0,
+        externalContextOk: !!externalTelemetry?.ok,
+        externalContextReason: String(externalTelemetry?.reason || "telemetry_only|missing"),
+        externalContextComponentSummary: buildExternalTelemetrySummary(externalTelemetry),
+        coinDayPct: externalTelemetry?.coinDayPct ?? null,
+        vixDayPct: externalTelemetry?.vixDayPct ?? null,
+        dxyDayPct: externalTelemetry?.dxyDayPct ?? null,
+        qqqDayPct: externalTelemetry?.qqqDayPct ?? null,
+        spxDayPct: externalTelemetry?.spxDayPct ?? null,
+        us2yDelta: externalTelemetry?.us2yDelta ?? null,
+        btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
+        btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
+        btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
+        btc5mPrice60mPct: btcTapeContext?.price60mPct ?? null,
+        btc5mOi5mPct: btcTapeContext?.oi5mPct ?? null,
+        btc5mOi15mPct: btcTapeContext?.oi15mPct ?? null,
+        btc5mOi30mPct: btcTapeContext?.oi30mPct ?? null,
+        btc5mOi60mPct: btcTapeContext?.oi60mPct ?? null,
+        btc5mFunding: btcTapeContext?.funding ?? null,
+        btc5mFunding5mAvg: btcTapeContext?.funding5mAvg ?? null,
+        btc5mFunding15mAvg: btcTapeContext?.funding15mAvg ?? null,
+        btc5mFunding30mAvg: btcTapeContext?.funding30mAvg ?? null,
+        btcTapeState: String(btcTapeContext?.tapeState || "neutral"),
+        isUsEquityRth: getEtSessionTelemetry(Date.now()).is_us_equity_rth,
+        symbolVsBtc15mPct: item?.market_context?.symbol_vs_btc_15m_pct ?? null,
+        symbolVsBtc1hPct: item?.market_context?.symbol_vs_btc_1h_pct ?? null,
+        symbolVsEth15mPct: item?.market_context?.symbol_vs_eth_15m_pct ?? null,
+        symbolVsEth1hPct: item?.market_context?.symbol_vs_eth_1h_pct ?? null,
+        cryptoBreadth15mPct: item?.market_context?.crypto_breadth_15m_pct ?? null,
+        cryptoBreadth1hPct: item?.market_context?.crypto_breadth_1h_pct ?? null,
+        cryptoBreadthTilt15m: item?.market_context?.crypto_breadth_tilt_15m ?? "",
+        cryptoBreadthTilt1h: item?.market_context?.crypto_breadth_tilt_1h ?? "",
+        spotVsPerp15mPct: item?.market_structure?.spot_vs_perp_15m_pct ?? null,
+        spotVsPerp1hPct: item?.market_structure?.spot_vs_perp_1h_pct ?? null,
+        spreadBps: item?.market_structure?.spread_bps ?? null,
+        bookBidDepth20Usd: item?.market_structure?.book_bid_depth_20_usd ?? null,
+        bookAskDepth20Usd: item?.market_structure?.book_ask_depth_20_usd ?? null,
+        bookImbalance20: item?.market_structure?.book_imbalance_20 ?? null,
+        thinBookFlag: item?.market_structure?.thin_book_flag ?? null,
+        marketStructureOk: item?.market_structure?.market_structure_ok ?? false,
+        marketStructureReason: item?.market_structure?.market_structure_reason || "missing_from_multi_item",
+        btcMacro: {
+          ok: !!macroMode?.ok,
+          reason: String(macroMode?.reason || ""),
+          tf: String(macroMode?.tf || ""),
+          lean: String(macroMode?.btc?.lean || ""),
+          pricePct: macroMode?.btc?.pricePct ?? null,
+          oiPct: macroMode?.btc?.oiPct ?? null,
+          bullExpansion: !!macroMode?.btcBullExpansion,
+        },
+        selectorFamily: `pooled_recipe_${recipe.mode}_${recipe.side}`,
+        selectorAllowed: true,
+        selectorRejectionReason: "",
+      },
+    };
+
+    if (recipe.matches(t)) candidates.push(t);
+  }
+
+  return candidates;
+}
   
 
     // Debug-only: show build regime per symbol (so you can confirm gate inputs)
@@ -4873,12 +5191,8 @@ for (const item of j.results || []) {
     continue;
   }
 
-  const evaluated = await evaluateCandidate({ item });
-  if (Array.isArray(evaluated.winners) && evaluated.winners.length) {
-    triggered.push(...evaluated.winners);
-  } else if (evaluated.winner) {
-    triggered.push(evaluated.winner);
-  }
+  const directCandidates = await buildDirectManualRecipeCandidates(item);
+  if (directCandidates.length) triggered.push(...directCandidates);
 }
 
 if (randomEval?.winner) {
@@ -4887,10 +5201,50 @@ if (randomEval?.winner) {
   triggered.push(randomEval.candidate);
 }
 
-// ---- Render DM ----
+const directGroups = new Map(LIVE_MANUAL_RECIPES.map((recipe) => [recipe.id, []]));
+const otherTriggered = [];
+const randomTriggered = [];
 
-const lines = [];
 for (const t of triggered) {
+  if (String(t?.observationType || "") === "random") {
+    randomTriggered.push(t);
+    continue;
+  }
+  const recipe = getLiveManualRecipe(t?.execReason);
+  if (recipe) directGroups.get(recipe.id).push(t);
+  else otherTriggered.push(t);
+}
+
+const orderedTriggered = [];
+for (const recipe of LIVE_MANUAL_RECIPES) {
+  orderedTriggered.push(...sortManualRecipeCandidates(recipe, directGroups.get(recipe.id)));
+}
+orderedTriggered.push(...otherTriggered, ...randomTriggered);
+
+const recipeCooldownState = new Map();
+for (const recipe of LIVE_MANUAL_RECIPES) {
+  const candidates = directGroups.get(recipe.id) || [];
+  if (candidates.length === 0 || force) {
+    recipeCooldownState.set(recipe.id, { active: false, ageMinutes: null });
+    continue;
+  }
+
+  const raw = await redis.get(CFG.keys.lastRecipeSentAt(recipe.id)).catch(() => null);
+  const sentAt = asNum(raw);
+  const ageMinutes = Number.isFinite(sentAt) ? (now - sentAt) / 60000 : null;
+  const cooldownMinutes = getRecipeCooldownMinutes(recipe);
+  recipeCooldownState.set(recipe.id, {
+    active: Number.isFinite(ageMinutes) && ageMinutes >= 0 && ageMinutes < cooldownMinutes,
+    ageMinutes: Number.isFinite(ageMinutes) ? Number(ageMinutes.toFixed(2)) : null,
+    cooldownMinutes,
+  });
+}
+
+// ---- Build ranked Telegram recipe messages and analytics rows ----
+
+const recipeSelections = new Map(LIVE_MANUAL_RECIPES.map((recipe) => [recipe.id, []]));
+const shortlistSize = getRecipeShortlistSize();
+for (const t of orderedTriggered) {
   const mode = String(t.mode || "swing").toLowerCase();
   const modeUp = mode.toUpperCase();
   let observationType = t.observationType || "fired";
@@ -4932,6 +5286,34 @@ for (const t of triggered) {
   const hasAnalyticsCandidateStamp = candidateStamps.length > 0;
   const isPremium = recipeStamp.label === "PREMIUM";
   const isSendableManualTrade = isSendableTradeStamp(recipeStamp);
+  const liveRecipe = getLiveManualRecipe(t?.execReason);
+
+  if (!isRandom && liveRecipe) {
+    const cooldownState = recipeCooldownState.get(liveRecipe.id) || { active: false };
+    if (!force && cooldownState.active) {
+      if (debug) skipped.push({
+        symbol: t.symbol,
+        mode,
+        reason: "recipe_cooldown",
+        detail: {
+          recipe: liveRecipe.id,
+          ageMinutes: cooldownState.ageMinutes,
+          cooldownMinutes: cooldownState.cooldownMinutes,
+        },
+      });
+      continue;
+    }
+
+    if ((recipeSelections.get(liveRecipe.id) || []).length >= shortlistSize) {
+      if (debug) skipped.push({
+        symbol: t.symbol,
+        mode,
+        reason: "recipe_shortlist_rank",
+        detail: { recipe: liveRecipe.id, shortlistSize },
+      });
+      continue;
+    }
+  }
 
   // Exactly two persisted analytics cohorts:
   // - Random: one pre-gate baseline observation per eligible run.
@@ -5200,20 +5582,6 @@ if (!isRandom && !force) {
   }
 }
 
-if (!isRandom && isSendableManualTrade) {
-  const managementHint = buildManagementHint(t, recipeStamp);
-  const profileLabel = recipeStamp.profile || prettifyDecisionToken(t?.execReason || "Premium setup");
-  const watch = compactTradeWatch(tradeRead);
-
-  const stampLabel = String(recipeStamp.label || "SETUP").toUpperCase();
-  lines.push(`[${modeUp}] ${t.symbol} ${price.toFixed(4)} | ${biasUp}`);
-  lines.push(`${stampLabel} ${recipeStamp.emoji}${repeatDecision.isReminder ? " | Reminder" : ""} | ${profileLabel}`);
-  if (managementHint) lines.push(`Mgmt: ${managementHint}`);
-  if (watch) lines.push(`Watch: ${watch}`);
-  lines.push(`Entry: ${price != null ? fmtPrice(price) : ""}`);
-  lines.push("");
-}
-
 const horizonMin = horizonMinForMode(mode);
 const evalTiming = buildEvaluationTiming(now, horizonMin);
 const sessionTelemetry = getEtSessionTelemetry(now);
@@ -5226,7 +5594,7 @@ const finalRejectionReason = isRandom
       rejectionReason,
       ...lateRejectionReasons.filter((x) => x && x !== rejectionReason),
     ].filter(Boolean).join("|");
-analyticsEvents.push({
+const analyticsEvent = {
   alert_id: isRandom
   ? `${now}_random_${t.symbol}_${mode}_${bias}`
   : `${now}_${t.symbol}_${mode}_${bias}`,
@@ -5397,7 +5765,17 @@ random_source: isRandom ? randomSourceForEvent : "",
   anomaly_funding_deviation_bps: anomaly.anomaly_funding_deviation_bps,
   anomaly_oi_trend_deviation: anomaly.anomaly_oi_trend_deviation,
   anomaly_price_deviation: anomaly.anomaly_price_deviation
-});
+};
+analyticsEvents.push(analyticsEvent);
+
+if (!isRandom && isSendableManualTrade && liveRecipe) {
+  recipeSelections.get(liveRecipe.id).push({
+    t,
+    event: analyticsEvent,
+    repeatDecision,
+    recipeStamp,
+  });
+}
 
 // TG intentionally omits TP/SL/invalidation/leverage price lines.
 // Those values remain captured in analytics and can still gate/reject internally,
@@ -5623,42 +6001,36 @@ const telegramRows = analyticsEvents
   );
 
 
-const telegramEvents = analyticsEvents.filter(
-  (e) => e.observation_type === "fired" && e.recipe_stamp_label === "PREMIUM"
-);
+const telegramMessages = LIVE_MANUAL_RECIPES
+  .map((recipe) => {
+    const selections = recipeSelections.get(recipe.id) || [];
+    const text = buildRankedRecipeTelegramMessage(recipe, selections);
+    return {
+      recipeId: recipe.id,
+      recipe,
+      selections,
+      events: selections.map((selection) => selection.event),
+      text,
+    };
+  })
+  .filter((group) => group.text && group.events.length > 0);
 
+const telegramEvents = telegramMessages.flatMap((group) => group.events);
 const renderedTradeCount = telegramEvents.length;
-const firedRowCount = analyticsEvents.filter(
-  (e) => e.observation_type === "fired"
-).length;
+const renderedMessageCount = telegramMessages.length;
+let firedRowCount = 0;
 const renderedRowCount = telegramRows.length;
 const randomRowCount = analyticsEvents.filter(
   (e) => e.observation_type === "random"
 ).length;
 
-const messageHeader = renderedTradeCount > 0
-  ? "⚡️TRADE ENTRY"
-  : "";
-
-const message = renderedTradeCount > 0
-  ? [messageHeader, lines.join("\n")]
-      .filter(Boolean)
-      .join("\n\n")
-  : "";
-
-// Fired rows are Premium Telegram events. Because analytics posts only after a
-// successful Telegram response, persisted Fired rows represent sent alerts.
-const firedKeys = [
-  ...new Set(
-    telegramEvents
-      .filter((e) => e.instId && e.mode)
-      .map((e) => `${String(e.instId)}__${String(e.mode)}`)
-  )
-];
+// Debug renders all recipe messages together, but production sends each recipe
+// as its own Telegram message so the shortlist stays actionable and coherent.
+const message = telegramMessages.map((group) => group.text).join("\n\n---\n\n");
 
 const { itemErrors, topSkips } = summarizeSkips(skipped);
 
-if (!force && renderedTradeCount === 0) {
+if (renderedTradeCount === 0) {
   if (!dry) {
     analyticsPost = await postAnalyticsBatch(analyticsEvents, {
       deploy_sha:
@@ -5681,6 +6053,7 @@ if (!force && renderedTradeCount === 0) {
             sent: false,
       triggered_count: renderedTradeCount,
       rendered_trade_count: renderedTradeCount,
+      rendered_message_count: renderedMessageCount,
       rendered_row_count: renderedRowCount,
       fired_row_count: firedRowCount,
       random_row_count: randomRowCount,
@@ -5716,6 +6089,7 @@ if (!force && renderedTradeCount === 0) {
           skipped,
           triggered,
           rendered_trade_count: renderedTradeCount,
+          rendered_message_count: renderedMessageCount,
           rendered_row_count: renderedRowCount,
           fired_row_count: firedRowCount,
           random_row_count: randomRowCount,
@@ -5731,104 +6105,111 @@ if (!force && renderedTradeCount === 0) {
   });
 }
 
+    const randomEvents = analyticsEvents.filter((e) => e.observation_type === "random");
+    const deliveredGroups = [];
+    let failedDelivery = null;
+
     if (!dry) {
-      const tg = await sendTelegram(message);
-      
-      if (!tg.ok) {
-  // Random is the pre-gate analytical baseline. Preserve it even when
-  // Telegram delivery fails; do not persist the unsent Fired event.
-  const randomOnlyEvents = analyticsEvents.filter(
-    (e) => e.observation_type === "random"
-  );
-  analyticsPost = await postAnalyticsBatch(randomOnlyEvents, {
-    deploy_sha:
-      process.env.VERCEL_GIT_COMMIT_SHA ||
-      process.env.VERCEL_GITHUB_COMMIT_SHA ||
-      process.env.GITHUB_SHA ||
-      null,
-    modes,
-    risk_profile,
-    telegram_delivery: "failed",
-  });
-  await writeHeartbeat(
-    {
-      ts: now,
-      iso: new Date(now).toISOString(),
-      ok: false,
-      stage: "telegram_failed",
-      modes,
-      risk_profile,
-           sent: false,
-      triggered_count: renderedTradeCount,
-      rendered_trade_count: renderedTradeCount,
-      rendered_row_count: renderedRowCount,
-      fired_row_count: firedRowCount,
-      random_row_count: randomRowCount,
-      ...analyticsHeartbeatFields(analyticsPost),
-      itemErrors,
-      topSkips,
-      telegram_error: tg.detail || null,
-    },
-    { dry }
-  );
-  return res.status(500).json({
-    ok: false,
-    error: "telegram_failed",
-    detail: tg.detail || null,
-    ...(debug ? { analytics: analyticsResponseSummary(analyticsPost) } : {}),
-  });
-        
-}
-      const firedStateWrites = telegramEvents
-  .filter((e) => e.instId && e.mode)
-  .map((e) => {
-    const match = triggered.find(
-      (t) => String(t.instId) === String(e.instId) && String(t.mode) === String(e.mode)
-    );
-    if (!match) return null;
-    return writeLastState(match.mode, match.instId, match.curState, { dry: false });
-  })
-  .filter(Boolean);
+      for (const group of telegramMessages) {
+        const tg = await sendTelegram(group.text);
+        if (!tg.ok) {
+          failedDelivery = {
+            recipeId: group.recipeId,
+            detail: tg.detail || null,
+          };
+          break;
+        }
+        deliveredGroups.push(group);
+      }
 
-if (firedStateWrites.length > 0) {
-  await Promise.all(firedStateWrites);
-}
+      const deliveredTelegramEvents = deliveredGroups.flatMap((group) => group.events);
+      firedRowCount = deliveredTelegramEvents.length;
 
-const firedAlertStateWrites = telegramEvents
-  .filter((e) => e.instId && e.mode)
-  .map((e) => {
-    const state = buildStoredAlertStateFromEvent(e);
-    const writes = [
-      redis.set(CFG.keys.lastFiredAlert(e.instId, e.mode), JSON.stringify(state)).catch(() => null),
-    ];
-    if (e.recipe_stamp_label === "PREMIUM") {
-      writes.push(redis.set(CFG.keys.lastPremiumAlert(e.instId, e.mode), JSON.stringify(state)).catch(() => null));
+      const firedStateWrites = deliveredTelegramEvents
+        .filter((e) => e.instId && e.mode)
+        .map((e) => {
+          const match = orderedTriggered.find(
+            (t) =>
+              String(t.instId) === String(e.instId) &&
+              String(t.mode) === String(e.mode) &&
+              String(t.bias) === String(e.side) &&
+              String(t.execReason || "") === String(e.exec_reason || "")
+          );
+          if (!match) return null;
+          return writeLastState(match.mode, match.instId, match.curState, { dry: false });
+        })
+        .filter(Boolean);
+
+      if (firedStateWrites.length > 0) {
+        await Promise.all(firedStateWrites);
+      }
+
+      const firedAlertStateWrites = deliveredTelegramEvents
+        .filter((e) => e.instId && e.mode)
+        .map((e) => {
+          const state = buildStoredAlertStateFromEvent(e);
+          return Promise.all([
+            redis.set(CFG.keys.lastFiredAlert(e.instId, e.mode), JSON.stringify(state)).catch(() => null),
+            redis.set(CFG.keys.lastPremiumAlert(e.instId, e.mode), JSON.stringify(state)).catch(() => null),
+            redis.set(CFG.keys.lastSentAt(e.instId, e.mode), String(now)).catch(() => null),
+          ]);
+        });
+
+      const recipeCooldownWrites = deliveredGroups.map((group) =>
+        redis.set(CFG.keys.lastRecipeSentAt(group.recipeId), String(now)).catch(() => null)
+      );
+
+      if (firedAlertStateWrites.length > 0 || recipeCooldownWrites.length > 0) {
+        await Promise.all([...firedAlertStateWrites, ...recipeCooldownWrites]);
+      }
+
+      const persistedEvents = [...randomEvents, ...deliveredTelegramEvents];
+      analyticsPost = await postAnalyticsBatch(persistedEvents, {
+        deploy_sha:
+          process.env.VERCEL_GIT_COMMIT_SHA ||
+          process.env.VERCEL_GITHUB_COMMIT_SHA ||
+          process.env.GITHUB_SHA ||
+          null,
+        modes,
+        risk_profile,
+        telegram_delivery: failedDelivery ? "partial_failure" : "sent",
+      });
     }
-    return Promise.all(writes);
-  });
 
-if (firedAlertStateWrites.length > 0) {
-  await Promise.all(firedAlertStateWrites);
-}
+    if (failedDelivery) {
+      await writeHeartbeat(
+        {
+          ts: now,
+          iso: new Date(now).toISOString(),
+          ok: false,
+          stage: "telegram_failed",
+          modes,
+          risk_profile,
+          sent: deliveredGroups.length > 0,
+          triggered_count: renderedTradeCount,
+          rendered_trade_count: renderedTradeCount,
+          rendered_message_count: renderedMessageCount,
+          rendered_row_count: renderedRowCount,
+          fired_row_count: firedRowCount,
+          random_row_count: randomRowCount,
+          ...analyticsHeartbeatFields(analyticsPost),
+          itemErrors,
+          topSkips,
+          telegram_error: failedDelivery.detail,
+          failed_recipe: failedDelivery.recipeId,
+        },
+        { dry }
+      );
 
-      if (firedKeys.length > 0) {
-  await Promise.all(
-    firedKeys.map((key) => {
-      const [id, mode] = key.split("__");
-      return redis.set(CFG.keys.lastSentAt(id, mode), String(now)).catch(() => null);
-    })
-  );
-}
-
-    analyticsPost = await postAnalyticsBatch(analyticsEvents, {
-      deploy_sha:
-        process.env.VERCEL_GIT_COMMIT_SHA ||
-        process.env.VERCEL_GITHUB_COMMIT_SHA ||
-        process.env.GITHUB_SHA ||
-        null,
-      modes,
-      risk_profile,
-    });
+      return res.status(500).json({
+        ok: false,
+        error: "telegram_failed",
+        failed_recipe: failedDelivery.recipeId,
+        delivered_recipe_count: deliveredGroups.length,
+        fired_row_count: firedRowCount,
+        detail: failedDelivery.detail,
+        ...(debug ? { analytics: analyticsResponseSummary(analyticsPost) } : {}),
+      });
     }
 
     await writeHeartbeat(
@@ -5838,10 +6219,12 @@ if (firedAlertStateWrites.length > 0) {
         ok: true,
         modes,
         risk_profile,
-                sent: !dry,
+        sent: !dry && deliveredGroups.length > 0,
         triggered_count: renderedTradeCount,
         rendered_trade_count: renderedTradeCount,
+        rendered_message_count: renderedMessageCount,
         rendered_row_count: renderedRowCount,
+        fired_row_count: firedRowCount,
         random_row_count: randomRowCount,
         ...analyticsHeartbeatFields(analyticsPost),
         itemErrors,
@@ -5864,7 +6247,7 @@ const summary = debug
   : undefined;
     return res.json({
       ok: true,
-      sent: !dry,
+      sent: !dry && deliveredGroups.length > 0,
       triggered_count: renderedTradeCount,
       ...(debug
         ? {
@@ -5876,6 +6259,7 @@ const summary = debug
                       skipped,
           triggered,
           rendered_trade_count: renderedTradeCount,
+          rendered_message_count: renderedMessageCount,
           rendered_row_count: renderedRowCount,
           fired_row_count: firedRowCount,
           random_row_count: randomRowCount,
