@@ -11,10 +11,10 @@
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
-// - MANUAL TG V10: four pooled-history Scalp/Swing recipes are live as dedicated paths; the former Swing Short route is analytics-only
+// - MANUAL TG V11: only the two validated Swing recipes remain live; weak Scalp routes are analytics-only
 // - RANKED TELEGRAM: one message per qualifying recipe, with up to three ranked symbol alternatives
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
-// - ANALYTICS-ONLY DISCOVERY: retain suppressed families for measurement and add hot-funding Swing Short plus BTC-funding short overlay candidates
+// - ANALYTICS-ONLY DISCOVERY: retain demoted Scalp routes and add regression-derived catch-up, breadth-ignition, and spot-led crowding stamps
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
 // - ANALYTICS POSTING: report posted/throttled/failed webhook health in heartbeat and debug output
 // - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y telemetry is capture-only
@@ -44,8 +44,8 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v1_aggregate_deprecated_2026_07_06",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v10_four_recipe_ranked_shortlists_2026_07_11",
-  candidate_stamp_version: "2026-07-06-external-aggregate-deprecated",
+  premium_recipe_version: "manual_tg_recipes_v11_swing_only_ranked_shortlists_2026_07_14",
+  candidate_stamp_version: "2026-07-14-regression_stitched_scalp_candidates_v1",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
 
@@ -2631,43 +2631,6 @@ function isSendableTradeStamp(recipeStamp) {
 
 const LIVE_MANUAL_RECIPES = Object.freeze([
   Object.freeze({
-    id: "scalp_breadth_spotperp_washout_long",
-    mode: "scalp",
-    side: "long",
-    profile: "Scalp Long: breadth washout + spot/perp divergence",
-    managementHint: "Fast scalp; take profit quickly if follow-through stalls.",
-    matches: (t) => {
-      const breadth = asNum(t?.ctx?.cryptoBreadth1hPct);
-      const spotPerp = asNum(t?.ctx?.spotVsPerp1hPct);
-      return Number.isFinite(breadth) && breadth <= 10 && Number.isFinite(spotPerp) && spotPerp <= -0.02;
-    },
-    rankValue: (t) => asNum(t?.ctx?.spotVsPerp1hPct),
-    rankMetric: (t) => `Spot/perp 1h ${fmtPct(t?.ctx?.spotVsPerp1hPct, 3)}`,
-    marketContext: (t) => [`Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`],
-  }),
-  Object.freeze({
-    id: "scalp_btc_oi_relative_lag_short",
-    mode: "scalp",
-    side: "short",
-    profile: "Scalp Short: moderate BTC OI rise + BTC-relative lag",
-    managementHint: "Fast TP; cover quickly if downside stalls.",
-    matches: (t) => {
-      const btcOi15 = asNum(t?.ctx?.btc5mOi15mPct);
-      const vsBtc15 = asNum(t?.ctx?.symbolVsBtc15mPct);
-      return (
-        Number.isFinite(btcOi15) &&
-        btcOi15 >= 0.02 &&
-        btcOi15 <= 0.13 &&
-        Number.isFinite(vsBtc15) &&
-        vsBtc15 >= -0.11 &&
-        vsBtc15 <= -0.02
-      );
-    },
-    rankValue: (t) => asNum(t?.ctx?.symbolVsBtc15mPct),
-    rankMetric: (t) => `vs BTC 15m ${fmtPct(t?.ctx?.symbolVsBtc15mPct, 3)}`,
-    marketContext: (t) => [`BTC OI 15m ${fmtPct(t?.ctx?.btc5mOi15mPct, 3)}`],
-  }),
-  Object.freeze({
     id: "swing_eth_relative_weakness_btc_funding_long",
     mode: "swing",
     side: "long",
@@ -2859,6 +2822,8 @@ function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
 }
 
 const BLOCKED_PROMOTION_CANDIDATE_STAMPS = new Set([
+  "suppressed_scalp_long_breadth_spotperp_washout",
+  "suppressed_scalp_short_btc_oi_relative_lag",
   "suppressed_swing_long_liquidity_snap_revalidation",
   "suppressed_swing_long_flow_persists_long",
   "suppressed_swing_long_ignition_breakout_long",
@@ -2904,16 +2869,125 @@ function computeCandidateStamps({ t, confidenceMeta, entryAtoms = {} }) {
   const symbolVsEth1hPct = asNum(t?.ctx?.symbolVsEth1hPct);
   const cryptoBreadth15mPct = asNum(t?.ctx?.cryptoBreadth15mPct);
   const cryptoBreadth1hPct = asNum(t?.ctx?.cryptoBreadth1hPct);
+  const spotVsPerp15mPct = asNum(t?.ctx?.spotVsPerp15mPct);
   const spotVsPerp1hPct = asNum(t?.ctx?.spotVsPerp1hPct);
   const bookImbalance20 = asNum(t?.ctx?.bookImbalance20);
   const spreadBps = asNum(t?.ctx?.spreadBps);
   const btcOi15mPct = asNum(t?.ctx?.btc5mOi15mPct);
   const btcOi30mPct = asNum(t?.ctx?.btc5mOi30mPct);
+  const btcPrice60mPct = asNum(t?.ctx?.btc5mPrice60mPct);
   const btcOi60mPct = asNum(t?.ctx?.btc5mOi60mPct);
   const anomalyPriceOiGap = asNum(t?.ctx?.anomalyPriceOiGap);
   const marketStructureOk = isTruthyBoolean(t?.ctx?.marketStructureOk);
   const inLowBand = isTruthyBoolean(entryAtoms?.entry_atom_in_low_band);
   const inHighBand = isTruthyBoolean(entryAtoms?.entry_atom_in_high_band);
+
+  // Demoted July 2026 Scalp routes. Preserve exact qualification as blocked,
+  // analytics-only stamps so forward evidence continues without Telegram noise.
+  if (
+    mode === "scalp" &&
+    bias === "long" &&
+    Number.isFinite(cryptoBreadth1hPct) &&
+    cryptoBreadth1hPct <= 10 &&
+    Number.isFinite(spotVsPerp1hPct) &&
+    spotVsPerp1hPct <= -0.02
+  ) {
+    addCandidateStamp(
+      stamps,
+      "suppressed_scalp_long_breadth_spotperp_washout",
+      "former live Scalp Long; breadth 1h <= 10%; spot/perp 1h <= -0.02%",
+      "Scalp Long: demoted breadth washout + spot/perp divergence"
+    );
+  }
+
+  if (
+    mode === "scalp" &&
+    bias === "short" &&
+    Number.isFinite(btcOi15mPct) &&
+    btcOi15mPct >= 0.02 &&
+    btcOi15mPct <= 0.13 &&
+    Number.isFinite(symbolVsBtc15mPct) &&
+    symbolVsBtc15mPct >= -0.11 &&
+    symbolVsBtc15mPct <= -0.02
+  ) {
+    addCandidateStamp(
+      stamps,
+      "suppressed_scalp_short_btc_oi_relative_lag",
+      "former live Scalp Short; BTC OI 15m 0.02% to 0.13%; symbol vs BTC 15m -0.11% to -0.02%",
+      "Scalp Short: demoted moderate BTC OI rise + BTC-relative lag"
+    );
+  }
+
+  // Regression-derived stitched candidates. These remain analytics-only and
+  // use only fields already available in the live pre-entry candidate context.
+  const relativeBtcAcceleration =
+    Number.isFinite(symbolVsBtc15mPct) && Number.isFinite(symbolVsBtc1hPct)
+      ? symbolVsBtc15mPct - symbolVsBtc1hPct / 4
+      : null;
+
+  if (
+    mode === "scalp" &&
+    bias === "long" &&
+    Number.isFinite(anomalyRank) &&
+    anomalyRank <= 3 &&
+    Number.isFinite(relativeBtcAcceleration) &&
+    relativeBtcAcceleration <= -0.39 &&
+    Number.isFinite(anomalyPriceOiGap) &&
+    anomalyPriceOiGap >= 0.36
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_long_catchup_anomaly",
+      "scalp long; anomaly rank <= 3; relative BTC acceleration <= -0.39%; anomaly price/OI gap >= 0.36",
+      "Scalp Long: catch-up anomaly"
+    );
+  }
+
+  const btcPriceOiPressure =
+    Number.isFinite(btcPrice60mPct) && Number.isFinite(btcOi60mPct)
+      ? btcPrice60mPct - btcOi60mPct
+      : null;
+  const breadthIgnition =
+    Number.isFinite(cryptoBreadth15mPct) && Number.isFinite(cryptoBreadth1hPct)
+      ? cryptoBreadth15mPct - cryptoBreadth1hPct
+      : null;
+
+  if (
+    mode === "scalp" &&
+    bias === "long" &&
+    Number.isFinite(btcPriceOiPressure) &&
+    btcPriceOiPressure <= -0.21 &&
+    Number.isFinite(breadthIgnition) &&
+    breadthIgnition >= 1.31
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_long_breadth_ignition_btc_positioning_pressure",
+      "scalp long; BTC price60 minus OI60 <= -0.21; breadth15 minus breadth1h >= 1.31 points",
+      "Scalp Long: breadth ignition + BTC positioning pressure"
+    );
+  }
+
+  const spotPerpAcceleration =
+    Number.isFinite(spotVsPerp15mPct) && Number.isFinite(spotVsPerp1hPct)
+      ? spotVsPerp15mPct - spotVsPerp1hPct / 4
+      : null;
+
+  if (
+    mode === "scalp" &&
+    bias === "short" &&
+    Number.isFinite(spotPerpAcceleration) &&
+    spotPerpAcceleration >= 0.20 &&
+    Number.isFinite(anomalyOiTrendDeviation) &&
+    anomalyOiTrendDeviation >= 0.34
+  ) {
+    addCandidateStamp(
+      stamps,
+      "candidate_scalp_short_spot_led_crowding_fade",
+      "scalp short; spot/perp acceleration >= 0.20; anomaly OI-trend deviation >= 0.34",
+      "Scalp Short: spot-led crowding fade"
+    );
+  }
 
   if (
     mode === "swing" &&
