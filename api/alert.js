@@ -11,7 +11,7 @@
 // - STATE SEEDING: always seed lastState; for swing/build mirror legacy lastState15m
 // - LEVERAGE RECO: rendered in message, and ALERT_MIN_LEVERAGE can hard-gate trades at render stage
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
-// - MANUAL TG V11: only the two validated Swing recipes remain live; weak Scalp routes are analytics-only
+// - MANUAL TG V13: add the validated merged Scalp Short and BTC-led long-build Swing Short routes; retain both prior Swing routes
 // - RANKED TELEGRAM: one message per qualifying recipe, with up to three ranked symbol alternatives
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
 // - ANALYTICS-ONLY DISCOVERY: retain demoted Scalp routes and track five pooled-side, horizon-aligned candidate states
@@ -44,7 +44,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v1_aggregate_deprecated_2026_07_06",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v12_swing_short_squeeze_suppression_2026_07_17",
+  premium_recipe_version: "manual_tg_recipes_v13_scalp_short_btc_led_swing_short_2026_07_29",
   candidate_stamp_version: "2026-07-17-pooled_side_horizon_candidates_v2",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
@@ -2628,6 +2628,52 @@ function isSendableTradeStamp(recipeStamp) {
   return label === "PREMIUM";
 }
 
+function isBtcLedSwingShortParent(ctx = {}) {
+  const breadth = asNum(ctx?.cryptoBreadth1hPct);
+  const btcPrice60 = asNum(ctx?.btc5mPrice60mPct);
+  const btcOi5 = asNum(ctx?.btc5mOi5mPct);
+  return (
+    Number.isFinite(breadth) &&
+    breadth >= 75 &&
+    breadth <= 95 &&
+    Number.isFinite(btcPrice60) &&
+    btcPrice60 >= 0.10 &&
+    Number.isFinite(btcOi5) &&
+    btcOi5 >= 0 &&
+    btcOi5 <= 0.05
+  );
+}
+
+function matchedScalpShortDiscoveryBranch(ctx = {}) {
+  const anomalyScore = asNum(ctx?.anomalyScore);
+  const btcPrice5 = asNum(ctx?.btc5mPrice5mPct);
+  const btcFunding30 = asNum(ctx?.btc5mFunding30mAvg);
+  const anomalyOiTrendDeviation = asNum(ctx?.anomalyOiTrendDeviation);
+  const oi15 = asNum(ctx?.oi15);
+
+  const branchA =
+    Number.isFinite(anomalyScore) &&
+    anomalyScore >= 1.25 &&
+    anomalyScore <= 2.00 &&
+    Number.isFinite(btcPrice5) &&
+    btcPrice5 >= -0.05 &&
+    Number.isFinite(btcFunding30) &&
+    btcFunding30 >= 0.000030;
+
+  if (branchA) return "moderate anomaly + elevated BTC funding";
+
+  const branchB =
+    Number.isFinite(anomalyOiTrendDeviation) &&
+    anomalyOiTrendDeviation >= 0.10 &&
+    anomalyOiTrendDeviation <= 0.15 &&
+    Number.isFinite(oi15) &&
+    oi15 >= 0 &&
+    oi15 <= 0.10;
+
+  if (branchB) return "moderate OI deviation + mild OI build";
+  return "";
+}
+
 
 const LIVE_MANUAL_RECIPES = Object.freeze([
   Object.freeze({
@@ -2672,11 +2718,70 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
       );
     },
     rankValue: (t) => asNum(t?.ctx?.symbolVsEth1hPct),
-    rankMetric: (t) => `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)}`,
+    rankMetric: (t) => {
+      const parent = isBtcLedSwingShortParent(t?.ctx) ? " | BTC-led priority regime" : "";
+      return `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)}${parent}`;
+    },
+    sendPriority: (t) => (isBtcLedSwingShortParent(t?.ctx) ? 0 : 100),
+    marketContext: (t) => {
+      const context = [
+        `Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`,
+        `BTC OI 60m ${fmtPct(t?.ctx?.btc5mOi60mPct, 3)}`,
+      ];
+      if (isBtcLedSwingShortParent(t?.ctx)) context.unshift("BTC-led Swing Short priority regime");
+      return context;
+    },
+  }),
+  Object.freeze({
+    id: "swing_btc_led_long_build_short",
+    mode: "swing",
+    side: "short",
+    profile: "Swing Short: BTC-led breadth regime + long-build fade",
+    managementHint: "Validate quickly; take partials by the due window and extend only with downside follow-through.",
+    matches: (t) =>
+      isBtcLedSwingShortParent(t?.ctx) &&
+      String(t?.ctx?.anomalyPattern || "").toLowerCase() === "long_build",
+    rankValue: (t) => asNum(t?.ctx?.anomalyRank),
+    rankMetric: (t) => {
+      const rank = asNum(t?.ctx?.anomalyRank);
+      return `${Number.isFinite(rank) ? `anomaly rank #${Math.round(rank)}` : "anomaly rank n/a"} | long build`;
+    },
+    sendPriority: () => 10,
     marketContext: (t) => [
       `Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`,
-      `BTC OI 60m ${fmtPct(t?.ctx?.btc5mOi60mPct, 3)}`,
+      `BTC price 60m ${fmtPct(t?.ctx?.btc5mPrice60mPct, 3)}`,
+      `BTC OI 5m ${fmtPct(t?.ctx?.btc5mOi5mPct, 3)}`,
     ],
+  }),
+  Object.freeze({
+    id: "scalp_moderate_anomaly_or_oi_build_short",
+    mode: "scalp",
+    side: "short",
+    profile: "Scalp Short: moderate anomaly or OI-build fade",
+    managementHint: "Use standard Scalp management; cover if downside follow-through stalls.",
+    matches: (t) => !!matchedScalpShortDiscoveryBranch(t?.ctx),
+    rankValue: (t) => asNum(t?.ctx?.anomalyRank),
+    rankMetric: (t) => {
+      const branch = matchedScalpShortDiscoveryBranch(t?.ctx);
+      const rank = asNum(t?.ctx?.anomalyRank);
+      const rankText = Number.isFinite(rank) ? `anomaly rank #${Math.round(rank)}` : "anomaly rank n/a";
+      return `${rankText} | ${branch}`;
+    },
+    marketContext: (t) => {
+      const branch = matchedScalpShortDiscoveryBranch(t?.ctx);
+      if (branch.startsWith("moderate anomaly")) {
+        return [
+          branch,
+          `BTC price 5m ${fmtPct(t?.ctx?.btc5mPrice5mPct, 3)}`,
+          `BTC funding 30m avg ${formatFundingRate(t?.ctx?.btc5mFunding30mAvg)}`,
+        ];
+      }
+      return [
+        branch,
+        `OI 15m ${fmtPct(t?.ctx?.oi15, 3)}`,
+        `OI trend deviation ${fmtPct(t?.ctx?.anomalyOiTrendDeviation, 3)}`,
+      ];
+    },
   }),
 ]);
 
@@ -4623,14 +4728,22 @@ async function buildDirectManualRecipeCandidates(item) {
 
   const anomalyCtx = getAnomalyEventFields(symbol);
   const probeCtx = {
+    anomalyScore: asNum(anomalyCtx.anomaly_score),
+    anomalyRank: asNum(anomalyCtx.anomaly_rank),
+    anomalyOiTrendDeviation: asNum(anomalyCtx.anomaly_oi_trend_deviation),
+    anomalyPattern: anomalyCtx.anomaly_pattern || "",
+    oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
+    btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
+    btc5mPrice60mPct: btcTapeContext?.price60mPct ?? null,
+    btc5mOi5mPct: btcTapeContext?.oi5mPct ?? null,
     btc5mOi15mPct: btcTapeContext?.oi15mPct ?? null,
     btc5mOi60mPct: btcTapeContext?.oi60mPct ?? null,
     btc5mFunding15mAvg: btcTapeContext?.funding15mAvg ?? null,
+    btc5mFunding30mAvg: btcTapeContext?.funding30mAvg ?? null,
     symbolVsBtc15mPct: item?.market_context?.symbol_vs_btc_15m_pct ?? null,
     symbolVsEth1hPct: item?.market_context?.symbol_vs_eth_1h_pct ?? null,
     cryptoBreadth1hPct: item?.market_context?.crypto_breadth_1h_pct ?? null,
     spotVsPerp1hPct: item?.market_structure?.spot_vs_perp_1h_pct ?? null,
-    anomalyPattern: anomalyCtx.anomaly_pattern || "",
   };
 
   const matchingRecipes = LIVE_MANUAL_RECIPES.filter((recipe) => {
@@ -4681,6 +4794,7 @@ async function buildDirectManualRecipeCandidates(item) {
       execReason: recipe.id,
       execDetail: {
         directRecipe: recipe.id,
+        directRecipeBranch: matchedScalpShortDiscoveryBranch(probeCtx) || "",
         rankValue: recipe.rankValue({ ctx: probeCtx }),
       },
       curState: stateInfo?.curState || null,
@@ -6123,6 +6237,7 @@ const telegramRows = analyticsEvents
   );
 
 
+const liveRecipeOrder = new Map(LIVE_MANUAL_RECIPES.map((recipe, index) => [recipe.id, index]));
 const telegramMessages = LIVE_MANUAL_RECIPES
   .map((recipe) => {
     const selections = recipeSelections.get(recipe.id) || [];
@@ -6135,7 +6250,15 @@ const telegramMessages = LIVE_MANUAL_RECIPES
       text,
     };
   })
-  .filter((group) => group.text && group.events.length > 0);
+  .filter((group) => group.text && group.events.length > 0)
+  .sort((a, b) => {
+    const ap = asNum(a?.recipe?.sendPriority?.(a?.selections?.[0]?.t));
+    const bp = asNum(b?.recipe?.sendPriority?.(b?.selections?.[0]?.t));
+    const aPriority = Number.isFinite(ap) ? ap : 100;
+    const bPriority = Number.isFinite(bp) ? bp : 100;
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    return (liveRecipeOrder.get(a.recipeId) ?? 999) - (liveRecipeOrder.get(b.recipeId) ?? 999);
+  });
 
 const telegramEvents = telegramMessages.flatMap((group) => group.events);
 const renderedTradeCount = telegramEvents.length;
