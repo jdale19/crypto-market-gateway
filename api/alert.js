@@ -2644,6 +2644,7 @@ function isBtcLedSwingShortParent(ctx = {}) {
   );
 }
 
+const SWING_BREADTH_FUNDING_ETH_LAG_SHORT_MIN_P5_PCT = -0.10;
 
 const LIVE_MANUAL_RECIPES = Object.freeze([
   Object.freeze({
@@ -2702,6 +2703,22 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     side: "short",
     profile: "Swing Short: strong breadth + moderate BTC funding + ETH-relative lag",
     managementHint: "Validate quickly; take partials by the due window and extend only with downside follow-through.",
+    executionGate: (t) => {
+      const p5 = asNum(t?._rawItem?.deltas?.["5m"]?.price_change_pct);
+      const minP5 = SWING_BREADTH_FUNDING_ETH_LAG_SHORT_MIN_P5_PCT;
+      if (!Number.isFinite(p5)) {
+        return {
+          ok: false,
+          reason: "swing_short_execution_p5_missing",
+          detail: { p5: null, minP5 },
+        };
+      }
+      return {
+        ok: p5 >= minP5,
+        reason: p5 >= minP5 ? "swing_short_execution_p5_ok" : "swing_short_execution_chase_block",
+        detail: { p5, minP5 },
+      };
+    },
     matches: (t) => {
       const breadth = asNum(t?.ctx?.cryptoBreadth1hPct);
       const btcFunding15 = asNum(t?.ctx?.btc5mFunding15mAvg);
@@ -2733,6 +2750,13 @@ const LIVE_MANUAL_RECIPE_BY_ID = new Map(LIVE_MANUAL_RECIPES.map((recipe) => [re
 
 function getLiveManualRecipe(recipeId) {
   return LIVE_MANUAL_RECIPE_BY_ID.get(String(recipeId || "")) || null;
+}
+
+function evaluateLiveManualRecipeExecutionGate(recipe, t) {
+  if (typeof recipe?.executionGate !== "function") {
+    return { ok: true, reason: "no_execution_gate", detail: null };
+  }
+  return recipe.executionGate(t);
 }
 
 function getRecipeShortlistSize() {
@@ -2855,7 +2879,11 @@ function computeRecipeStamp({ t, confidenceMeta, entryAtoms = {} }) {
     liveRecipe.side === bias &&
     liveRecipe.matches(t)
   ) {
-    return premiumStamp("PREMIUM", liveRecipe.id, liveRecipe.profile);
+    const executionGate = evaluateLiveManualRecipeExecutionGate(liveRecipe, t);
+    if (executionGate.ok) {
+      return premiumStamp("PREMIUM", liveRecipe.id, liveRecipe.profile);
+    }
+    return { label: "", emoji: "", reason: executionGate.reason, profile: liveRecipe.profile };
   }
 
   if (confidenceMeta?.selectorAllowed === false) {
@@ -4692,10 +4720,33 @@ async function buildDirectManualRecipeCandidates(item) {
     spotVsPerp1hPct: item?.market_structure?.spot_vs_perp_1h_pct ?? null,
   };
 
-  const matchingRecipes = LIVE_MANUAL_RECIPES.filter((recipe) => {
+  const parentMatchingRecipes = LIVE_MANUAL_RECIPES.filter((recipe) => {
     if (!modes.includes(recipe.mode)) return false;
     return recipe.matches({ mode: recipe.mode, bias: recipe.side, execReason: recipe.id, ctx: probeCtx });
   });
+
+  const matchingRecipes = [];
+  for (const recipe of parentMatchingRecipes) {
+    const executionGate = evaluateLiveManualRecipeExecutionGate(recipe, {
+      mode: recipe.mode,
+      bias: recipe.side,
+      execReason: recipe.id,
+      _rawItem: item,
+      ctx: probeCtx,
+    });
+    if (!executionGate.ok) {
+      if (debug) {
+        skipped.push({
+          symbol,
+          mode: recipe.mode,
+          reason: executionGate.reason,
+          detail: { recipe: recipe.id, ...(executionGate.detail || {}) },
+        });
+      }
+      continue;
+    }
+    matchingRecipes.push(recipe);
+  }
 
   if (matchingRecipes.length === 0) return [];
 
