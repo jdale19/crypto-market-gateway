@@ -44,7 +44,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v3_gmx_equity_perps_since_close_2026_09_07",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v14_scalp_long_swing_short_refresh_2026_08_22",
+  premium_recipe_version: "manual_tg_recipes_v15_quality_refresh_2026_09_07",
   candidate_stamp_version: "2026-07-17-pooled_side_horizon_candidates_v2",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
@@ -2919,50 +2919,71 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     id: "swing_eth_relative_weakness_btc_funding_long",
     mode: "swing",
     side: "long",
-    profile: "Swing Long: ETH-relative washout + elevated BTC funding",
+    profile: "Swing Long: deeper ETH-relative washout + elevated BTC funding + off-RTH",
     managementHint: "Harvest at the due-window move; runner only with clean follow-through.",
     matches: (t) => {
       const vsEth1h = asNum(t?.ctx?.symbolVsEth1hPct);
       const btcFunding15 = asNum(t?.ctx?.btc5mFunding15mAvg);
+      const isUsEquityRth = t?.ctx?.isUsEquityRth;
       return (
         Number.isFinite(vsEth1h) &&
-        vsEth1h <= -0.35 &&
+        vsEth1h <= -0.50 &&
         Number.isFinite(btcFunding15) &&
-        btcFunding15 >= 0.00008
+        btcFunding15 >= 0.00008 &&
+        isUsEquityRth === false
       );
     },
     rankValue: (t) => asNum(t?.ctx?.symbolVsEth1hPct),
     rankMetric: (t) => `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)}`,
-    marketContext: (t) => [`BTC funding 15m avg ${formatFundingRate(t?.ctx?.btc5mFunding15mAvg)}`],
+    marketContext: (t) => [
+      `BTC funding 15m avg ${formatFundingRate(t?.ctx?.btc5mFunding15mAvg)}`,
+      "US equities off-RTH",
+    ],
   }),
   Object.freeze({
-    id: "scalp_basket_funding_price_oi_gap_ranked_long",
+    id: "scalp_long_ethbtc_lag_anomaly_rebound",
     mode: "scalp",
     side: "long",
-    profile: "Scalp Long: moderate basket funding + ranked price/OI dislocation",
+    profile: "Scalp Long: ETH/BTC lag anomaly rebound (weekday)",
     managementHint: "Use standard Scalp management; exit if follow-through stalls.",
     matches: (t) => {
-      const basketFunding = asNum(t?.ctx?.anomalyBasketFundingRate);
-      const priceOiGap = asNum(t?.ctx?.anomalyPriceOiGap);
-      const anomalyRank = asNum(t?.ctx?.anomalyRank);
+      const anomalyScore = asNum(t?.ctx?.anomalyScore);
+      const symbolVsBtc15mPct = asNum(t?.ctx?.symbolVsBtc15mPct);
+      const symbolVsEth15mPct = asNum(t?.ctx?.symbolVsEth15mPct);
+      const btcPrice5mPct = asNum(t?.ctx?.btc5mPrice5mPct);
+      const isWeekendEt = t?.ctx?.isWeekendEt;
+      const ethVsBtc15mLag =
+        Number.isFinite(symbolVsBtc15mPct) && Number.isFinite(symbolVsEth15mPct)
+          ? symbolVsBtc15mPct - symbolVsEth15mPct
+          : null;
       return (
-        Number.isFinite(basketFunding) &&
-        basketFunding >= 0.000020 &&
-        basketFunding <= 0.000050 &&
-        Number.isFinite(priceOiGap) &&
-        priceOiGap >= 0.20 &&
-        Number.isFinite(anomalyRank) &&
-        anomalyRank <= 5
+        Number.isFinite(anomalyScore) &&
+        anomalyScore >= 1.30 &&
+        Number.isFinite(ethVsBtc15mLag) &&
+        ethVsBtc15mLag <= -0.04 &&
+        Number.isFinite(btcPrice5mPct) &&
+        btcPrice5mPct >= 0 &&
+        isWeekendEt === false
       );
     },
-    rankValue: (t) => asNum(t?.ctx?.anomalyRank),
+    rankValue: (t) => {
+      const symbolVsBtc15mPct = asNum(t?.ctx?.symbolVsBtc15mPct);
+      const symbolVsEth15mPct = asNum(t?.ctx?.symbolVsEth15mPct);
+      return Number.isFinite(symbolVsBtc15mPct) && Number.isFinite(symbolVsEth15mPct)
+        ? symbolVsBtc15mPct - symbolVsEth15mPct
+        : null;
+    },
     rankMetric: (t) => {
-      const rank = asNum(t?.ctx?.anomalyRank);
-      const rankText = Number.isFinite(rank) ? `anomaly rank #${Math.round(rank)}` : "anomaly rank n/a";
-      return `${rankText} | price/OI gap ${fmtPct(t?.ctx?.anomalyPriceOiGap, 3)}`;
+      const symbolVsBtc15mPct = asNum(t?.ctx?.symbolVsBtc15mPct);
+      const symbolVsEth15mPct = asNum(t?.ctx?.symbolVsEth15mPct);
+      const lag = Number.isFinite(symbolVsBtc15mPct) && Number.isFinite(symbolVsEth15mPct)
+        ? symbolVsBtc15mPct - symbolVsEth15mPct
+        : null;
+      return `ETH/BTC lag ${fmtPct(lag, 3)} | anomaly ${Number(asNum(t?.ctx?.anomalyScore)).toFixed(2)}`;
     },
     marketContext: (t) => [
-      `Basket funding ${formatFundingRate(t?.ctx?.anomalyBasketFundingRate)}`,
+      `BTC 5m ${fmtPct(t?.ctx?.btc5mPrice5mPct, 3)}`,
+      "Weekday",
     ],
   }),
   Object.freeze({
@@ -3002,6 +3023,7 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
         Number.isFinite(vsEth1h) &&
         vsEth1h <= 0 &&
         anomalyPattern !== "short_squeeze" &&
+        anomalyPattern !== "long_build" &&
         !isBtcLedSwingShortParent(t?.ctx)
       );
     },
@@ -4967,6 +4989,7 @@ async function buildDirectManualRecipeCandidates(item) {
   if (!instId || !Number.isFinite(price)) return [];
 
   const anomalyCtx = getAnomalyEventFields(symbol);
+  const etSession = getEtSessionTelemetry(Date.now());
   const probeCtx = {
     anomalyScore: asNum(anomalyCtx.anomaly_score),
     anomalyRank: asNum(anomalyCtx.anomaly_rank),
@@ -4982,7 +5005,10 @@ async function buildDirectManualRecipeCandidates(item) {
     btc5mOi60mPct: btcTapeContext?.oi60mPct ?? null,
     btc5mFunding15mAvg: btcTapeContext?.funding15mAvg ?? null,
     btc5mFunding30mAvg: btcTapeContext?.funding30mAvg ?? null,
+    isWeekendEt: etSession.is_weekend_et,
+    isUsEquityRth: etSession.is_us_equity_rth,
     symbolVsBtc15mPct: item?.market_context?.symbol_vs_btc_15m_pct ?? null,
+    symbolVsEth15mPct: item?.market_context?.symbol_vs_eth_15m_pct ?? null,
     symbolVsEth1hPct: item?.market_context?.symbol_vs_eth_1h_pct ?? null,
     cryptoBreadth1hPct: item?.market_context?.crypto_breadth_1h_pct ?? null,
     spotVsPerp1hPct: item?.market_structure?.spot_vs_perp_1h_pct ?? null,
@@ -5131,7 +5157,8 @@ async function buildDirectManualRecipeCandidates(item) {
         btc5mFunding15mAvg: btcTapeContext?.funding15mAvg ?? null,
         btc5mFunding30mAvg: btcTapeContext?.funding30mAvg ?? null,
         btcTapeState: String(btcTapeContext?.tapeState || "neutral"),
-        isUsEquityRth: getEtSessionTelemetry(Date.now()).is_us_equity_rth,
+        isUsEquityRth: etSession.is_us_equity_rth,
+        isWeekendEt: etSession.is_weekend_et,
         symbolVsBtc15mPct: item?.market_context?.symbol_vs_btc_15m_pct ?? null,
         symbolVsBtc1hPct: item?.market_context?.symbol_vs_btc_1h_pct ?? null,
         symbolVsEth15mPct: item?.market_context?.symbol_vs_eth_15m_pct ?? null,
