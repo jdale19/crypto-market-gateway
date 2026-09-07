@@ -17,7 +17,7 @@
 // - ANALYTICS-ONLY DISCOVERY: retain demoted Scalp routes and track five pooled-side, horizon-aligned candidate states
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
 // - ANALYTICS POSTING: report posted/throttled/failed webhook health in heartbeat and debug output
-// - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y telemetry is capture-only
+// - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y plus GMX 24/7 SPY/QQQ perp telemetry is capture-only
 // - TWO-COHORT ANALYTICS: Random is sampled before any candidate/selector gate; Fired is persisted only for Premium alerts successfully sent to Telegram. Candidate/Premium metadata remain fields, never cohorts.
 //
 // Notes:
@@ -41,7 +41,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   selector_version: "selector_v3_2_external_aggregate_deprecated_2026_07_06",
   confidence_version: "confidence_v2_1_external_aggregate_deprecated_2026_07_06",
   trade_read_version: "trade_read_v1_1_external_aggregate_deprecated_2026_07_06",
-  ext_context_version: "external_telemetry_v1_aggregate_deprecated_2026_07_06",
+  ext_context_version: "external_telemetry_v3_gmx_equity_perps_since_close_2026_09_07",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
   premium_recipe_version: "manual_tg_recipes_v14_scalp_long_swing_short_refresh_2026_08_22",
@@ -352,7 +352,7 @@ minRangePctByMode: {
     ) === "1",
     timeoutMs: Number(process.env.ALERT_EXTERNAL_TELEMETRY_TIMEOUT_MS || 2500),
     cacheTtlSeconds: Number(process.env.ALERT_EXTERNAL_TELEMETRY_CACHE_TTL_SECONDS || 300),
-    cacheKey: String(process.env.ALERT_EXTERNAL_TELEMETRY_CACHE_KEY || "alert:externalTelemetry:v1"),
+    cacheKey: String(process.env.ALERT_EXTERNAL_TELEMETRY_CACHE_KEY || "alert:externalTelemetry:v3"),
     yahooChartBaseUrl: String(
       process.env.ALERT_EXTERNAL_TELEMETRY_YAHOO_CHART_BASE_URL ||
       "https://query1.finance.yahoo.com/v8/finance/chart"
@@ -371,6 +371,24 @@ minRangePctByMode: {
       process.env.ALERT_EXTERNAL_TELEMETRY_US2Y_URL_TEMPLATE ||
       "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}"
     ),
+    // Capture-only 24/7 equity-index perp telemetry. GMX Arbitrum exposes
+    // public oracle candles for SPY and QQQ even outside US cash-market hours.
+    // These fields are intentionally not wired into selectors or Premium routes.
+    gmxEquityPerpsEnabled:
+      String(process.env.ALERT_EXTERNAL_TELEMETRY_GMX_EQUITY_PERPS_ENABLED || "1") === "1",
+    gmxOracleBaseUrl: String(
+      process.env.ALERT_EXTERNAL_TELEMETRY_GMX_ORACLE_BASE_URL ||
+      "https://arbitrum-api.gmxinfra.io"
+    ).replace(/\/$/, ""),
+    gmxEquityPerpSymbols: {
+      spy: String(process.env.ALERT_EXTERNAL_TELEMETRY_GMX_SPY_SYMBOL || "SPY"),
+      qqq: String(process.env.ALERT_EXTERNAL_TELEMETRY_GMX_QQQ_SYMBOL || "QQQ"),
+    },
+    // Keep enough 5m history to span the last US cash close through a long weekend.
+    // 1200 candles = 100 hours; still well below GMX's documented 10,000-candle max.
+    gmxEquityPerpCandleLimit: Math.max(900, Math.min(2000, Number(
+      process.env.ALERT_EXTERNAL_TELEMETRY_GMX_CANDLE_LIMIT || 1200
+    ))),
   },
 
   anomaly: {
@@ -851,6 +869,188 @@ function buildTreasuryUs2yUrl() {
   return template.replaceAll("{year}", String(new Date().getUTCFullYear()));
 }
 
+function buildGmxEquityPerpCandlesUrl(symbol) {
+  const baseUrl = CFG.externalTelemetry.gmxOracleBaseUrl;
+  const encodedSymbol = encodeURIComponent(String(symbol || ""));
+  const limit = CFG.externalTelemetry.gmxEquityPerpCandleLimit;
+  return `${baseUrl}/prices/candles?tokenSymbol=${encodedSymbol}&period=5m&limit=${limit}`;
+}
+
+
+function getNewYorkDateParts(epochMs) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(epochMs));
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return {
+    year: Number(map.year),
+    month: Number(map.month),
+    day: Number(map.day),
+    hour: Number(map.hour),
+    minute: Number(map.minute),
+    second: Number(map.second),
+  };
+}
+
+function getNewYorkUtcOffsetMs(epochMs) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    timeZoneName: "shortOffset",
+    year: "numeric",
+  }).formatToParts(new Date(epochMs));
+  const raw = parts.find((p) => p.type === "timeZoneName")?.value || "GMT-5";
+  const match = raw.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/i);
+  if (!match) return -5 * 60 * 60 * 1000;
+  const sign = match[1] === "+" ? 1 : -1;
+  const minutes = Number(match[2]) * 60 + Number(match[3] || 0);
+  return sign * minutes * 60 * 1000;
+}
+
+function newYorkLocalToEpochMs(year, month, day, hour = 16, minute = 0) {
+  const guess = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const offsetMs = getNewYorkUtcOffsetMs(guess);
+  return guess - offsetMs;
+}
+
+function nthWeekdayOfMonth(year, month, weekday, nth) {
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const delta = (weekday - first.getUTCDay() + 7) % 7;
+  return 1 + delta + (nth - 1) * 7;
+}
+
+function lastWeekdayOfMonth(year, month, weekday) {
+  const last = new Date(Date.UTC(year, month, 0));
+  const delta = (last.getUTCDay() - weekday + 7) % 7;
+  return last.getUTCDate() - delta;
+}
+
+function observedFixedHoliday(year, month, day) {
+  const date = new Date(Date.UTC(year, month - 1, day));
+  const dow = date.getUTCDay();
+  if (dow === 6) date.setUTCDate(date.getUTCDate() - 1);
+  if (dow === 0) date.setUTCDate(date.getUTCDate() + 1);
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
+}
+
+function easterSundayUTC(year) {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function isNyseFullDayHoliday(year, month, day) {
+  const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  const fixed = [
+    observedFixedHoliday(year, 1, 1),
+    observedFixedHoliday(year, 6, 19),
+    observedFixedHoliday(year, 7, 4),
+    observedFixedHoliday(year, 12, 25),
+  ].map((d) => `${d.year}-${String(d.month).padStart(2, "0")}-${String(d.day).padStart(2, "0")}`);
+  if (fixed.includes(key)) return true;
+  if (month === 1 && day === nthWeekdayOfMonth(year, 1, 1, 3)) return true; // MLK
+  if (month === 2 && day === nthWeekdayOfMonth(year, 2, 1, 3)) return true; // Presidents
+  if (month === 5 && day === lastWeekdayOfMonth(year, 5, 1)) return true; // Memorial
+  if (month === 9 && day === nthWeekdayOfMonth(year, 9, 1, 1)) return true; // Labor
+  if (month === 11 && day === nthWeekdayOfMonth(year, 11, 4, 4)) return true; // Thanksgiving
+  const easter = easterSundayUTC(year);
+  easter.setUTCDate(easter.getUTCDate() - 2);
+  if (month === easter.getUTCMonth() + 1 && day === easter.getUTCDate()) return true; // Good Friday
+  return false;
+}
+
+function lastUsCashCloseEpochMs(nowMs = Date.now()) {
+  const ny = getNewYorkDateParts(nowMs);
+  const baseDate = new Date(Date.UTC(ny.year, ny.month - 1, ny.day));
+  for (let back = 0; back < 7; back += 1) {
+    const d = new Date(baseDate.getTime() - back * 24 * 60 * 60 * 1000);
+    const dow = d.getUTCDay();
+    if (dow === 0 || dow === 6) continue;
+    if (isNyseFullDayHoliday(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate())) continue;
+    const closeMs = newYorkLocalToEpochMs(
+      d.getUTCFullYear(),
+      d.getUTCMonth() + 1,
+      d.getUTCDate(),
+      16,
+      0
+    );
+    if (closeMs <= nowMs) return closeMs;
+  }
+  return null;
+}
+
+function parseGmxEquityPerpTelemetry(payload, nowMs = Date.now()) {
+  const rawCandles = Array.isArray(payload?.candles) ? payload.candles : [];
+  const candles = rawCandles
+    .map((row) => {
+      if (!Array.isArray(row) || row.length < 5) return null;
+      const timestamp = Number(row[0]);
+      const close = Number(row[4]);
+      if (!Number.isFinite(timestamp) || !Number.isFinite(close) || close <= 0) return null;
+      return { timestamp, close };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  if (!candles.length) throw new Error("gmx_equity_perp_candles_missing");
+
+  const latest = candles[candles.length - 1];
+  const pctAtSeconds = (seconds) => {
+    const target = latest.timestamp - seconds;
+    let reference = null;
+    for (let i = candles.length - 1; i >= 0; i -= 1) {
+      if (candles[i].timestamp <= target) {
+        reference = candles[i];
+        break;
+      }
+    }
+    return reference ? computePctChange(latest.close, reference.close) : null;
+  };
+
+  const cashCloseMs = lastUsCashCloseEpochMs(nowMs);
+  let cashCloseReference = null;
+  if (Number.isFinite(cashCloseMs)) {
+    const cashCloseSec = Math.floor(cashCloseMs / 1000);
+    for (let i = candles.length - 1; i >= 0; i -= 1) {
+      if (candles[i].timestamp <= cashCloseSec) {
+        cashCloseReference = candles[i];
+        break;
+      }
+    }
+  }
+
+  return {
+    price: latest.close,
+    updatedAt: latest.timestamp * 1000,
+    pct15m: pctAtSeconds(15 * 60),
+    pct1h: pctAtSeconds(60 * 60),
+    pct4h: pctAtSeconds(4 * 60 * 60),
+    pct24h: pctAtSeconds(24 * 60 * 60),
+    sinceRthClosePct: cashCloseReference
+      ? computePctChange(latest.close, cashCloseReference.close)
+      : null,
+    rthCloseAt: Number.isFinite(cashCloseMs) ? cashCloseMs : null,
+  };
+}
+
 function buildExternalTelemetrySummary(ctx = {}) {
   const source = ctx?.source || {};
   const labels = [
@@ -860,6 +1060,8 @@ function buildExternalTelemetrySummary(ctx = {}) {
     `qqq:${source.qqq || "missing"}`,
     `spx:${source.spx || "missing"}`,
     `us2y:${source.us2y || "missing"}`,
+    `spy_perp:${source.spyPerp || "missing"}`,
+    `qqq_perp:${source.qqqPerp || "missing"}`,
   ];
   return `telemetry_only|${labels.join(",")}`;
 }
@@ -891,6 +1093,24 @@ async function loadExternalTelemetry() {
     qqqDayPct: null,
     spxDayPct: null,
     us2yDelta: null,
+    equityPerpOk: false,
+    equityPerpReason: null,
+    equityPerpSource: "gmx_arbitrum_oracle",
+    spyPerpPrice: null,
+    spyPerp15mPct: null,
+    spyPerp1hPct: null,
+    spyPerp4hPct: null,
+    spyPerp24hPct: null,
+    spyPerpSinceRthClosePct: null,
+    spyPerpUpdatedAt: null,
+    qqqPerpPrice: null,
+    qqqPerp15mPct: null,
+    qqqPerp1hPct: null,
+    qqqPerp4hPct: null,
+    qqqPerp24hPct: null,
+    qqqPerpSinceRthClosePct: null,
+    qqqPerpUpdatedAt: null,
+    equityPerpRthCloseAt: null,
     reason: null,
     source: {
       coin: "yahoo_chart",
@@ -899,6 +1119,8 @@ async function loadExternalTelemetry() {
       qqq: "yahoo_chart",
       spx: "yahoo_chart",
       us2y: "treasury_xml",
+      spyPerp: "gmx_arbitrum_oracle",
+      qqqPerp: "gmx_arbitrum_oracle",
     },
     fetchedAt: Date.now(),
     cache: "miss",
@@ -923,6 +1145,14 @@ async function loadExternalTelemetry() {
     ["us2y", () => fetchTextWithTimeout(buildTreasuryUs2yUrl(), timeoutMs).then(parseTreasuryUs2yDelta)],
   ];
 
+  if (CFG.externalTelemetry.gmxEquityPerpsEnabled) {
+    const perpSymbols = CFG.externalTelemetry.gmxEquityPerpSymbols || {};
+    tasks.push(
+      ["spyPerp", () => fetchJsonWithTimeout(buildGmxEquityPerpCandlesUrl(perpSymbols.spy), timeoutMs).then(parseGmxEquityPerpTelemetry)],
+      ["qqqPerp", () => fetchJsonWithTimeout(buildGmxEquityPerpCandlesUrl(perpSymbols.qqq), timeoutMs).then(parseGmxEquityPerpTelemetry)]
+    );
+  }
+
   const settled = await Promise.allSettled(tasks.map(([_, run]) => run()));
   const metricMap = Object.fromEntries(tasks.map(([label], index) => [label, settled[index]]));
 
@@ -937,19 +1167,53 @@ async function loadExternalTelemetry() {
   assign("spx", "spxDayPct");
   assign("us2y", "us2yDelta");
 
+  const assignPerp = (label, prefix) => {
+    const result = metricMap[label];
+    if (result?.status !== "fulfilled" || !result.value || typeof result.value !== "object") return;
+    const value = result.value;
+    out[`${prefix}PerpPrice`] = Number.isFinite(value.price) ? value.price : null;
+    out[`${prefix}Perp15mPct`] = Number.isFinite(value.pct15m) ? value.pct15m : null;
+    out[`${prefix}Perp1hPct`] = Number.isFinite(value.pct1h) ? value.pct1h : null;
+    out[`${prefix}Perp4hPct`] = Number.isFinite(value.pct4h) ? value.pct4h : null;
+    out[`${prefix}Perp24hPct`] = Number.isFinite(value.pct24h) ? value.pct24h : null;
+    out[`${prefix}PerpSinceRthClosePct`] = Number.isFinite(value.sinceRthClosePct)
+      ? value.sinceRthClosePct
+      : null;
+    out[`${prefix}PerpUpdatedAt`] = Number.isFinite(value.updatedAt) ? value.updatedAt : null;
+    if (Number.isFinite(value.rthCloseAt)) out.equityPerpRthCloseAt = value.rthCloseAt;
+  };
+  assignPerp("spyPerp", "spy");
+  assignPerp("qqqPerp", "qqq");
+
+  if (!CFG.externalTelemetry.gmxEquityPerpsEnabled) {
+    out.equityPerpReason = "disabled";
+  } else {
+    const perpFailures = ["spyPerp", "qqqPerp"]
+      .filter((label) => {
+        const result = metricMap[label];
+        return !(result?.status === "fulfilled" && result.value &&
+          Number.isFinite(result.value.price) && Number.isFinite(result.value.pct15m) &&
+          Number.isFinite(result.value.pct1h) && Number.isFinite(result.value.pct4h) &&
+          Number.isFinite(result.value.pct24h));
+      })
+      .map((label) => metricFailureReason(label, metricMap[label]));
+    out.equityPerpOk = perpFailures.length === 0;
+    out.equityPerpReason = out.equityPerpOk
+      ? "ok"
+      : `partial|${perpFailures.join("|") || "missing"}`;
+  }
+
   const required = ["coinDayPct", "vixDayPct", "dxyDayPct", "qqqDayPct", "spxDayPct", "us2yDelta"];
-  const failures = tasks
-    .filter(([label], index) => {
-      const outputKey = {
-        coin: "coinDayPct",
-        vix: "vixDayPct",
-        dxy: "dxyDayPct",
-        qqq: "qqqDayPct",
-        spx: "spxDayPct",
-        us2y: "us2yDelta",
-      }[label];
-      return !Number.isFinite(out[outputKey]);
-    })
+  const legacyMetricOutputKeys = {
+    coin: "coinDayPct",
+    vix: "vixDayPct",
+    dxy: "dxyDayPct",
+    qqq: "qqqDayPct",
+    spx: "spxDayPct",
+    us2y: "us2yDelta",
+  };
+  const failures = Object.entries(legacyMetricOutputKeys)
+    .filter(([_, outputKey]) => !Number.isFinite(out[outputKey]))
     .map(([label]) => metricFailureReason(label, metricMap[label]));
 
   out.ok = required.every((key) => Number.isFinite(out[key]));
@@ -4832,6 +5096,24 @@ async function buildDirectManualRecipeCandidates(item) {
         qqqDayPct: externalTelemetry?.qqqDayPct ?? null,
         spxDayPct: externalTelemetry?.spxDayPct ?? null,
         us2yDelta: externalTelemetry?.us2yDelta ?? null,
+        equityPerpOk: !!externalTelemetry?.equityPerpOk,
+        equityPerpReason: externalTelemetry?.equityPerpReason ?? null,
+        equityPerpSource: externalTelemetry?.equityPerpSource ?? null,
+        spyPerpPrice: externalTelemetry?.spyPerpPrice ?? null,
+        spyPerp15mPct: externalTelemetry?.spyPerp15mPct ?? null,
+        spyPerp1hPct: externalTelemetry?.spyPerp1hPct ?? null,
+        spyPerp4hPct: externalTelemetry?.spyPerp4hPct ?? null,
+        spyPerp24hPct: externalTelemetry?.spyPerp24hPct ?? null,
+        spyPerpSinceRthClosePct: externalTelemetry?.spyPerpSinceRthClosePct ?? null,
+        spyPerpUpdatedAt: externalTelemetry?.spyPerpUpdatedAt ?? null,
+        qqqPerpPrice: externalTelemetry?.qqqPerpPrice ?? null,
+        qqqPerp15mPct: externalTelemetry?.qqqPerp15mPct ?? null,
+        qqqPerp1hPct: externalTelemetry?.qqqPerp1hPct ?? null,
+        qqqPerp4hPct: externalTelemetry?.qqqPerp4hPct ?? null,
+        qqqPerp24hPct: externalTelemetry?.qqqPerp24hPct ?? null,
+        qqqPerpSinceRthClosePct: externalTelemetry?.qqqPerpSinceRthClosePct ?? null,
+        qqqPerpUpdatedAt: externalTelemetry?.qqqPerpUpdatedAt ?? null,
+        equityPerpRthCloseAt: externalTelemetry?.equityPerpRthCloseAt ?? null,
         btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
         btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
         btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
@@ -4984,6 +5266,24 @@ async function evaluateCandidate({
         qqqDayPct: externalTelemetry?.qqqDayPct ?? null,
         spxDayPct: externalTelemetry?.spxDayPct ?? null,
         us2yDelta: externalTelemetry?.us2yDelta ?? null,
+        equityPerpOk: !!externalTelemetry?.equityPerpOk,
+        equityPerpReason: externalTelemetry?.equityPerpReason ?? null,
+        equityPerpSource: externalTelemetry?.equityPerpSource ?? null,
+        spyPerpPrice: externalTelemetry?.spyPerpPrice ?? null,
+        spyPerp15mPct: externalTelemetry?.spyPerp15mPct ?? null,
+        spyPerp1hPct: externalTelemetry?.spyPerp1hPct ?? null,
+        spyPerp4hPct: externalTelemetry?.spyPerp4hPct ?? null,
+        spyPerp24hPct: externalTelemetry?.spyPerp24hPct ?? null,
+        spyPerpSinceRthClosePct: externalTelemetry?.spyPerpSinceRthClosePct ?? null,
+        spyPerpUpdatedAt: externalTelemetry?.spyPerpUpdatedAt ?? null,
+        qqqPerpPrice: externalTelemetry?.qqqPerpPrice ?? null,
+        qqqPerp15mPct: externalTelemetry?.qqqPerp15mPct ?? null,
+        qqqPerp1hPct: externalTelemetry?.qqqPerp1hPct ?? null,
+        qqqPerp4hPct: externalTelemetry?.qqqPerp4hPct ?? null,
+        qqqPerp24hPct: externalTelemetry?.qqqPerp24hPct ?? null,
+        qqqPerpSinceRthClosePct: externalTelemetry?.qqqPerpSinceRthClosePct ?? null,
+        qqqPerpUpdatedAt: externalTelemetry?.qqqPerpUpdatedAt ?? null,
+        equityPerpRthCloseAt: externalTelemetry?.equityPerpRthCloseAt ?? null,
         btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
         btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
         btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
@@ -5932,6 +6232,24 @@ dxy_day_pct: t?.ctx?.dxyDayPct ?? "",
 qqq_day_pct: t?.ctx?.qqqDayPct ?? "",
 spx_day_pct: t?.ctx?.spxDayPct ?? "",
 us2y_delta: t?.ctx?.us2yDelta ?? "",
+equity_perp_ok: !!t?.ctx?.equityPerpOk,
+equity_perp_reason: t?.ctx?.equityPerpReason || "",
+equity_perp_source: t?.ctx?.equityPerpSource || "",
+spy_perp_price: t?.ctx?.spyPerpPrice ?? "",
+spy_perp_15m_pct: t?.ctx?.spyPerp15mPct ?? "",
+spy_perp_1h_pct: t?.ctx?.spyPerp1hPct ?? "",
+spy_perp_4h_pct: t?.ctx?.spyPerp4hPct ?? "",
+spy_perp_24h_pct: t?.ctx?.spyPerp24hPct ?? "",
+spy_perp_since_rth_close_pct: t?.ctx?.spyPerpSinceRthClosePct ?? "",
+spy_perp_updated_at: t?.ctx?.spyPerpUpdatedAt ?? "",
+qqq_perp_price: t?.ctx?.qqqPerpPrice ?? "",
+qqq_perp_15m_pct: t?.ctx?.qqqPerp15mPct ?? "",
+qqq_perp_1h_pct: t?.ctx?.qqqPerp1hPct ?? "",
+qqq_perp_4h_pct: t?.ctx?.qqqPerp4hPct ?? "",
+qqq_perp_24h_pct: t?.ctx?.qqqPerp24hPct ?? "",
+qqq_perp_since_rth_close_pct: t?.ctx?.qqqPerpSinceRthClosePct ?? "",
+qqq_perp_updated_at: t?.ctx?.qqqPerpUpdatedAt ?? "",
+equity_perp_rth_close_at: t?.ctx?.equityPerpRthCloseAt ?? "",
 btc_5m_price_5m_pct: t?.ctx?.btc5mPrice5mPct ?? "",
 btc_5m_price_15m_pct: t?.ctx?.btc5mPrice15mPct ?? "",
 btc_5m_price_30m_pct: t?.ctx?.btc5mPrice30mPct ?? "",
@@ -6113,6 +6431,24 @@ const telegramRowFields = [
   "qqq_day_pct",
   "spx_day_pct",
   "us2y_delta",
+  "equity_perp_ok",
+  "equity_perp_reason",
+  "equity_perp_source",
+  "spy_perp_price",
+  "spy_perp_15m_pct",
+  "spy_perp_1h_pct",
+  "spy_perp_4h_pct",
+  "spy_perp_24h_pct",
+  "spy_perp_since_rth_close_pct",
+  "spy_perp_updated_at",
+  "qqq_perp_price",
+  "qqq_perp_15m_pct",
+  "qqq_perp_1h_pct",
+  "qqq_perp_4h_pct",
+  "qqq_perp_24h_pct",
+  "qqq_perp_since_rth_close_pct",
+  "qqq_perp_updated_at",
+  "equity_perp_rth_close_at",
   "btc_5m_price_5m_pct",
   "btc_5m_price_15m_pct",
   "btc_5m_price_30m_pct",
