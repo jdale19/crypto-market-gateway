@@ -1534,10 +1534,14 @@ function getEtSessionTelemetry(ts = Date.now()) {
 
     const minuteOfDay = hour * 60 + minute;
     const isWeekend = weekdayNum === 0 || weekdayNum === 6;
-    const isRth = !isWeekend && minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 16 * 60;
+    const ny = getNewYorkDateParts(date.getTime());
+    const isFullDayHoliday = !isWeekend && isNyseFullDayHoliday(ny.year, ny.month, ny.day);
+    const isRth = !isWeekend && !isFullDayHoliday &&
+      minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 16 * 60;
 
     let session = "overnight";
     if (isWeekend) session = "weekend";
+    else if (isFullDayHoliday) session = "holiday";
     else if (isRth) session = "regular";
     else if (minuteOfDay >= 4 * 60 && minuteOfDay < 9 * 60 + 30) session = "pre_market";
     else if (minuteOfDay >= 16 * 60 && minuteOfDay < 20 * 60) session = "after_hours";
