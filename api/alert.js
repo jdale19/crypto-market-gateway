@@ -17,7 +17,7 @@
 // - ANALYTICS-ONLY DISCOVERY: retain demoted Scalp routes and track five pooled-side, horizon-aligned candidate states
 // - PREMIUM SUPPRESSION: former Liquidity Snap Long and BTC/breadth washout pilots are analytics-only; weak Swing Long continuation/breakout and BTC OI compression stay blocked
 // - ANALYTICS POSTING: report posted/throttled/failed webhook health in heartbeat and debug output
-// - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y plus GMX 24/7 SPY/QQQ perp telemetry is capture-only
+// - EXTERNAL TELEMETRY: legacy side-aware aggregate is deprecated; raw COIN/VIX/DXY/QQQ/SPX/US2Y plus GMX 24/7 SPY/QQQ perp telemetry is persisted; validated recipes may use explicit raw fields
 // - TWO-COHORT ANALYTICS: Random is sampled before any candidate/selector gate; Fired is persisted only for Premium alerts successfully sent to Telegram. Candidate/Premium metadata remain fields, never cohorts.
 //
 // Notes:
@@ -2912,32 +2912,45 @@ function isBtcLedSwingShortParent(ctx = {}) {
   );
 }
 
+function isBtcQqqRiskOnExhaustionShortParent(ctx = {}) {
+  const btcPrice60 = asNum(ctx?.btc5mPrice60mPct);
+  const qqqDay = asNum(ctx?.qqqDayPct);
+  return (
+    Number.isFinite(btcPrice60) &&
+    btcPrice60 >= 0.20 &&
+    Number.isFinite(qqqDay) &&
+    qqqDay >= 0.20
+  );
+}
+
 const SWING_BREADTH_FUNDING_ETH_LAG_SHORT_MIN_P5_PCT = -0.10;
 
 const LIVE_MANUAL_RECIPES = Object.freeze([
   Object.freeze({
-    id: "swing_eth_relative_weakness_btc_funding_long",
+    id: "swing_btc_pullback_long",
     mode: "swing",
     side: "long",
-    profile: "Swing Long: deeper ETH-relative washout + elevated BTC funding + off-RTH",
-    managementHint: "Harvest at the due-window move; runner only with clean follow-through.",
+    profile: "Swing Long: BTC pullback rebound",
+    managementHint: "Use standard Swing management; no recipe-specific TP/stop override.",
     matches: (t) => {
-      const vsEth1h = asNum(t?.ctx?.symbolVsEth1hPct);
-      const btcFunding15 = asNum(t?.ctx?.btc5mFunding15mAvg);
-      const isUsEquityRth = t?.ctx?.isUsEquityRth;
+      const btcPrice15mPct = asNum(t?.ctx?.btc5mPrice15mPct);
+      const btcPrice60mPct = asNum(t?.ctx?.btc5mPrice60mPct);
       return (
-        Number.isFinite(vsEth1h) &&
-        vsEth1h <= -0.50 &&
-        Number.isFinite(btcFunding15) &&
-        btcFunding15 >= 0.00008 &&
-        isUsEquityRth === false
+        Number.isFinite(btcPrice15mPct) &&
+        btcPrice15mPct <= -0.02 &&
+        Number.isFinite(btcPrice60mPct) &&
+        btcPrice60mPct <= -0.02
       );
     },
+    // The entry predicate is market-wide, so preserve a symbol-level ranking
+    // metric instead of letting tied candidates fall back to alphabetical order.
+    // Lower (more ETH-relative weakness) ranks first, matching the existing
+    // sortManualRecipeCandidates() ascending sort behavior.
     rankValue: (t) => asNum(t?.ctx?.symbolVsEth1hPct),
     rankMetric: (t) => `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)}`,
     marketContext: (t) => [
-      `BTC funding 15m avg ${formatFundingRate(t?.ctx?.btc5mFunding15mAvg)}`,
-      "US equities off-RTH",
+      `BTC 15m ${fmtPct(t?.ctx?.btc5mPrice15mPct, 3)}`,
+      `BTC 60m ${fmtPct(t?.ctx?.btc5mPrice60mPct, 3)}`,
     ],
   }),
   Object.freeze({
@@ -2987,6 +3000,23 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     ],
   }),
   Object.freeze({
+    id: "swing_btc_qqq_risk_on_exhaustion_short",
+    mode: "swing",
+    side: "short",
+    profile: "Swing Short: BTC + QQQ risk-on exhaustion",
+    managementHint: "Use standard Swing management; no recipe-specific TP/stop override.",
+    matches: (t) => isBtcQqqRiskOnExhaustionShortParent(t?.ctx),
+    // The market trigger is shared by the universe. Rank the shortlist by the
+    // weakest ETH-relative symbols; this was the strongest selector inside the
+    // qualifying historical cohort and prevents alphabetical tie-breaking.
+    rankValue: (t) => asNum(t?.ctx?.symbolVsEth1hPct),
+    rankMetric: (t) => `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)}`,
+    marketContext: (t) => [
+      `BTC 60m ${fmtPct(t?.ctx?.btc5mPrice60mPct, 3)}`,
+      `QQQ day ${fmtPct(t?.ctx?.qqqDayPct, 3)}`,
+    ],
+  }),
+  Object.freeze({
     id: "swing_breadth_funding_eth_lag_short",
     mode: "swing",
     side: "short",
@@ -3024,7 +3054,8 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
         vsEth1h <= 0 &&
         anomalyPattern !== "short_squeeze" &&
         anomalyPattern !== "long_build" &&
-        !isBtcLedSwingShortParent(t?.ctx)
+        !isBtcLedSwingShortParent(t?.ctx) &&
+        !isBtcQqqRiskOnExhaustionShortParent(t?.ctx)
       );
     },
     rankValue: (t) => asNum(t?.ctx?.symbolVsEth1hPct),
@@ -4999,6 +5030,7 @@ async function buildDirectManualRecipeCandidates(item) {
     anomalyPattern: anomalyCtx.anomaly_pattern || "",
     oi15: asNum(item?.deltas?.["15m"]?.oi_change_pct),
     btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
+    btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
     btc5mPrice60mPct: btcTapeContext?.price60mPct ?? null,
     btc5mOi5mPct: btcTapeContext?.oi5mPct ?? null,
     btc5mOi15mPct: btcTapeContext?.oi15mPct ?? null,
@@ -5011,6 +5043,7 @@ async function buildDirectManualRecipeCandidates(item) {
     symbolVsEth15mPct: item?.market_context?.symbol_vs_eth_15m_pct ?? null,
     symbolVsEth1hPct: item?.market_context?.symbol_vs_eth_1h_pct ?? null,
     cryptoBreadth1hPct: item?.market_context?.crypto_breadth_1h_pct ?? null,
+    qqqDayPct: externalTelemetry?.qqqDayPct ?? null,
     spotVsPerp1hPct: item?.market_structure?.spot_vs_perp_1h_pct ?? null,
   };
 
@@ -5240,7 +5273,8 @@ async function evaluateCandidate({
     bottoming = null,
     rejectionReason = "",
   }) {
-    // Legacy aggregate is retired. Raw external-market values below are capture-only.
+    // Legacy aggregate is retired. Raw external-market values are persisted;
+    // validated manual recipes may consume explicit fields without restoring an aggregate bias.
     const externalContextAdj = 0;
 
         const anomalyCtx = getAnomalyEventFields(symbol);
