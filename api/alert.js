@@ -13,6 +13,7 @@
 // - ANALYTICS TELEMETRY: ET day/session fields added for fired/random/skipped rows where emitted
 // - MANUAL TG V14: add validated Scalp Long; replace Swing Short with breadth/funding + ETH-relative weakness; remove weak Scalp Short and BTC-led Swing Short routes
 // - MANUAL TG V16: tighten Scalp Long to low breadth; tighten Swing Long structure; add 14 ET funding-dispersion Scalp Short; raise breadth/funding Swing Short funding floor
+// - MANUAL TG V17: add validated Swing Long BTC-OI pullback sibling and Scalp Long washout sibling; de-duplicate same-symbol overlaps by explicit route priority
 // - INPUT VALIDATION: live recipe inputs preserve missing/blank values instead of coercing them to zero
 // - RANKED TELEGRAM: one message per qualifying recipe, with up to three ranked symbol alternatives
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
@@ -46,7 +47,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v3_gmx_equity_perps_since_close_2026_09_07",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v16_research_refresh_2026_09_23",
+  premium_recipe_version: "manual_tg_recipes_v17_pooled_refresh_2026_09_26",
   candidate_stamp_version: "2026-07-17-pooled_side_horizon_candidates_v2",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
@@ -2939,19 +2940,56 @@ function isBtcQqqRiskOnExhaustionShortParent(ctx = {}) {
 
 const SWING_BREADTH_FUNDING_ETH_LAG_SHORT_MIN_P5_PCT = -0.10;
 const SCALP_LONG_MAX_BREADTH_1H_PCT = 35;
+const SCALP_LONG_WASHOUT_MAX_BTC_30M_PCT = -0.17;
+const SCALP_LONG_WASHOUT_MAX_ANOMALY_BASKET_PRICE_PCT = -0.06;
+const SCALP_LONG_WASHOUT_MAX_BREADTH_1H_PCT = 20;
 const SWING_LONG_MIN_PULLBACK_FROM_1H_HIGH_PCT = 1.0;
 const SWING_LONG_MAX_ANOMALY_PRICE_PCT = -0.25;
+const SWING_LONG_OI_PULLBACK_MIN_BTC_MACRO_OI_PCT = 0.50;
+const SWING_LONG_OI_PULLBACK_MAX_BTC_15M_PCT = -0.05;
+const SWING_LONG_OI_PULLBACK_MAX_SYMBOL_VS_BTC_1H_PCT = -0.20;
 const SWING_SHORT_MIN_BTC_FUNDING_15M = 0.000035;
 const SCALP_SHORT_MIN_FUNDING_DEVIATION_BPS = 0.22;
 const SCALP_SHORT_HOUR_ET = 14;
 
 const LIVE_MANUAL_RECIPES = Object.freeze([
   Object.freeze({
+    id: "swing_btc_oi_pullback_relative_weakness_long",
+    mode: "swing",
+    side: "long",
+    profile: "Swing Long: BTC OI build + pullback + BTC-relative weakness",
+    managementHint: "Use standard Swing management; no recipe-specific TP/stop override.",
+    overlapGroup: "swing_long_entry",
+    overlapPriority: 10,
+    matches: (t) => {
+      const btcMacroOiPct = asRequiredNum(t?.ctx?.btcMacro?.oiPct);
+      const btcPrice15mPct = asRequiredNum(t?.ctx?.btc5mPrice15mPct);
+      const symbolVsBtc1hPct = asRequiredNum(t?.ctx?.symbolVsBtc1hPct);
+      return (
+        Number.isFinite(btcMacroOiPct) &&
+        btcMacroOiPct >= SWING_LONG_OI_PULLBACK_MIN_BTC_MACRO_OI_PCT &&
+        Number.isFinite(btcPrice15mPct) &&
+        btcPrice15mPct <= SWING_LONG_OI_PULLBACK_MAX_BTC_15M_PCT &&
+        Number.isFinite(symbolVsBtc1hPct) &&
+        symbolVsBtc1hPct <= SWING_LONG_OI_PULLBACK_MAX_SYMBOL_VS_BTC_1H_PCT
+      );
+    },
+    rankValue: (t) => asRequiredNum(t?.ctx?.symbolVsBtc1hPct),
+    rankMetric: (t) =>
+      `vs BTC 1h ${fmtPct(t?.ctx?.symbolVsBtc1hPct, 3)} | BTC ${String(t?.ctx?.btcMacro?.tf || "4h")} OI ${fmtPct(t?.ctx?.btcMacro?.oiPct, 3)}`,
+    marketContext: (t) => [
+      `BTC 15m ${fmtPct(t?.ctx?.btc5mPrice15mPct, 3)}`,
+      `BTC ${String(t?.ctx?.btcMacro?.tf || "4h")} OI ${fmtPct(t?.ctx?.btcMacro?.oiPct, 3)}`,
+    ],
+  }),
+  Object.freeze({
     id: "swing_btc_pullback_long",
     mode: "swing",
     side: "long",
     profile: "Swing Long: BTC pullback + 1h structural weakness",
     managementHint: "Use standard Swing management; no recipe-specific TP/stop override.",
+    overlapGroup: "swing_long_entry",
+    overlapPriority: 20,
     matches: (t) => {
       const btcPrice15mPct = asRequiredNum(t?.ctx?.btc5mPrice15mPct);
       const btcPrice60mPct = asRequiredNum(t?.ctx?.btc5mPrice60mPct);
@@ -3000,11 +3038,45 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     ],
   }),
   Object.freeze({
+    id: "scalp_long_btc_washout_weak_basket",
+    mode: "scalp",
+    side: "long",
+    profile: "Scalp Long: BTC washout + weak basket + low breadth",
+    managementHint: "Use standard Scalp management; exit if follow-through stalls.",
+    overlapGroup: "scalp_long_entry",
+    overlapPriority: 10,
+    matches: (t) => {
+      const btcPrice30mPct = asRequiredNum(t?.ctx?.btc5mPrice30mPct);
+      const anomalyBasketPricePct = asRequiredNum(t?.ctx?.anomalyBasketPricePct);
+      const breadth1hPct = asRequiredNum(t?.ctx?.cryptoBreadth1hPct);
+      return (
+        Number.isFinite(btcPrice30mPct) &&
+        btcPrice30mPct <= SCALP_LONG_WASHOUT_MAX_BTC_30M_PCT &&
+        Number.isFinite(anomalyBasketPricePct) &&
+        anomalyBasketPricePct <= SCALP_LONG_WASHOUT_MAX_ANOMALY_BASKET_PRICE_PCT &&
+        Number.isFinite(breadth1hPct) &&
+        breadth1hPct <= SCALP_LONG_WASHOUT_MAX_BREADTH_1H_PCT
+      );
+    },
+    // No additional economic gate is introduced for shortlist ranking. Within
+    // the validated washout cohort, prefer the weakest BTC-relative symbols.
+    rankValue: (t) => asRequiredNum(t?.ctx?.symbolVsBtc1hPct),
+    rankMetric: (t) =>
+      `vs BTC 1h ${fmtPct(t?.ctx?.symbolVsBtc1hPct, 3)} | basket ${fmtPct(t?.ctx?.anomalyBasketPricePct, 3)}`,
+    marketContext: (t) => [
+      `BTC 30m ${fmtPct(t?.ctx?.btc5mPrice30mPct, 3)}`,
+      `Basket price ${fmtPct(t?.ctx?.anomalyBasketPricePct, 3)}`,
+      `Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`,
+    ],
+  }),
+  Object.freeze({
     id: "scalp_long_ethbtc_lag_anomaly_rebound",
     mode: "scalp",
     side: "long",
     profile: "Scalp Long: ETH/BTC lag anomaly rebound + low breadth (weekday)",
     managementHint: "Use standard Scalp management; exit if follow-through stalls.",
+    overlapGroup: "scalp_long_entry",
+    overlapPriority: 20,
     matches: (t) => {
       const anomalyScore = asRequiredNum(t?.ctx?.anomalyScore);
       const symbolVsBtc15mPct = asRequiredNum(t?.ctx?.symbolVsBtc15mPct);
@@ -5103,6 +5175,7 @@ async function buildDirectManualRecipeCandidates(item) {
     anomalyScore: asRequiredNum(anomalyCtx.anomaly_score),
     anomalyRank: asRequiredNum(anomalyCtx.anomaly_rank),
     anomalyPricePct: asRequiredNum(anomalyCtx.anomaly_price_pct),
+    anomalyBasketPricePct: asRequiredNum(anomalyCtx.anomaly_basket_price_pct),
     anomalyBasketFundingRate: asRequiredNum(anomalyCtx.anomaly_basket_funding_rate),
     anomalyPriceOiGap: asRequiredNum(anomalyCtx.anomaly_price_oi_gap),
     anomalyFundingDeviationBps: asRequiredNum(anomalyCtx.anomaly_funding_deviation_bps),
@@ -5111,6 +5184,7 @@ async function buildDirectManualRecipeCandidates(item) {
     oi15: asRequiredNum(item?.deltas?.["15m"]?.oi_change_pct),
     btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
     btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
+    btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
     btc5mPrice60mPct: btcTapeContext?.price60mPct ?? null,
     btc5mOi5mPct: btcTapeContext?.oi5mPct ?? null,
     btc5mOi15mPct: btcTapeContext?.oi15mPct ?? null,
@@ -5121,6 +5195,7 @@ async function buildDirectManualRecipeCandidates(item) {
     isUsEquityRth: etSession.is_us_equity_rth,
     hourEt: asRequiredNum(etSession.hour_et),
     symbolVsBtc15mPct: asRequiredNum(item?.market_context?.symbol_vs_btc_15m_pct),
+    symbolVsBtc1hPct: asRequiredNum(item?.market_context?.symbol_vs_btc_1h_pct),
     symbolVsEth15mPct: asRequiredNum(item?.market_context?.symbol_vs_eth_15m_pct),
     symbolVsEth1hPct: asRequiredNum(item?.market_context?.symbol_vs_eth_1h_pct),
     cryptoBreadth1hPct: asRequiredNum(item?.market_context?.crypto_breadth_1h_pct),
@@ -5128,9 +5203,31 @@ async function buildDirectManualRecipeCandidates(item) {
     spotVsPerp1hPct: asRequiredNum(item?.market_structure?.spot_vs_perp_1h_pct),
   };
 
+  // Macro context is mode-dependent. Compute it before the cheap recipe probe so
+  // recipes can use the same live BTC macro fields that are persisted later.
+  const macroByMode = new Map();
+  const getMacroForMode = (mode) => {
+    const key = String(mode || "swing").toLowerCase();
+    if (!macroByMode.has(key)) macroByMode.set(key, computeBtcMacro(j.results || [], key));
+    return macroByMode.get(key);
+  };
+
   const parentMatchingRecipes = LIVE_MANUAL_RECIPES.filter((recipe) => {
     if (!modes.includes(recipe.mode)) return false;
-    return recipe.matches({ mode: recipe.mode, bias: recipe.side, execReason: recipe.id, ctx: probeCtx });
+    const macroMode = getMacroForMode(recipe.mode);
+    const recipeProbeCtx = {
+      ...probeCtx,
+      btcMacro: {
+        ok: !!macroMode?.ok,
+        reason: String(macroMode?.reason || ""),
+        tf: String(macroMode?.tf || ""),
+        lean: String(macroMode?.btc?.lean || ""),
+        pricePct: macroMode?.btc?.pricePct ?? null,
+        oiPct: macroMode?.btc?.oiPct ?? null,
+        bullExpansion: !!macroMode?.btcBullExpansion,
+      },
+    };
+    return recipe.matches({ mode: recipe.mode, bias: recipe.side, execReason: recipe.id, ctx: recipeProbeCtx });
   });
 
   const matchingRecipes = [];
@@ -5182,7 +5279,7 @@ async function buildDirectManualRecipeCandidates(item) {
 
     const baseBias = biasFromItem(item, recipe.mode);
     const b1 = strongRecoB1({ bias: recipe.side, levels, price });
-    const macroMode = computeBtcMacro(j.results || [], recipe.mode);
+    const macroMode = getMacroForMode(recipe.mode);
 
     const t = {
       mode: recipe.mode,
@@ -5309,7 +5406,59 @@ async function buildDirectManualRecipeCandidates(item) {
     if (recipe.matches(t)) candidates.push(t);
   }
 
-  return candidates;
+  // A symbol can satisfy both the incumbent and its validated sibling in the
+  // same run. Preserve one candidate per overlap family so Telegram does not
+  // duplicate the same trade idea. Lower overlapPriority wins; V17 siblings
+  // intentionally take precedence while the incumbent remains available for
+  // non-overlapping observations.
+  const selectedByOverlapGroup = new Map();
+  const dedupedCandidates = [];
+  for (const candidate of candidates) {
+    const recipe = getLiveManualRecipe(candidate?.execReason);
+    const group = String(recipe?.overlapGroup || "").trim();
+    if (!group) {
+      dedupedCandidates.push(candidate);
+      continue;
+    }
+
+    const priorityRaw = asNum(recipe?.overlapPriority);
+    const priority = Number.isFinite(priorityRaw) ? priorityRaw : 100;
+    const existing = selectedByOverlapGroup.get(group);
+    if (!existing || priority < existing.priority) {
+      if (existing && debug) {
+        skipped.push({
+          symbol,
+          mode: existing.candidate?.mode,
+          reason: "recipe_overlap_priority",
+          detail: {
+            overlapGroup: group,
+            keptRecipe: recipe.id,
+            suppressedRecipe: existing.recipe.id,
+          },
+        });
+      }
+      selectedByOverlapGroup.set(group, { candidate, recipe, priority });
+    } else if (debug) {
+      skipped.push({
+        symbol,
+        mode: candidate?.mode,
+        reason: "recipe_overlap_priority",
+        detail: {
+          overlapGroup: group,
+          keptRecipe: existing.recipe.id,
+          suppressedRecipe: recipe.id,
+        },
+      });
+    }
+  }
+
+  for (const recipe of LIVE_MANUAL_RECIPES) {
+    for (const selected of selectedByOverlapGroup.values()) {
+      if (selected.recipe.id === recipe.id) dedupedCandidates.push(selected.candidate);
+    }
+  }
+
+  return dedupedCandidates;
 }
   
 
