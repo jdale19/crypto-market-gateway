@@ -14,6 +14,7 @@
 // - MANUAL TG V14: add validated Scalp Long; replace Swing Short with breadth/funding + ETH-relative weakness; remove weak Scalp Short and BTC-led Swing Short routes
 // - MANUAL TG V16: tighten Scalp Long to low breadth; tighten Swing Long structure; add 14 ET funding-dispersion Scalp Short; raise breadth/funding Swing Short funding floor
 // - MANUAL TG V17: add validated Swing Long BTC-OI pullback sibling and Scalp Long washout sibling; de-duplicate same-symbol overlaps by explicit route priority
+// - MANUAL TG V18: replace Scalp Long washout with validated weak-basket + BTC short-TF rebound + 1h short-lean recipe
 // - INPUT VALIDATION: live recipe inputs preserve missing/blank values instead of coercing them to zero
 // - RANKED TELEGRAM: one message per qualifying recipe, with up to three ranked symbol alternatives
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
@@ -47,7 +48,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v3_gmx_equity_perps_since_close_2026_09_07",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v17_pooled_refresh_2026_09_26",
+  premium_recipe_version: "manual_tg_recipes_v18_scalp_long_rebound_refresh_2026_10_01",
   candidate_stamp_version: "2026-07-17-pooled_side_horizon_candidates_v2",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
@@ -2940,9 +2941,8 @@ function isBtcQqqRiskOnExhaustionShortParent(ctx = {}) {
 
 const SWING_BREADTH_FUNDING_ETH_LAG_SHORT_MIN_P5_PCT = -0.10;
 const SCALP_LONG_MAX_BREADTH_1H_PCT = 35;
-const SCALP_LONG_WASHOUT_MAX_BTC_30M_PCT = -0.17;
-const SCALP_LONG_WASHOUT_MAX_ANOMALY_BASKET_PRICE_PCT = -0.06;
-const SCALP_LONG_WASHOUT_MAX_BREADTH_1H_PCT = 20;
+const SCALP_LONG_REBOUND_MAX_ANOMALY_BASKET_PRICE_PCT = -0.05;
+const SCALP_LONG_REBOUND_MIN_BTC_SHORT_TF_REBOUND_PCT = 0.05;
 const SWING_LONG_MIN_PULLBACK_FROM_1H_HIGH_PCT = 1.0;
 const SWING_LONG_MAX_ANOMALY_PRICE_PCT = -0.25;
 const SWING_LONG_OI_PULLBACK_MIN_BTC_MACRO_OI_PCT = 0.50;
@@ -3038,36 +3038,48 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     ],
   }),
   Object.freeze({
-    id: "scalp_long_btc_washout_weak_basket",
+    id: "scalp_long_weak_basket_btc_rebound_short_lean",
     mode: "scalp",
     side: "long",
-    profile: "Scalp Long: BTC washout + weak basket + low breadth",
+    profile: "Scalp Long: weak basket + BTC rebound + 1h short lean",
     managementHint: "Use standard Scalp management; exit if follow-through stalls.",
     overlapGroup: "scalp_long_entry",
     overlapPriority: 10,
     matches: (t) => {
-      const btcPrice30mPct = asRequiredNum(t?.ctx?.btc5mPrice30mPct);
       const anomalyBasketPricePct = asRequiredNum(t?.ctx?.anomalyBasketPricePct);
-      const breadth1hPct = asRequiredNum(t?.ctx?.cryptoBreadth1hPct);
+      const btcPrice5mPct = asRequiredNum(t?.ctx?.btc5mPrice5mPct);
+      const btcPrice15mPct = asRequiredNum(t?.ctx?.btc5mPrice15mPct);
+      const lean1h = String(t?.ctx?.lean1h || "").toLowerCase();
+      const btcShortTfReboundPct =
+        Number.isFinite(btcPrice5mPct) && Number.isFinite(btcPrice15mPct)
+          ? btcPrice5mPct - btcPrice15mPct / 3
+          : null;
       return (
-        Number.isFinite(btcPrice30mPct) &&
-        btcPrice30mPct <= SCALP_LONG_WASHOUT_MAX_BTC_30M_PCT &&
         Number.isFinite(anomalyBasketPricePct) &&
-        anomalyBasketPricePct <= SCALP_LONG_WASHOUT_MAX_ANOMALY_BASKET_PRICE_PCT &&
-        Number.isFinite(breadth1hPct) &&
-        breadth1hPct <= SCALP_LONG_WASHOUT_MAX_BREADTH_1H_PCT
+        anomalyBasketPricePct <= SCALP_LONG_REBOUND_MAX_ANOMALY_BASKET_PRICE_PCT &&
+        Number.isFinite(btcShortTfReboundPct) &&
+        btcShortTfReboundPct >= SCALP_LONG_REBOUND_MIN_BTC_SHORT_TF_REBOUND_PCT &&
+        lean1h === "short"
       );
     },
-    // No additional economic gate is introduced for shortlist ranking. Within
-    // the validated washout cohort, prefer the weakest BTC-relative symbols.
+    // Preserve the validated shortlist behavior: within the qualifying cohort,
+    // prefer the weakest BTC-relative symbols.
     rankValue: (t) => asRequiredNum(t?.ctx?.symbolVsBtc1hPct),
     rankMetric: (t) =>
       `vs BTC 1h ${fmtPct(t?.ctx?.symbolVsBtc1hPct, 3)} | basket ${fmtPct(t?.ctx?.anomalyBasketPricePct, 3)}`,
-    marketContext: (t) => [
-      `BTC 30m ${fmtPct(t?.ctx?.btc5mPrice30mPct, 3)}`,
-      `Basket price ${fmtPct(t?.ctx?.anomalyBasketPricePct, 3)}`,
-      `Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`,
-    ],
+    marketContext: (t) => {
+      const btcPrice5mPct = asRequiredNum(t?.ctx?.btc5mPrice5mPct);
+      const btcPrice15mPct = asRequiredNum(t?.ctx?.btc5mPrice15mPct);
+      const btcShortTfReboundPct =
+        Number.isFinite(btcPrice5mPct) && Number.isFinite(btcPrice15mPct)
+          ? btcPrice5mPct - btcPrice15mPct / 3
+          : null;
+      return [
+        `Basket price ${fmtPct(t?.ctx?.anomalyBasketPricePct, 3)}`,
+        `BTC rebound ${fmtPct(btcShortTfReboundPct, 3)}`,
+        `1h lean ${String(t?.ctx?.lean1h || "n/a")}`,
+      ];
+    },
   }),
   Object.freeze({
     id: "scalp_long_ethbtc_lag_anomaly_rebound",
