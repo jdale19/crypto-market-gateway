@@ -15,6 +15,7 @@
 // - MANUAL TG V16: tighten Scalp Long to low breadth; tighten Swing Long structure; add 14 ET funding-dispersion Scalp Short; raise breadth/funding Swing Short funding floor
 // - MANUAL TG V17: add validated Swing Long BTC-OI pullback sibling and Scalp Long washout sibling; de-duplicate same-symbol overlaps by explicit route priority
 // - MANUAL TG V18: replace Scalp Long washout with validated weak-basket + BTC short-TF rebound + 1h short-lean recipe
+// - MANUAL TG V19: suppress decayed Swing Long BTC-OI pullback route; exclude ETH from ETH-relative Swing Short eligibility
 // - INPUT VALIDATION: live recipe inputs preserve missing/blank values instead of coercing them to zero
 // - RANKED TELEGRAM: one message per qualifying recipe, with up to three ranked symbol alternatives
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
@@ -48,7 +49,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v3_gmx_equity_perps_since_close_2026_09_07",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v18_scalp_long_rebound_refresh_2026_10_01",
+  premium_recipe_version: "manual_tg_recipes_v19_swing_oi_suppressed_eth_self_excluded_2026_10_08",
   candidate_stamp_version: "2026-07-17-pooled_side_horizon_candidates_v2",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
@@ -2945,43 +2946,11 @@ const SCALP_LONG_REBOUND_MAX_ANOMALY_BASKET_PRICE_PCT = -0.05;
 const SCALP_LONG_REBOUND_MIN_BTC_SHORT_TF_REBOUND_PCT = 0.05;
 const SWING_LONG_MIN_PULLBACK_FROM_1H_HIGH_PCT = 1.0;
 const SWING_LONG_MAX_ANOMALY_PRICE_PCT = -0.25;
-const SWING_LONG_OI_PULLBACK_MIN_BTC_MACRO_OI_PCT = 0.50;
-const SWING_LONG_OI_PULLBACK_MAX_BTC_15M_PCT = -0.05;
-const SWING_LONG_OI_PULLBACK_MAX_SYMBOL_VS_BTC_1H_PCT = -0.20;
 const SWING_SHORT_MIN_BTC_FUNDING_15M = 0.000035;
 const SCALP_SHORT_MIN_FUNDING_DEVIATION_BPS = 0.22;
 const SCALP_SHORT_HOUR_ET = 14;
 
 const LIVE_MANUAL_RECIPES = Object.freeze([
-  Object.freeze({
-    id: "swing_btc_oi_pullback_relative_weakness_long",
-    mode: "swing",
-    side: "long",
-    profile: "Swing Long: BTC OI build + pullback + BTC-relative weakness",
-    managementHint: "Use standard Swing management; no recipe-specific TP/stop override.",
-    overlapGroup: "swing_long_entry",
-    overlapPriority: 10,
-    matches: (t) => {
-      const btcMacroOiPct = asRequiredNum(t?.ctx?.btcMacro?.oiPct);
-      const btcPrice15mPct = asRequiredNum(t?.ctx?.btc5mPrice15mPct);
-      const symbolVsBtc1hPct = asRequiredNum(t?.ctx?.symbolVsBtc1hPct);
-      return (
-        Number.isFinite(btcMacroOiPct) &&
-        btcMacroOiPct >= SWING_LONG_OI_PULLBACK_MIN_BTC_MACRO_OI_PCT &&
-        Number.isFinite(btcPrice15mPct) &&
-        btcPrice15mPct <= SWING_LONG_OI_PULLBACK_MAX_BTC_15M_PCT &&
-        Number.isFinite(symbolVsBtc1hPct) &&
-        symbolVsBtc1hPct <= SWING_LONG_OI_PULLBACK_MAX_SYMBOL_VS_BTC_1H_PCT
-      );
-    },
-    rankValue: (t) => asRequiredNum(t?.ctx?.symbolVsBtc1hPct),
-    rankMetric: (t) =>
-      `vs BTC 1h ${fmtPct(t?.ctx?.symbolVsBtc1hPct, 3)} | BTC ${String(t?.ctx?.btcMacro?.tf || "4h")} OI ${fmtPct(t?.ctx?.btcMacro?.oiPct, 3)}`,
-    marketContext: (t) => [
-      `BTC 15m ${fmtPct(t?.ctx?.btc5mPrice15mPct, 3)}`,
-      `BTC ${String(t?.ctx?.btcMacro?.tf || "4h")} OI ${fmtPct(t?.ctx?.btcMacro?.oiPct, 3)}`,
-    ],
-  }),
   Object.freeze({
     id: "swing_btc_pullback_long",
     mode: "swing",
@@ -3201,11 +3170,13 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
       };
     },
     matches: (t) => {
+      const symbol = String(t?.symbol || "").toUpperCase();
       const breadth = asRequiredNum(t?.ctx?.cryptoBreadth1hPct);
       const btcFunding15 = asRequiredNum(t?.ctx?.btc5mFunding15mAvg);
       const vsEth1h = asRequiredNum(t?.ctx?.symbolVsEth1hPct);
       const anomalyPattern = String(t?.ctx?.anomalyPattern || "").toLowerCase();
       return (
+        symbol !== "ETHUSDT" &&
         Number.isFinite(breadth) &&
         breadth >= 75 &&
         breadth <= 95 &&
@@ -5239,7 +5210,7 @@ async function buildDirectManualRecipeCandidates(item) {
         bullExpansion: !!macroMode?.btcBullExpansion,
       },
     };
-    return recipe.matches({ mode: recipe.mode, bias: recipe.side, execReason: recipe.id, ctx: recipeProbeCtx });
+    return recipe.matches({ symbol, mode: recipe.mode, bias: recipe.side, execReason: recipe.id, ctx: recipeProbeCtx });
   });
 
   const matchingRecipes = [];
