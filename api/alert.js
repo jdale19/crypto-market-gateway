@@ -16,6 +16,7 @@
 // - MANUAL TG V17: add validated Swing Long BTC-OI pullback sibling and Scalp Long washout sibling; de-duplicate same-symbol overlaps by explicit route priority
 // - MANUAL TG V18: replace Scalp Long washout with validated weak-basket + BTC short-TF rebound + 1h short-lean recipe
 // - MANUAL TG V19: suppress decayed Swing Long BTC-OI pullback route; exclude ETH from ETH-relative Swing Short eligibility
+// - MANUAL TG V20: restore Scalp Long 1h lean probe; add BTC-OI unwind / ETH-lag / token-funding Swing Short with incumbent-first overlap protection
 // - INPUT VALIDATION: live recipe inputs preserve missing/blank values instead of coercing them to zero
 // - RANKED TELEGRAM: one message per qualifying recipe, with up to three ranked symbol alternatives
 // - TELEMETRY FIX: preserve execution wick atom metadata when merging candidate context
@@ -49,7 +50,7 @@ const ANALYTICS_VERSION_TAGS = Object.freeze({
   ext_context_version: "external_telemetry_v3_gmx_equity_perps_since_close_2026_09_07",
   btc_short_tf_version: "btc_short_tf_soft_v1_2026_04_14",
   entry_idea_version: "entry_ideas_v1_2026_04_20",
-  premium_recipe_version: "manual_tg_recipes_v19_swing_oi_suppressed_eth_self_excluded_2026_10_08",
+  premium_recipe_version: "manual_tg_recipes_v20_oi_unwind_short_scalp_probe_fix_2026_10_27",
   candidate_stamp_version: "2026-07-17-pooled_side_horizon_candidates_v2",
   random_baseline_version: "random_pre_gate_full_universe_v3_2026_07_06",
 });
@@ -2947,6 +2948,9 @@ const SCALP_LONG_REBOUND_MIN_BTC_SHORT_TF_REBOUND_PCT = 0.05;
 const SWING_LONG_MIN_PULLBACK_FROM_1H_HIGH_PCT = 1.0;
 const SWING_LONG_MAX_ANOMALY_PRICE_PCT = -0.25;
 const SWING_SHORT_MIN_BTC_FUNDING_15M = 0.000035;
+const SWING_SHORT_OI_UNWIND_MAX_BTC_OI_60M_PCT = -0.25;
+const SWING_SHORT_OI_UNWIND_MAX_VS_ETH_1H_PCT = -0.75;
+const SWING_SHORT_OI_UNWIND_MIN_TOKEN_FUNDING = 0.000035;
 const SCALP_SHORT_MIN_FUNDING_DEVIATION_BPS = 0.22;
 const SCALP_SHORT_HOUR_ET = 14;
 
@@ -3136,6 +3140,8 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     side: "short",
     profile: "Swing Short: BTC + QQQ risk-on exhaustion",
     managementHint: "Use standard Swing management; no recipe-specific TP/stop override.",
+    overlapGroup: "swing_short_entry",
+    overlapPriority: 10,
     matches: (t) => isBtcQqqRiskOnExhaustionShortParent(t?.ctx),
     // The market trigger is shared by the universe. Rank the shortlist by the
     // weakest ETH-relative symbols; this was the strongest selector inside the
@@ -3153,6 +3159,8 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     side: "short",
     profile: "Swing Short: strong breadth + moderate BTC funding + ETH-relative lag",
     managementHint: "Validate quickly; take partials by the due window and extend only with downside follow-through.",
+    overlapGroup: "swing_short_entry",
+    overlapPriority: 20,
     executionGate: (t) => {
       const p5 = asRequiredNum(t?._rawItem?.deltas?.["5m"]?.price_change_pct);
       const minP5 = SWING_BREADTH_FUNDING_ETH_LAG_SHORT_MIN_P5_PCT;
@@ -3196,6 +3204,38 @@ const LIVE_MANUAL_RECIPES = Object.freeze([
     marketContext: (t) => [
       `Breadth 1h ${fmtPct(t?.ctx?.cryptoBreadth1hPct, 1)}`,
       `BTC funding 15m avg ${formatFundingRate(t?.ctx?.btc5mFunding15mAvg)}`,
+    ],
+  }),
+  Object.freeze({
+    id: "swing_btc_oi_unwind_eth_lag_token_funding_short",
+    mode: "swing",
+    side: "short",
+    profile: "Swing Short: BTC OI unwind + ETH lag + positive token funding",
+    managementHint: "Use standard Swing management; no recipe-specific TP/stop override.",
+    // Keep incumbent Swing Shorts when both qualify for the same symbol.
+    overlapGroup: "swing_short_entry",
+    overlapPriority: 30,
+    matches: (t) => {
+      const symbol = String(t?.symbol || "").toUpperCase();
+      const btcOi60mPct = asRequiredNum(t?.ctx?.btc5mOi60mPct);
+      const vsEth1hPct = asRequiredNum(t?.ctx?.symbolVsEth1hPct);
+      const tokenFundingRate = asRequiredNum(t?.ctx?.anomalyFundingRate);
+      return (
+        symbol !== "ETHUSDT" &&
+        Number.isFinite(btcOi60mPct) &&
+        btcOi60mPct <= SWING_SHORT_OI_UNWIND_MAX_BTC_OI_60M_PCT &&
+        Number.isFinite(vsEth1hPct) &&
+        vsEth1hPct <= SWING_SHORT_OI_UNWIND_MAX_VS_ETH_1H_PCT &&
+        Number.isFinite(tokenFundingRate) &&
+        tokenFundingRate >= SWING_SHORT_OI_UNWIND_MIN_TOKEN_FUNDING
+      );
+    },
+    // ETH-relative weakness is a deterministic shortlist order, not an extra gate.
+    rankValue: (t) => asRequiredNum(t?.ctx?.symbolVsEth1hPct),
+    rankMetric: (t) =>
+      `vs ETH 1h ${fmtPct(t?.ctx?.symbolVsEth1hPct, 3)} | token funding ${formatFundingRate(t?.ctx?.anomalyFundingRate)}`,
+    marketContext: (t) => [
+      `BTC OI 60m ${fmtPct(t?.ctx?.btc5mOi60mPct, 3)}`,
     ],
   }),
 ]);
@@ -5158,6 +5198,7 @@ async function buildDirectManualRecipeCandidates(item) {
     anomalyScore: asRequiredNum(anomalyCtx.anomaly_score),
     anomalyRank: asRequiredNum(anomalyCtx.anomaly_rank),
     anomalyPricePct: asRequiredNum(anomalyCtx.anomaly_price_pct),
+    anomalyFundingRate: asRequiredNum(anomalyCtx.anomaly_funding_rate),
     anomalyBasketPricePct: asRequiredNum(anomalyCtx.anomaly_basket_price_pct),
     anomalyBasketFundingRate: asRequiredNum(anomalyCtx.anomaly_basket_funding_rate),
     anomalyPriceOiGap: asRequiredNum(anomalyCtx.anomaly_price_oi_gap),
@@ -5165,6 +5206,7 @@ async function buildDirectManualRecipeCandidates(item) {
     anomalyOiTrendDeviation: asRequiredNum(anomalyCtx.anomaly_oi_trend_deviation),
     anomalyPattern: anomalyCtx.anomaly_pattern || "",
     oi15: asRequiredNum(item?.deltas?.["15m"]?.oi_change_pct),
+    lean1h: String(item?.deltas?.["1h"]?.lean || "").toLowerCase(),
     btc5mPrice5mPct: btcTapeContext?.price5mPct ?? null,
     btc5mPrice15mPct: btcTapeContext?.price15mPct ?? null,
     btc5mPrice30mPct: btcTapeContext?.price30mPct ?? null,
